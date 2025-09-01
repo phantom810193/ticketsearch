@@ -39,7 +39,6 @@ ENV_PATH = Path(__file__).with_name(".env")   # 固定讀取和 app.py 同一層
 load_dotenv(override=False)
 
 # 啟動時印診斷，方便確認是否讀到
-print(f"[ENV] path={ENV_PATH} exists={ENV_PATH.exists()} loaded={ok}")
 print("[ENV] TOKEN?", bool(os.getenv("LINE_CHANNEL_ACCESS_TOKEN")))
 print("[ENV] SECRET?", bool(os.getenv("LINE_CHANNEL_SECRET")))
 
@@ -197,7 +196,7 @@ async def callback(request: Request,
     return PlainTextResponse("OK", status_code=200)
 
 # ========== 訊息處理 ==========
-@handler.add(MessageEvent, message=TextMessage)
+@handler.add(MessageEvent, message=TextMessageContent)
 def handle_message(event: MessageEvent):
     text = (event.message.text or "").strip()
     # ✅ 一次正確取得 user_id；群組/聊天室可自行擴充
@@ -271,11 +270,16 @@ def handle_message(event: MessageEvent):
         logger.exception(f"[event] unhandled error: {e}")
 
 # ========== LINE 工具 ==========
-def reply(event: MessageEvent, message: str):
+def reply(event, text: str):
     try:
-        line_bot_api.reply_message(event.reply_token, TextSendMessage(text=message))
-    except LineBotApiError as e:
-        logger.error(f"[reply] error status={getattr(e, 'status_code', '?')} detail={getattr(e, 'error', None)}")
+        messaging_api.reply_message(
+            ReplyMessageRequest(
+                reply_token=event.reply_token,
+                messages=[V3TextMessage(text=text)]
+            )
+        )
+    except ApiException as e:
+        logging.exception(f"LINE reply failed: {e}")
 
 def push(user_id: str, message: str):
     try:
