@@ -6,4 +6,8 @@ line-bot-sdk==3.13.0
 requests==2.32.3
 beautifulsoup4==4.12.3
 cloudscraper==1.2.71
+<<<<<<< HEAD
 google-cloud-firestore==2.16.0
+=======
+google-cloud-firestore==2.16.0
+>>>>>>> 3bf2749 (Add Dockerfile/cloudbuild and requirements)

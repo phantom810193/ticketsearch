@@ -1,31 +1,23 @@
-# Byte-compiled / cache
-__pycache__/
-*.py[cod]
-*.pyo
-*.pyd
-*.pyc
+# env/secrets
+.env
+*.env
+*.key
+*_token.txt
+*_secret.txt
+cron_key.txt
 
-# Virtual envs
+# venv / build
 .venv/
 venv/
 env/
-ENV/
-
-# Distribution / packaging
+__pycache__/
+*.py[cod]
 build/
 dist/
 *.egg-info/
 
-# Logs
-*.log
-
-# IDE / Editor
+# IDE / OS
 .vscode/
 .idea/
-
-# OS files
 .DS_Store
 Thumbs.db
-
-# Env files
-.env
