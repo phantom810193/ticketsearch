@@ -31,7 +31,7 @@ logging.basicConfig(
 )
 
 ENV_PATH = Path(__file__).with_name(".env")   # 固定讀取和 app.py 同一層的 .env
-ok = load_dotenv(dotenv_path=ENV_PATH, override=False)
+load_dotenv(override=False)
 
 # 啟動時印診斷，方便確認是否讀到
 print(f"[ENV] path={ENV_PATH} exists={ENV_PATH.exists()} loaded={ok}")
