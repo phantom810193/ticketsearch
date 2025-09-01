@@ -31,8 +31,4 @@ options:
   logging: CLOUD_LOGGING_ONLY
 
 images:
-<<<<<<< HEAD
 - 'asia-east1-docker.pkg.dev/$PROJECT_ID/cloud-run-source-deploy/ticketsearch:$SHORT_SHA'
-=======
-- 'asia-east1-docker.pkg.dev/$PROJECT_ID/cloud-run-source-deploy/ticketsearch:$SHORT_SHA'
->>>>>>> 3bf2749 (Add Dockerfile/cloudbuild and requirements)

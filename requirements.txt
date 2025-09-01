@@ -1,13 +1,9 @@
 fastapi==0.115.0
 uvicorn[standard]==0.30.6
-gunicorn==21.2.0
+gunicorn==22.0.0
 python-dotenv==1.0.1
 line-bot-sdk==3.13.0
 requests==2.32.3
 beautifulsoup4==4.12.3
 cloudscraper==1.2.71
-<<<<<<< HEAD
 google-cloud-firestore==2.16.0
-=======
-google-cloud-firestore==2.16.0
->>>>>>> 3bf2749 (Add Dockerfile/cloudbuild and requirements)
