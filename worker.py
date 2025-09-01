@@ -1,50 +1,34 @@
-# worker.py — 住宅網路抓票 Worker（搭配雲端 Cloud Run Webhook/Firestore）
-# 需求套件：google-cloud-firestore, requests, beautifulsoup4, cloudscraper(可選), python-dotenv
-
-import os, time, random, hashlib, re, unicodedata, logging, sys
-try:
-    sys.stdout.reconfigure(encoding="utf-8")
-    sys.stderr.reconfigure(encoding="utf-8")
-except Exception:
-    pass
-
-from datetime import datetime
+# worker.py — 住宅網路模式輪詢 Worker（使用 Firestore FieldFilter）
+import os, sys, time, random, hashlib, re, unicodedata, logging
 from typing import Tuple, Optional, List, Dict
+from datetime import datetime
+from pathlib import Path
 
 from dotenv import load_dotenv
-from urllib.parse import urlparse
 
 # ---- HTTP 抓取 ----
 import requests
 try:
-    import cloudscraper  # 可選：繞過部分 Cloudflare
+    import cloudscraper  # 可選：減少被 CF 擋的機率
 except ImportError:
     cloudscraper = None
 
 from bs4 import BeautifulSoup
 
-# ---- Firestore ----
+# ---- LINE v3（僅需 Access Token 可推播）----
+from linebot.v3.messaging import (
+    Configuration, ApiClient, MessagingApi,
+    PushMessageRequest, TextMessage as V3TextMessage, ApiException
+)
+
+# ---- Firestore（新版 where 寫法）----
 from google.cloud import firestore
+from google.cloud.firestore_v1 import FieldFilter, Query
 
 # ========= 基本設定 =========
-load_dotenv(override=False)
+ENV_PATH = Path(__file__).with_name(".env")
+load_dotenv(override=False)  # 本機可放 .env；Cloud 上不覆蓋
 
-LINE_CHANNEL_ACCESS_TOKEN = (os.getenv("LINE_CHANNEL_ACCESS_TOKEN") or "").strip()
-if not LINE_CHANNEL_ACCESS_TOKEN:
-    print("❌ 請在 .env 或環境變數設定 LINE_CHANNEL_ACCESS_TOKEN")
-    sys.exit(1)
-
-# 本機請先執行：gcloud auth application-default login
-# 讓 Firestore Client 能用 ADC 認證
-db = firestore.Client()  # 自動取用預設專案；若要指定專案可傳 project="your-project-id"
-TASKS = db.collection("tasks")
-
-DEFAULT_INTERVAL = int(os.getenv("DEFAULT_INTERVAL", "15"))  # 秒
-SLEEP_BETWEEN_TASKS = (0.5, 1.2)  # 每個任務之間的抖動休息
-LOOP_IDLE_SLEEP = (5, 10)         # 若沒任務可做，暫停幾秒後再輪詢
-REQUEST_TIMEOUT = 12
-
-# ========= Logger =========
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s %(levelname)s %(name)s: %(message)s",
@@ -52,18 +36,32 @@ logging.basicConfig(
     force=True,
 )
 logger = logging.getLogger("tixworker")
+logger.setLevel(logging.INFO)
+logger.handlers.clear()
+logger.addHandler(logging.StreamHandler(sys.stdout))
+logger.propagate = False
 
-# ========= 關鍵字規則 =========
-SOLDOUT_KEYWORDS = [
-    "售完", "完售", "已售完", "已售罄", "已無票",
-    "sold out", "soldout", "no tickets", "unavailable"
-]
-TICKET_KEYWORDS = [
-    "立即購票", "購票", "加入購物車", "選擇座位", "剩餘", "可售", "尚有", "開賣",
-    "tickets", "buy now", "add to cart", "select seats", "available"
-]
+# 票頁抓取 UA
+UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126 Safari/537.36"
 
-# ========= 小工具 =========
+# 讀取環境變數
+LINE_CHANNEL_ACCESS_TOKEN = (os.getenv("LINE_CHANNEL_ACCESS_TOKEN") or "").strip()
+DEFAULT_INTERVAL = int(os.getenv("DEFAULT_INTERVAL", "15"))  # 秒
+
+if not LINE_CHANNEL_ACCESS_TOKEN:
+    logger.warning("環境變數 LINE_CHANNEL_ACCESS_TOKEN 未設定，將無法推播 LINE 訊息。")
+
+# ========= 建立外部服務客戶端 =========
+# LINE client（只有 token 就能 push）
+line_conf = Configuration(access_token=LINE_CHANNEL_ACCESS_TOKEN) if LINE_CHANNEL_ACCESS_TOKEN else None
+api_client = ApiClient(line_conf) if line_conf else None
+messaging_api = MessagingApi(api_client) if api_client else None
+
+# Firestore（本機請先設定 ADC）
+db = firestore.Client()
+TASKS = db.collection("tasks")
+
+# ========= 共用工具 =========
 def _now_ts() -> int:
     return int(time.time())
 
@@ -72,75 +70,68 @@ def normalize_text(s: str) -> str:
     s = re.sub(r"\s+", " ", s).strip()
     return s
 
-UA_POOL = [
-    # 常見瀏覽器 UA（隨機選一個）
-    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126 Safari/537.36",
-    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.4 Safari/605.1.15",
-    "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:128.0) Gecko/20100101 Firefox/128.0",
-]
-
-def build_session():
-    # cloudscraper 若存在，優先用；否則 requests.Session
-    s = cloudscraper.create_scraper(
-        browser={"browser": "chrome", "platform": "windows"},
-        delay=random.uniform(1.0, 3.0),
-    ) if cloudscraper else requests.Session()
-    s.headers.update({
-        "User-Agent": random.choice(UA_POOL),
+def fetch_html(url: str, timeout: int = 15) -> str:
+    """
+    盡量模擬正常瀏覽器請求。若有 cloudscraper 就用，否則退回 requests。
+    """
+    headers = {
+        "User-Agent": UA,
         "Accept-Language": "zh-TW,zh;q=0.9,en;q=0.8",
         "Cache-Control": "no-cache",
         "Pragma": "no-cache",
-    })
-    return s
-
-def fetch_html(url: str, timeout=REQUEST_TIMEOUT) -> str:
-    s = build_session()
-    # 盡量帶上合理 Referer（同網域）
-    try:
-        host = urlparse(url).scheme + "://" + urlparse(url).netloc
-        s.headers["Referer"] = host
-    except Exception:
-        pass
-    r = s.get(url, timeout=timeout)
+    }
+    session = cloudscraper.create_scraper(
+        browser={"browser": "chrome", "platform": "windows"}
+    ) if cloudscraper else requests.Session()
+    r = session.get(url, headers=headers, timeout=timeout)
     r.raise_for_status()
     return r.text
 
 def extract_snapshot_and_ticket(html: str) -> Tuple[str, bool]:
     """
-    取出頁面純文字快照 + 是否判定「有票」（關鍵字邏輯）
+    擷取頁面文字快照，並以關鍵字粗略判定是否「疑似有票」。
     """
     soup = BeautifulSoup(html, "html.parser")
     for tag in soup(["script", "style", "noscript"]):
         tag.decompose()
 
     text = normalize_text(soup.get_text(" ", strip=True))
+
+    # 可依站點微調
+    soldout_keywords = ["售完", "完售", "已售完", "已售罄", "已無票", "sold out", "soldout"]
+    ticket_keywords  = ["立即購票", "購票", "加入購物車", "選擇座位", "剩餘", "可售", "尚有", "開賣", "tickets"]
+
     t_low = text.lower()
+    has_ticket = any(kw.lower() in t_low for kw in ticket_keywords) and not any(
+        kw.lower() in t_low for kw in soldout_keywords
+    )
 
-    has_ticket_kw = any(kw.lower() in t_low for kw in TICKET_KEYWORDS)
-    has_soldout_kw = any(kw.lower() in t_low for kw in SOLDOUT_KEYWORDS)
-    has_ticket = has_ticket_kw and not has_soldout_kw
-
-    # 蒐集可能重要的按鈕文字
-    btns = []
+    important_bits = []
     for btn in soup.find_all(["a", "button"]):
         t = btn.get_text(" ", strip=True)
         if t:
-            btns.append(normalize_text(t))
-    snapshot = text + "\n\nBTN:" + "|".join(btns[:50])
-
+            important_bits.append(normalize_text(t))
+    snapshot = text + "\n\nBTN:" + "|".join(important_bits[:80])
     return snapshot, has_ticket
 
-def has_ticket_in_snapshot(snapshot: str) -> bool:
-    t_low = normalize_text(snapshot).lower()
-    return (any(kw.lower() in t_low for kw in TICKET_KEYWORDS)
-            and not any(kw.lower() in t_low for kw in SOLDOUT_KEYWORDS))
+def push_line(user_id: str, message: str):
+    if not messaging_api:
+        logger.warning(f"[push] 無 LINE client，略過推播：{message[:60]}...")
+        return
+    try:
+        messaging_api.push_message(
+            PushMessageRequest(to=user_id, messages=[V3TextMessage(text=message)])
+        )
+        logger.info(f"[push] 推播成功 -> {user_id}")
+    except ApiException as e:
+        logger.error(f"[push] LINE API error: {e}")
 
-def sha(s: str) -> str:
-    return hashlib.sha256((s or "").encode("utf-8")).hexdigest()
-
-# ========= Firestore 資料層 =========
-def list_all_active_tasks() -> List[Dict]:
-    docs = TASKS.where("is_active", "==", True).stream()
+# ========= Firestore 資料操作（使用 FieldFilter）=========
+def list_due_active_tasks(now_ts: int) -> List[Dict]:
+    """
+    取出 is_active=True 的任務；是否到期在迴圈中判斷，避免複雜索引。
+    """
+    docs = TASKS.where(filter=FieldFilter("is_active", "==", True)).stream()
     return [d.to_dict() for d in docs]
 
 def update_after_check(tid: str, snapshot: str):
@@ -149,111 +140,99 @@ def update_after_check(tid: str, snapshot: str):
         "last_checked": _now_ts(),
     })
 
-# ========= LINE Push =========
-def line_push_text(to_user_id: str, text: str) -> bool:
-    url = "https://api.line.me/v2/bot/message/push"
-    headers = {
-        "Authorization": f"Bearer {LINE_CHANNEL_ACCESS_TOKEN}",
-        "Content-Type": "application/json; charset=utf-8",
-    }
-    data = {
-        "to": to_user_id,
-        "messages": [{"type": "text", "text": text[:1000]}],  # LINE 單則上限 1000 字左右
-    }
-    try:
-        resp = requests.post(url, json=data, headers=headers, timeout=10)
-        if resp.status_code >= 300:
-            logger.error(f"[push] {resp.status_code} {resp.text}")
-            return False
-        return True
-    except Exception as e:
-        logger.exception(f"[push] error: {e}")
-        return False
-
-# ========= 主流程 =========
-def do_one_pass() -> int:
-    """
-    進行一輪掃描；回傳本輪「實際檢查的任務數」
-    """
-    tasks = list_all_active_tasks()
-    if not tasks:
-        return 0
-
+# ========= 單次輪詢邏輯 =========
+def run_once():
+    now = _now_ts()
+    tasks = list_due_active_tasks(now)
     random.shuffle(tasks)
-    checked = 0
 
+    checked = 0
     for t in tasks:
         try:
             tid = t.get("tid")
-            url = t.get("url")
-            user_id = t.get("user_id")
+            url = t.get("url") or ""
+            user_id = t.get("user_id") or ""
             interval_sec = int(t.get("interval_sec", DEFAULT_INTERVAL))
             last_checked = int(t.get("last_checked", 0))
-            last_snapshot = t.get("last_snapshot") or ""
 
-            # 間隔控制
-            if _now_ts() - last_checked < max(5, min(300, interval_sec)):
+            # 間隔控管
+            if (now - last_checked) < max(5, min(300, interval_sec)):
                 continue
+
+            logger.info(f"[tick] checking #{tid} {url}")
 
             # 抓頁
             try:
                 html = fetch_html(url)
             except requests.HTTPError as he:
-                status = he.response.status_code if he.response is not None else "?"
-                logger.warning(f"[task {tid}] HTTP {status} for {url}")
-                # 照樣更新 last_checked，避免一直猛打被擋的頁
-                update_after_check(tid, last_snapshot)
-                checked += 1
-                time.sleep(random.uniform(*SLEEP_BETWEEN_TASKS))
+                # 例如 403/404/5xx
+                status = getattr(he.response, "status_code", None)
+                logger.warning(f"[tick] task#{tid} HTTPError {status} for {url}")
+                # 即便失敗也更新 last_checked，避免連續轟炸
+                TASKS.document(tid).update({"last_checked": _now_ts()})
+                time.sleep(random.uniform(0.2, 0.6))
                 continue
             except Exception as e:
-                logger.warning(f"[task {tid}] fetch error: {e}")
-                update_after_check(tid, last_snapshot)
-                checked += 1
-                time.sleep(random.uniform(*SLEEP_BETWEEN_TASKS))
+                logger.error(f"[tick] task#{tid} fetch error: {e}")
+                TASKS.document(tid).update({"last_checked": _now_ts()})
+                time.sleep(random.uniform(0.2, 0.6))
                 continue
 
-            snapshot, has_ticket_now = extract_snapshot_and_ticket(html)
-            prev_has = has_ticket_in_snapshot(last_snapshot)
+            # 判定
+            snapshot, has_ticket = extract_snapshot_and_ticket(html)
+            new_hash = hashlib.sha256(snapshot.encode("utf-8")).hexdigest()
+            old_hash = hashlib.sha256((t.get("last_snapshot") or "").encode("utf-8")).hexdigest()
 
-            # 更新 Firestore（先更新時間與快照）
             update_after_check(tid, snapshot)
-            checked += 1
 
-            # 通知條件：現在判定有票，且上一版沒有
-            if has_ticket_now and not prev_has:
+            # 有變化而且疑似有票 -> 推播
+            if new_hash != old_hash and has_ticket:
                 msg = (
                     "🎉 疑似有票釋出！\n"
-                    f"任務 #{tid}\n"
-                    f"{url}\n"
+                    f"任務#{tid}\n{url}\n"
                     "（建議立刻點進去檢查與購買）"
                 )
-                ok = line_push_text(user_id, msg)
-                logger.info(f"[task {tid}] push {'OK' if ok else 'FAIL'}")
+                push_line(user_id, msg)
+            else:
+                logger.info(f"[tick] task#{tid} has_ticket={has_ticket} changed={new_hash != old_hash}")
 
-            time.sleep(random.uniform(*SLEEP_BETWEEN_TASKS))
+            checked += 1
+            time.sleep(random.uniform(0.2, 0.6))
 
         except Exception as e:
-            logger.exception(f"[task {t.get('tid')}] unhandled: {e}")
-            # 不退出，繼續跑下一個
+            logger.exception(f"[tick] task#{t.get('tid')} unexpected error: {e}")
 
     return checked
 
+# ========= 主程式：持續輪詢 =========
 def main():
     logger.info("worker 啟動（住宅網路模式）")
+    oneshot = os.getenv("ONESHOT", "").lower() in ("1", "true", "yes")
+
+    if oneshot:
+        c = run_once()
+        logger.info(f"oneshot 完成，checked={c}")
+        return
+
+    # 常駐輪詢
+    base_sleep = int(os.getenv("WORKER_LOOP_SLEEP", "3"))  # 每輪間隔
     while True:
+        start = time.time()
         try:
-            n = do_one_pass()
-            if n == 0:
-                # 沒任務可做或都未到時間
-                time.sleep(random.uniform(*LOOP_IDLE_SLEEP))
-            # 否則立刻再跑下一輪（每個任務內已有節流）
-        except KeyboardInterrupt:
-            logger.info("收到中斷，結束。")
-            break
+            checked = run_once()
+            dur = time.time() - start
+            logger.info(f"[loop] 本輪完成 checked={checked} duration={dur:.2f}s")
         except Exception as e:
-            logger.exception(f"[loop] error: {e}")
-            time.sleep(3)
+            logger.exception(f"[loop] fatal: {e}")
+        # 輪與輪之間稍微休息，避免過度打擾網站
+        time.sleep(base_sleep + random.uniform(0.0, 1.0))
 
 if __name__ == "__main__":
+    # 可選：消音舊版 Firestore where 警告（我們已改新寫法，理論上不會再看到）
+    # import warnings
+    # warnings.filterwarnings(
+    #     "ignore",
+    #     category=UserWarning,
+    #     module="google.cloud.firestore_v1.base_collection",
+    # )
     main()
