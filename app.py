@@ -6,6 +6,7 @@ from typing import Tuple, Optional, List, Dict
 
 from fastapi import FastAPI, Request, Header, HTTPException
 from fastapi.responses import JSONResponse, PlainTextResponse
+from fastapi import Header
 from dotenv import load_dotenv
 from pathlib import Path
 
@@ -24,12 +25,13 @@ from google.cloud import firestore
 
 logging.basicConfig(
     level=logging.INFO,
-    format="%(asctime)s | %(levelname)s | %(name)s | %(message)s",
-    stream=sys.stdout,
+    format="%(asctime)s %(levelname)s %(name)s: %(message)s",
+    handlers=[logging.StreamHandler(sys.stdout)],
+    force=True,  # 覆蓋預設設定，避免沒有 handler
 )
 
 ENV_PATH = Path(__file__).with_name(".env")   # 固定讀取和 app.py 同一層的 .env
-ok = load_dotenv(dotenv_path=ENV_PATH, override=True)
+ok = load_dotenv(dotenv_path=ENV_PATH, override=False)
 
 # 啟動時印診斷，方便確認是否讀到
 print(f"[ENV] path={ENV_PATH} exists={ENV_PATH.exists()} loaded={ok}")
@@ -167,19 +169,22 @@ logger.propagate = False
 # ========== Webhook（LINE → /callback）==========
 @app.post("/callback")
 @app.post("/callback/")
-async def callback(request: Request, x_line_signature: str | None = Header(default=None)):
-    body_text = (await request.body()).decode("utf-8", errors="ignore")
-    logger.info(f"[callback] UA={request.headers.get('user-agent')} "
-                f"sig={'Y' if x_line_signature else 'N'} body={body_text[:300]}")
+async def callback(request: Request,
+                   x_line_signature: str | None = Header(None, alias="X-Line-Signature")):
+    body_bytes = await request.body()
+    body_text = body_bytes.decode("utf-8", errors="ignore")
+    logger.info("[callback] UA=%s sig=%s body=%s",
+                request.headers.get("user-agent"),
+                "Y" if x_line_signature else "N",
+                body_text[:200])
 
     if not x_line_signature:
-        # LINE 後台的 Verify 會走這裡（沒帶簽章），直接 200
         return PlainTextResponse("OK", status_code=200)
 
     try:
         handler.handle(body_text, x_line_signature)
     except InvalidSignatureError:
-        logger.error("[callback] invalid signature (check LINE_CHANNEL_SECRET)")
+        logger.error("[callback] Invalid signature (check LINE_CHANNEL_SECRET)")
         raise HTTPException(status_code=400, detail="Invalid signature")
 
     return PlainTextResponse("OK", status_code=200)
