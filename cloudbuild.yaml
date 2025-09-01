@@ -1,31 +1,41 @@
-# cloudbuild.yaml
+# cloudbuild.yaml － Build & Push 到 Artifact Registry，然後部署 Cloud Run
 options:
-  logging: CLOUD_LOGGING_ONLY
+  logging: CLOUD_LOGGING_ONLY   # 避免要求指定 logsBucket
 
-# cloudbuild.yaml － 走 Artifact Registry + Cloud Run
 substitutions:
   _REGION: asia-east1
   _SERVICE: ticketsearch
   _REPO: cloud-run-source-deploy
-  _IMAGE: asia-east1-docker.pkg.dev/$PROJECT_ID/${_REPO}/${_SERVICE}:$COMMIT_SHA
+
+# 產生的映像名稱（這裡用內建變數，讓 Cloud Build 來替換）
+# 也可以改成 $COMMIT_SHA，但 $SHORT_SHA 比較短
+images:
+- 'asia-east1-docker.pkg.dev/$PROJECT_ID/${_REPO}/${_SERVICE}:$SHORT_SHA'
 
 steps:
-# Build image
+# Build
 - name: 'gcr.io/cloud-builders/docker'
-  args: ['build', '-t', '${_IMAGE}', '.']
+  args:
+    - 'build'
+    - '-t'
+    - 'asia-east1-docker.pkg.dev/$PROJECT_ID/${_REPO}/${_SERVICE}:$SHORT_SHA'
+    - '.'
 
-# Push image
+# Push
 - name: 'gcr.io/cloud-builders/docker'
-  args: ['push', '${_IMAGE}']
+  args:
+    - 'push'
+    - 'asia-east1-docker.pkg.dev/$PROJECT_ID/${_REPO}/${_SERVICE}:$SHORT_SHA'
 
-# Deploy to Cloud Run（連同 Secrets / 環境變數）
-- name: 'gcr.io/cloud-builders/gcloud'
+# Deploy to Cloud Run
+- name: 'gcr.io/google.com/cloudsdktool/cloud-sdk'
+  entrypoint: gcloud
   args:
     - run
     - deploy
     - '${_SERVICE}'
     - --image
-    - '${_IMAGE}'
+    - 'asia-east1-docker.pkg.dev/$PROJECT_ID/${_REPO}/${_SERVICE}:$SHORT_SHA'
     - --region
     - '${_REGION}'
     - --allow-unauthenticated
@@ -33,6 +43,3 @@ steps:
     - 'LINE_CHANNEL_ACCESS_TOKEN=line-channel-token:latest,LINE_CHANNEL_SECRET=line-channel-secret:latest,CRON_KEY=cron-key:latest'
     - --set-env-vars
     - 'DEFAULT_INTERVAL=15'
-
-images:
-- '${_IMAGE}'
