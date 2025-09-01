@@ -2,6 +2,12 @@
 # 需求套件：google-cloud-firestore, requests, beautifulsoup4, cloudscraper(可選), python-dotenv
 
 import os, time, random, hashlib, re, unicodedata, logging, sys
+try:
+    sys.stdout.reconfigure(encoding="utf-8")
+    sys.stderr.reconfigure(encoding="utf-8")
+except Exception:
+    pass
+
 from datetime import datetime
 from typing import Tuple, Optional, List, Dict
 
@@ -234,7 +240,7 @@ def do_one_pass() -> int:
     return checked
 
 def main():
-    logger.info("🏠 worker 啟動（住宅網路模式）")
+    logger.info("worker 啟動（住宅網路模式）")
     while True:
         try:
             n = do_one_pass()
