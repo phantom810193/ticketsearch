@@ -63,6 +63,9 @@ LINE_CHANNEL_ACCESS_TOKEN = (os.getenv("LINE_CHANNEL_ACCESS_TOKEN") or "").strip
 DEFAULT_INTERVAL = int(os.getenv("DEFAULT_INTERVAL", "15"))  # 秒
 CRON_KEY = os.getenv("CRON_KEY", "")  # 可選：保護 /cron/tick
 
+# === NEW: 預期的 NAT 對外 IP（可選，用於對照一致性） ===
+EXPECTED_EGRESS_IP = (os.getenv("EXPECTED_EGRESS_IP") or "").strip()
+
 if not LINE_CHANNEL_SECRET or not LINE_CHANNEL_ACCESS_TOKEN:
     raise RuntimeError("請設定 LINE_CHANNEL_ACCESS_TOKEN 與 LINE_CHANNEL_SECRET 環境變數")
 
@@ -90,9 +93,11 @@ USAGE = (
     "・/watch <URL> [秒數]：開始監看（例：/watch https://tixcraft.com/... 15）\n"
     "・/list：查看我的監看列表\n"
     "・/stop <任務ID>：停止指定監看任務\n"
+    "・ip：回報 Cloud Run 對外 IP（驗證 Direct VPC egress）\n"
     "・輸入「取得說明」或 /start 可再看此訊息"
 )
 HELP_ALIASES = {"/start", "/help", "help", "取得說明", "說明", "指令", "使用說明", "開始使用", "教我用"}
+IP_ALIASES = {"ip", "/ip", "出口ip", "我的ip"}  # === NEW ===
 
 
 # ========= 小工具 =========
@@ -260,6 +265,12 @@ def push(user_id: str, message: str):
         logger.error(f"[push] LINE API error: {e}")
 
 
+# ========= 驗證 Direct VPC egress：取得 Cloud Run 對外 IP（經 NAT）=========
+def get_outbound_ip() -> str:
+    # 由 Cloud Run 內部對外呼叫，看到的就是 NAT 後的出口 IP
+    return requests.get("https://api.ipify.org", timeout=5).text.strip()
+
+
 # ========= Webhook（LINE → /callback）=========
 @app.post("/callback")
 @app.post("/callback/")
@@ -292,6 +303,19 @@ def handle_message(event: MessageEvent):
     logger.info(f"[event] user={user_id} text={text} replyToken={event.reply_token}")
 
     try:
+        # === NEW: 驗證 Direct VPC egress（輸入 'ip' / '/ip' / '出口ip' / '我的ip'） ===
+        if text.lower() in IP_ALIASES:
+            try:
+                ip = get_outbound_ip()
+                lines = [f"Cloud Run 對外 IP：{ip}"]
+                if EXPECTED_EGRESS_IP:
+                    lines.append(f"預期（NAT）：{EXPECTED_EGRESS_IP}")
+                    lines.append("是否一致：{}".format("✅ 一致" if ip == EXPECTED_EGRESS_IP else "❌ 不一致"))
+                reply(event, "\n".join(lines))
+            except Exception as e:
+                reply(event, f"查詢對外 IP 失敗：{type(e).__name__} {e}")
+            return
+
         # 說明
         if text.startswith("/start") or text in HELP_ALIASES:
             reply(event, USAGE)
@@ -415,6 +439,21 @@ def debug_check(url: str):
 @app.get("/")
 def health():
     return JSONResponse({"ok": True, "time": datetime.now().isoformat()})
+
+
+# ========= 驗證 Direct VPC egress 的 HTTP 路由（非 LINE）=========
+@app.get("/_ip")
+def show_outbound_ip():
+    try:
+        ip = get_outbound_ip()
+        return JSONResponse({
+            "outbound_ip": ip,
+            "expected": EXPECTED_EGRESS_IP or None,
+            "match": (ip == EXPECTED_EGRESS_IP) if EXPECTED_EGRESS_IP else None,
+        })
+    except Exception as e:
+        logger.exception("Failed to fetch outbound IP")
+        return JSONResponse({"error": f"{type(e).__name__}: {e}"}, status_code=500)
 
 
 # ========= 本機啟動 =========
