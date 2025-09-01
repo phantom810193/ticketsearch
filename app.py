@@ -1,67 +1,85 @@
 # app.py — LINE 票數偵測 Bot（Cloud Run/本機均可）
-import os, time, random, hashlib, re, unicodedata
-import sys, logging
+import os, sys, time, random, hashlib, re, unicodedata, logging
 from datetime import datetime
 from typing import Tuple, Optional, List, Dict
+from pathlib import Path
 
 from fastapi import FastAPI, Request, Header, HTTPException
 from fastapi.responses import JSONResponse, PlainTextResponse
-from fastapi import Header
 from dotenv import load_dotenv
-from pathlib import Path
 
+# ---- LINE Bot SDK v3 ----
 from linebot.v3.webhook import WebhookHandler
 from linebot.v3.webhooks import MessageEvent, TextMessageContent
 from linebot.v3.messaging import (
     Configuration, ApiClient, MessagingApi,
-    ReplyMessageRequest, TextMessage as V3TextMessage,
-    ApiException,  # v3 的 API 例外
+    ReplyMessageRequest, PushMessageRequest,
+    TextMessage as V3TextMessage,
+    ApiException,
 )
 from linebot.v3.exceptions import InvalidSignatureError
 
+# ---- HTTP / 解析 ----
 import requests
 try:
-    import cloudscraper
+    import cloudscraper  # 可選：繞過部分 Cloudflare 防護
 except ImportError:
     cloudscraper = None
 
 from bs4 import BeautifulSoup
+
+# ---- Firestore ----
 from google.cloud import firestore
 
+
+# ========= Logging =========
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s %(levelname)s %(name)s: %(message)s",
     handlers=[logging.StreamHandler(sys.stdout)],
-    force=True,  # 覆蓋預設設定，避免沒有 handler
+    force=True,
 )
+logger = logging.getLogger("tixwatch")
+logger.setLevel(logging.INFO)
+logger.handlers.clear()
+logger.addHandler(logging.StreamHandler(sys.stdout))
+logger.propagate = False
 
-ENV_PATH = Path(__file__).with_name(".env")   # 固定讀取和 app.py 同一層的 .env
-load_dotenv(override=False)
 
-# 啟動時印診斷，方便確認是否讀到
+# ========= 環境變數 =========
+ENV_PATH = Path(__file__).with_name(".env")  # 固定讀取和 app.py 同層 .env
+load_dotenv(override=False)                  # 不覆蓋 Cloud Run 的環境
+
 print("[ENV] TOKEN?", bool(os.getenv("LINE_CHANNEL_ACCESS_TOKEN")))
 print("[ENV] SECRET?", bool(os.getenv("LINE_CHANNEL_SECRET")))
 
-# ---- 必填環境變數（建議放 Secret Manager 並在部署時綁到環境）----
 LINE_CHANNEL_SECRET = (os.getenv("LINE_CHANNEL_SECRET") or "").strip()
 LINE_CHANNEL_ACCESS_TOKEN = (os.getenv("LINE_CHANNEL_ACCESS_TOKEN") or "").strip()
 DEFAULT_INTERVAL = int(os.getenv("DEFAULT_INTERVAL", "15"))  # 秒
 CRON_KEY = os.getenv("CRON_KEY", "")  # 可選：保護 /cron/tick
 
-app = FastAPI(title="tixwatch-linebot")
-
-# 若 token/secret 沒給，避免初始化失敗
 if not LINE_CHANNEL_SECRET or not LINE_CHANNEL_ACCESS_TOKEN:
     raise RuntimeError("請設定 LINE_CHANNEL_ACCESS_TOKEN 與 LINE_CHANNEL_SECRET 環境變數")
 
+
+# ========= FastAPI =========
+app = FastAPI(title="tixwatch-linebot")
+
+
+# ========= LINE v3 初始化 =========
 configuration = Configuration(access_token=LINE_CHANNEL_ACCESS_TOKEN)
 api_client = ApiClient(configuration)
 messaging_api = MessagingApi(api_client)
 handler = WebhookHandler(LINE_CHANNEL_SECRET)
 
-# Firestore（本機請先設定 ADC；Cloud Run 上會自動帶服務帳戶）
-db = firestore.Client()
 
+# ========= Firestore =========
+# 本機需先設定 ADC；Cloud Run 上會自動帶服務帳戶
+db = firestore.Client()
+TASKS = db.collection("tasks")
+
+
+# ========= 使用說明 =========
 USAGE = (
     "🎫 票數偵測 Bot 使用說明\n"
     "・/watch <URL> [秒數]：開始監看（例：/watch https://tixcraft.com/... 15）\n"
@@ -71,9 +89,8 @@ USAGE = (
 )
 HELP_ALIASES = {"/start", "/help", "help", "取得說明", "說明", "指令", "使用說明", "開始使用", "教我用"}
 
-# ========== Firestore 資料層 ==========
-TASKS = db.collection("tasks")
 
+# ========= 小工具 =========
 def _now_ts() -> int:
     return int(time.time())
 
@@ -120,7 +137,8 @@ def all_active_tasks() -> List[Dict]:
 def update_after_check(tid: str, snapshot: str):
     TASKS.document(tid).update({"last_snapshot": snapshot, "last_checked": _now_ts()})
 
-# ========== 抓頁 & 判定 ==========
+
+# ========= 抓頁 & 判定 =========
 UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126 Safari/537.36"
 
 def fetch_html(url: str, timeout=15) -> str:
@@ -165,14 +183,32 @@ def norm(s: Optional[str]) -> str:
     s = unicodedata.normalize("NFKC", s).strip().lower()
     return re.sub(r"\s+", " ", s)
 
-# ========== Logger ==========
-logger = logging.getLogger("tixwatch")
-logger.setLevel(logging.INFO)
-logger.handlers.clear()
-logger.addHandler(logging.StreamHandler(sys.stdout))
-logger.propagate = False
 
-# ========== Webhook（LINE → /callback）==========
+# ========= LINE 回覆/推播（v3）=========
+def reply(event: MessageEvent, text: str):
+    try:
+        messaging_api.reply_message(
+            ReplyMessageRequest(
+                reply_token=event.reply_token,
+                messages=[V3TextMessage(text=text)]
+            )
+        )
+    except ApiException as e:
+        logger.exception(f"[reply] LINE API error: {e}")
+
+def push(user_id: str, message: str):
+    try:
+        messaging_api.push_message(
+            PushMessageRequest(
+                to=user_id,
+                messages=[V3TextMessage(text=message)]
+            )
+        )
+    except ApiException as e:
+        logger.error(f"[push] LINE API error: {e}")
+
+
+# ========= Webhook（LINE → /callback）=========
 @app.post("/callback")
 @app.post("/callback/")
 async def callback(request: Request,
@@ -195,26 +231,23 @@ async def callback(request: Request,
 
     return PlainTextResponse("OK", status_code=200)
 
-# ========== 訊息處理 ==========
+
+# ========= 訊息處理 =========
 @handler.add(MessageEvent, message=TextMessageContent)
 def handle_message(event: MessageEvent):
     text = (event.message.text or "").strip()
-    # ✅ 一次正確取得 user_id；群組/聊天室可自行擴充
-    user_id = getattr(event.source, "user_id", None)
+    # v3 source 常見欄位：userId / groupId / roomId
+    user_id = getattr(event.source, "userId", None) or getattr(event.source, "user_id", None)
     logger.info(f"[event] user={user_id} text={text} replyToken={event.reply_token}")
 
     try:
         if text.startswith("/start") or text in HELP_ALIASES:
-            line_bot_api.reply_message(
-                event.reply_token,
-                TextSendMessage(text=USAGE)
-            )
-            logger.info("[event] reply sent OK")
+            reply(event, USAGE)
             return
 
         # ---- /watch ----
         if text.startswith("/watch"):
-            parts = text.split()  # ✅ 修正：原本用 raw.split()（未定義）
+            parts = text.split()
             if len(parts) < 2:
                 reply(event, "用法：/watch <URL> [秒數]")
                 return
@@ -249,7 +282,7 @@ def handle_message(event: MessageEvent):
 
         # ---- /stop ----
         if text.startswith("/stop"):
-            parts = text.split()  # ✅ 修正：原本用 raw.split()（未定義）
+            parts = text.split()
             if len(parts) < 2:
                 reply(event, "用法：/stop <任務ID>")
                 return
@@ -258,36 +291,16 @@ def handle_message(event: MessageEvent):
             reply(event, f"{'已停止' if ok else '找不到'}任務 #{tid}")
             return
 
-        # 其他訊息：先 echo 確認回覆正常
-        line_bot_api.reply_message(event.reply_token, TextSendMessage(text=f"echo: {text}"))
-        logger.info("[event] reply sent OK")
+        # 其他訊息：echo
+        reply(event, f"echo: {text}")
 
-    except LineBotApiError as e:
-        # 更穩健的錯誤輸出
-        detail = getattr(e, "error", None)
-        logger.error(f"[event] LINE API error status={getattr(e, 'status_code', '?')} detail={detail}")
+    except ApiException as e:
+        logger.error(f"[event] LINE API error: {e}")
     except Exception as e:
         logger.exception(f"[event] unhandled error: {e}")
 
-# ========== LINE 工具 ==========
-def reply(event, text: str):
-    try:
-        messaging_api.reply_message(
-            ReplyMessageRequest(
-                reply_token=event.reply_token,
-                messages=[V3TextMessage(text=text)]
-            )
-        )
-    except ApiException as e:
-        logging.exception(f"LINE reply failed: {e}")
 
-def push(user_id: str, message: str):
-    try:
-        line_bot_api.push_message(user_id, TextSendMessage(text=message))
-    except LineBotApiError as e:
-        logger.error(f"[push] error status={getattr(e, 'status_code', '?')} detail={getattr(e, 'error', None)}")
-
-# ========== 定時偵測（Cloud Scheduler → /cron/tick）==========
+# ========= 定時偵測（Cloud Scheduler → /cron/tick）=========
 @app.get("/cron/tick")
 async def cron_tick(request: Request):
     # 可選：用簡單金鑰防護
@@ -315,10 +328,14 @@ async def cron_tick(request: Request):
             logger.error(f"[tick] task#{t.get('tid')} error: {e}")
     return JSONResponse({"ok": True, "checked": checked})
 
+
+# ========= 健康檢查 =========
 @app.get("/")
 def health():
     return JSONResponse({"ok": True, "time": datetime.now().isoformat()})
 
+
+# ========= 本機啟動 =========
 if __name__ == "__main__":
     import uvicorn
     port = int(os.getenv("PORT", "8000"))
