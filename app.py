@@ -312,31 +312,34 @@ def handle_message(event: MessageEvent):
 # ========= 定時偵測（Cloud Scheduler → /cron/tick）=========
 @app.get("/cron/tick")
 async def cron_tick(request: Request):
-    # 可選：用簡單金鑰防護
     if CRON_KEY and request.headers.get("X-Cron-Key") != CRON_KEY:
+        # 你已經把 header 帶進 Scheduler，這裡留著即可
         raise HTTPException(status_code=403, detail="Forbidden")
 
-    tasks = all_active_tasks()
-    random.shuffle(tasks)
-    checked = 0
-    for t in tasks:
-        # 確保達到用戶設定的輪詢間隔
-        if _now_ts() - int(t.get("last_checked", 0)) < int(t.get("interval_sec", DEFAULT_INTERVAL)):
-            continue
-        try:
-            html = fetch_html(t["url"])
-            snapshot, has_ticket = extract_snapshot_and_ticket(html)
-            new_hash = hashlib.sha256(snapshot.encode("utf-8")).hexdigest()
-            old_hash = hashlib.sha256((t.get("last_snapshot") or "").encode("utf-8")).hexdigest()
-            update_after_check(t["tid"], snapshot)
-            if new_hash != old_hash and has_ticket:
-                push(t["user_id"], f"🎉 疑似有票釋出！\n任務#{t['tid']}\n{t['url']}\n（建議立刻點進去檢查與購買）")
-            checked += 1
-            time.sleep(random.uniform(0.2, 0.6))
-        except Exception as e:
-            logger.error(f"[tick] task#{t.get('tid')} error: {e}")
-    return JSONResponse({"ok": True, "checked": checked})
-
+    try:
+        tasks = all_active_tasks()
+        random.shuffle(tasks)
+        checked = 0
+        for t in tasks:
+            if _now_ts() - int(t.get("last_checked", 0)) < int(t.get("interval_sec", DEFAULT_INTERVAL)):
+                continue
+            try:
+                html = fetch_html(t["url"])
+                snapshot, has_ticket = extract_snapshot_and_ticket(html)
+                new_hash = hashlib.sha256(snapshot.encode("utf-8")).hexdigest()
+                old_hash = hashlib.sha256((t.get("last_snapshot") or "").encode("utf-8")).hexdigest()
+                update_after_check(t["tid"], snapshot)
+                if new_hash != old_hash and has_ticket:
+                    push(t["user_id"], f"🎉 疑似有票釋出！\n任務#{t['tid']}\n{t['url']}\n（建議立刻點進去檢查與購買）")
+                checked += 1
+                time.sleep(random.uniform(0.2, 0.6))
+            except Exception as e:
+                logger.error(f"[tick] task#{t.get('tid')} error: {e}")
+        return JSONResponse({"ok": True, "checked": checked})
+    except Exception as e:
+        logger.exception(f"[cron_tick] unhandled: {e}")
+        # 回 200 + 錯誤內容，避免 Scheduler 看到 5xx
+        return JSONResponse({"ok": False, "error": str(e)})
 
 # ========= 健康檢查 =========
 @app.get("/")
