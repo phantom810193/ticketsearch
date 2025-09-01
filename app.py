@@ -28,6 +28,10 @@ except ImportError:
 
 from bs4 import BeautifulSoup
 
+def get_user_id(src) -> str | None:
+    # v3 的 SourceUser 是 userId；保險再兼容 user_id
+    return getattr(src, "userId", None) or getattr(src, "user_id", None)
+
 # ---- Firestore ----
 from google.cloud import firestore
 
@@ -236,21 +240,25 @@ async def callback(request: Request,
 @handler.add(MessageEvent, message=TextMessageContent)
 def handle_message(event: MessageEvent):
     text = (event.message.text or "").strip()
-    # v3 source 常見欄位：userId / groupId / roomId
-    user_id = getattr(event.source, "userId", None) or getattr(event.source, "user_id", None)
+    user_id = get_user_id(event.source)
     logger.info(f"[event] user={user_id} text={text} replyToken={event.reply_token}")
 
     try:
+        # 說明
         if text.startswith("/start") or text in HELP_ALIASES:
             reply(event, USAGE)
             return
 
-        # ---- /watch ----
+        # /watch <URL> [秒數]
         if text.startswith("/watch"):
             parts = text.split()
             if len(parts) < 2:
                 reply(event, "用法：/watch <URL> [秒數]")
                 return
+            if not user_id:
+                reply(event, "請在與機器人「1 對 1」聊天中使用 /watch 指令。")
+                return
+
             url = parts[1]
             try:
                 interval_sec = int(parts[2]) if len(parts) >= 3 else DEFAULT_INTERVAL
@@ -258,15 +266,18 @@ def handle_message(event: MessageEvent):
             except ValueError:
                 interval_sec = DEFAULT_INTERVAL
 
-            if not user_id:
-                reply(event, "請在與機器人「1 對 1」聊天中使用 /watch 指令。")
-                return
-
-            tid = add_task(user_id, url, interval_sec)
-            reply(event, f"已建立監看任務 #{tid}\nURL: {url}\n頻率：每 {interval_sec} 秒")
+            # 先回覆已收到，避免 Firestore 出錯就沒回覆
+            reply(event, f"收到，準備監看：\n{url}\n頻率：每 {interval_sec} 秒")
+            try:
+                tid = add_task(user_id, url, interval_sec)
+                # 再補一則確認（可省略）
+                reply(event, f"已建立監看任務 #{tid}")
+            except Exception as e:
+                logger.exception(f"[watch] Firestore error: {e}")
+                reply(event, "⚠️ 目前無法存取資料庫，請稍後再試。")
             return
 
-        # ---- /list ----
+        # /list
         if text.startswith("/list"):
             items = list_tasks(user_id or "")
             if not items:
@@ -280,7 +291,7 @@ def handle_message(event: MessageEvent):
             reply(event, "\n".join(lines))
             return
 
-        # ---- /stop ----
+        # /stop <tid>
         if text.startswith("/stop"):
             parts = text.split()
             if len(parts) < 2:
@@ -291,14 +302,12 @@ def handle_message(event: MessageEvent):
             reply(event, f"{'已停止' if ok else '找不到'}任務 #{tid}")
             return
 
-        # 其他訊息：echo
+        # 其他訊息先 echo
         reply(event, f"echo: {text}")
 
-    except ApiException as e:
-        logger.error(f"[event] LINE API error: {e}")
     except Exception as e:
         logger.exception(f"[event] unhandled error: {e}")
-
+        reply(event, "系統發生錯誤，請稍後再試。")
 
 # ========= 定時偵測（Cloud Scheduler → /cron/tick）=========
 @app.get("/cron/tick")
