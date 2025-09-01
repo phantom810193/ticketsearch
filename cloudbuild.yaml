@@ -1,3 +1,7 @@
+# cloudbuild.yaml
+options:
+  logging: CLOUD_LOGGING_ONLY
+
 # cloudbuild.yaml － 走 Artifact Registry + Cloud Run
 substitutions:
   _REGION: asia-east1
