@@ -28,10 +28,6 @@ except ImportError:
 
 from bs4 import BeautifulSoup
 
-def get_user_id(src) -> str | None:
-    # v3 的 SourceUser 是 userId；保險再兼容 user_id
-    return getattr(src, "userId", None) or getattr(src, "user_id", None)
-
 # ---- Firestore ----
 from google.cloud import firestore
 
@@ -102,6 +98,10 @@ def _gen_tid() -> str:
     import secrets, string
     alphabet = string.ascii_lowercase + string.digits
     return "".join(secrets.choice(alphabet) for _ in range(8))
+
+def get_user_id(src) -> Optional[str]:
+    # v3 的 Source 型別：1對1是 userId；保險再兼容 user_id
+    return getattr(src, "userId", None) or getattr(src, "user_id", None)
 
 def add_task(user_id: str, url: str, interval_sec: int) -> str:
     tid = _gen_tid()
@@ -189,12 +189,16 @@ def norm(s: Optional[str]) -> str:
 
 
 # ========= LINE 回覆/推播（v3）=========
-def reply(event: MessageEvent, text: str):
+def reply(event: MessageEvent, *texts: str):
+    """一次回覆多則訊息，避免重複使用 reply_token。"""
     try:
+        messages = [V3TextMessage(text=t) for t in texts if t]
+        if not messages:
+            return
         messaging_api.reply_message(
             ReplyMessageRequest(
                 reply_token=event.reply_token,
-                messages=[V3TextMessage(text=text)]
+                messages=messages
             )
         )
     except ApiException as e:
@@ -216,7 +220,7 @@ def push(user_id: str, message: str):
 @app.post("/callback")
 @app.post("/callback/")
 async def callback(request: Request,
-                   x_line_signature: str | None = Header(None, alias="X-Line-Signature")):
+                   x_line_signature: Optional[str] = Header(None, alias="X-Line-Signature")):
     body_bytes = await request.body()
     body_text = body_bytes.decode("utf-8", errors="ignore")
     logger.info("[callback] UA=%s sig=%s body=%s",
@@ -266,12 +270,13 @@ def handle_message(event: MessageEvent):
             except ValueError:
                 interval_sec = DEFAULT_INTERVAL
 
-            # 先回覆已收到，避免 Firestore 出錯就沒回覆
-            reply(event, f"收到，準備監看：\n{url}\n頻率：每 {interval_sec} 秒")
             try:
                 tid = add_task(user_id, url, interval_sec)
-                # 再補一則確認（可省略）
-                reply(event, f"已建立監看任務 #{tid}")
+                reply(
+                    event,
+                    f"收到，準備監看：\n{url}",
+                    f"已建立監看任務 #{tid}（頻率：每 {interval_sec} 秒）"
+                )
             except Exception as e:
                 logger.exception(f"[watch] Firestore error: {e}")
                 reply(event, "⚠️ 目前無法存取資料庫，請稍後再試。")
@@ -309,11 +314,12 @@ def handle_message(event: MessageEvent):
         logger.exception(f"[event] unhandled error: {e}")
         reply(event, "系統發生錯誤，請稍後再試。")
 
+
 # ========= 定時偵測（Cloud Scheduler → /cron/tick）=========
 @app.get("/cron/tick")
 async def cron_tick(request: Request):
+    # 可選：用 header 做最簡保護
     if CRON_KEY and request.headers.get("X-Cron-Key") != CRON_KEY:
-        # 你已經把 header 帶進 Scheduler，這裡留著即可
         raise HTTPException(status_code=403, detail="Forbidden")
 
     try:
@@ -321,6 +327,7 @@ async def cron_tick(request: Request):
         random.shuffle(tasks)
         checked = 0
         for t in tasks:
+            # 遵守用戶設定的輪詢間隔
             if _now_ts() - int(t.get("last_checked", 0)) < int(t.get("interval_sec", DEFAULT_INTERVAL)):
                 continue
             try:
@@ -340,6 +347,7 @@ async def cron_tick(request: Request):
         logger.exception(f"[cron_tick] unhandled: {e}")
         # 回 200 + 錯誤內容，避免 Scheduler 看到 5xx
         return JSONResponse({"ok": False, "error": str(e)})
+
 
 # ========= 健康檢查 =========
 @app.get("/")
