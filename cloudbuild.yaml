@@ -1,45 +1,36 @@
-# cloudbuild.yaml － Build & Push 到 Artifact Registry，然後部署 Cloud Run
 options:
-  logging: CLOUD_LOGGING_ONLY   # 避免要求指定 logsBucket
+  logging: CLOUD_LOGGING_ONLY
 
 substitutions:
   _REGION: asia-east1
   _SERVICE: ticketsearch
   _REPO: cloud-run-source-deploy
 
-# 產生的映像名稱（這裡用內建變數，讓 Cloud Build 來替換）
-# 也可以改成 $COMMIT_SHA，但 $SHORT_SHA 比較短
 images:
 - 'asia-east1-docker.pkg.dev/$PROJECT_ID/${_REPO}/${_SERVICE}:$SHORT_SHA'
 
 steps:
 # Build
-- name: 'gcr.io/cloud-builders/docker'
-  args:
-    - 'build'
-    - '-t'
-    - 'asia-east1-docker.pkg.dev/$PROJECT_ID/${_REPO}/${_SERVICE}:$SHORT_SHA'
-    - '.'
+- name: gcr.io/cloud-builders/docker
+  args: ['build','-t','asia-east1-docker.pkg.dev/$PROJECT_ID/${_REPO}/${_SERVICE}:$SHORT_SHA','.']
 
 # Push
-- name: 'gcr.io/cloud-builders/docker'
-  args:
-    - 'push'
-    - 'asia-east1-docker.pkg.dev/$PROJECT_ID/${_REPO}/${_SERVICE}:$SHORT_SHA'
+- name: gcr.io/cloud-builders/docker
+  args: ['push','asia-east1-docker.pkg.dev/$PROJECT_ID/${_REPO}/${_SERVICE}:$SHORT_SHA']
 
-# Deploy to Cloud Run
-- name: 'gcr.io/google.com/cloudsdktool/cloud-sdk'
+# Deploy
+- name: gcr.io/google.com/cloudsdktool/cloud-sdk
   entrypoint: gcloud
   args:
     - run
     - deploy
     - '${_SERVICE}'
-    - --image
+    - '--image'
     - 'asia-east1-docker.pkg.dev/$PROJECT_ID/${_REPO}/${_SERVICE}:$SHORT_SHA'
-    - --region
+    - '--region'
     - '${_REGION}'
-    - --allow-unauthenticated
-    - --set-secrets
+    - '--allow-unauthenticated'
+    - '--set-secrets'
     - 'LINE_CHANNEL_ACCESS_TOKEN=line-channel-token:latest,LINE_CHANNEL_SECRET=line-channel-secret:latest,CRON_KEY=cron-key:latest'
-    - --set-env-vars
+    - '--update-env-vars'
     - 'DEFAULT_INTERVAL=15'
