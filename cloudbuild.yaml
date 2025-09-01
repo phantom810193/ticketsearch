@@ -1,0 +1,62 @@
+# cloudbuild.yaml
+substitutions:
+  _REGION: asia-east1
+  _SERVICE: tixwatch
+
+steps:
+  # 1) Build image
+  - name: gcr.io/cloud-builders/docker
+    args: ["build", "-t", "gcr.io/$PROJECT_ID/${_SERVICE}:$SHORT_SHA", "."]
+
+  # 2) Push image
+  - name: gcr.io/cloud-builders/docker
+    args: ["push", "gcr.io/$PROJECT_ID/${_SERVICE}:$SHORT_SHA"]
+
+  # 3) Deploy to Cloud Run（帶 Secret 當環境變數）
+  - name: gcr.io/google.com/cloudsdktool/cloud-sdk
+    entrypoint: bash
+    args:
+      - -c
+      - |
+        gcloud run deploy ${_SERVICE} \
+          --image gcr.io/$PROJECT_ID/${_SERVICE}:$SHORT_SHA \
+          --region ${_REGION} \
+          --platform managed \
+          --allow-unauthenticated \
+          --service-account ${_SERVICE}-sa@${PROJECT_ID}.iam.gserviceaccount.com \
+          --set-env-vars "DEFAULT_INTERVAL=15" \
+          --update-secrets "LINE_CHANNEL_ACCESS_TOKEN=LINE_CHANNEL_ACCESS_TOKEN:latest,LINE_CHANNEL_SECRET=LINE_CHANNEL_SECRET:latest,CRON_KEY=CRON_KEY:latest"
+
+  # 4) Create/Update Cloud Scheduler job to hit /cron/tick 每分鐘
+  - name: gcr.io/google.com/cloudsdktool/cloud-sdk
+    entrypoint: bash
+    args:
+      - -c
+      - |
+        SERVICE_URL=$(gcloud run services describe ${_SERVICE} --region ${_REGION} --format='value(status.url)')
+        # 建立或更新排程（地區請與 Cloud Run 相近）
+        gcloud scheduler jobs describe ${_SERVICE}-tick --location ${_REGION} >/dev/null 2>&1 && EXIST=1 || EXIST=0
+        if [ "$EXIST" -eq 0 ]; then
+          gcloud scheduler jobs create http ${_SERVICE}-tick \
+            --location ${_REGION} \
+            --schedule "* * * * *" \
+            --time-zone "Asia/Taipei" \
+            --uri "${SERVICE_URL}/cron/tick" \
+            --http-method GET \
+            --oidc-service-account-email ${_SERVICE}-sa@${PROJECT_ID}.iam.gserviceaccount.com \
+            --oidc-token-audience "${SERVICE_URL}" \
+            --headers "X-Cron-Key=$(gcloud secrets versions access latest --secret=CRON_KEY)"
+        else
+          gcloud scheduler jobs update http ${_SERVICE}-tick \
+            --location ${_REGION} \
+            --schedule "* * * * *" \
+            --time-zone "Asia/Taipei" \
+            --uri "${SERVICE_URL}/cron/tick" \
+            --http-method GET \
+            --oidc-service-account-email ${_SERVICE}-sa@${PROJECT_ID}.iam.gserviceaccount.com \
+            --oidc-token-audience "${SERVICE_URL}" \
+            --headers "X-Cron-Key=$(gcloud secrets versions access latest --secret=CRON_KEY)"
+        fi
+
+images:
+  - gcr.io/$PROJECT_ID/${_SERVICE}:$SHORT_SHA

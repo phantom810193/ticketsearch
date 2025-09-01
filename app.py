@@ -1,14 +1,16 @@
 # app.py — LINE 票數偵測 Bot（Cloud Run/本機均可）
 import os, time, random, hashlib, re, unicodedata
+import sys, logging
 from datetime import datetime
 from typing import Tuple, Optional, List, Dict
 
 from fastapi import FastAPI, Request, Header, HTTPException
 from fastapi.responses import JSONResponse, PlainTextResponse
 from dotenv import load_dotenv
+from pathlib import Path
 
 from linebot import LineBotApi, WebhookHandler
-from linebot.models import MessageEvent, TextMessage, TextSendMessage, QuickReply, QuickReplyButton, MessageAction
+from linebot.models import MessageEvent, TextMessage, TextSendMessage
 from linebot.exceptions import LineBotApiError, InvalidSignatureError
 
 import requests
@@ -20,7 +22,19 @@ except ImportError:
 from bs4 import BeautifulSoup
 from google.cloud import firestore
 
-load_dotenv(override=True)
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s | %(levelname)s | %(name)s | %(message)s",
+    stream=sys.stdout,
+)
+
+ENV_PATH = Path(__file__).with_name(".env")   # 固定讀取和 app.py 同一層的 .env
+ok = load_dotenv(dotenv_path=ENV_PATH, override=True)
+
+# 啟動時印診斷，方便確認是否讀到
+print(f"[ENV] path={ENV_PATH} exists={ENV_PATH.exists()} loaded={ok}")
+print("[ENV] TOKEN?", bool(os.getenv("LINE_CHANNEL_ACCESS_TOKEN")))
+print("[ENV] SECRET?", bool(os.getenv("LINE_CHANNEL_SECRET")))
 
 # ---- 必填環境變數（建議放 Secret Manager 並在部署時綁到環境）----
 LINE_CHANNEL_SECRET = (os.getenv("LINE_CHANNEL_SECRET") or "").strip()
@@ -29,9 +43,16 @@ DEFAULT_INTERVAL = int(os.getenv("DEFAULT_INTERVAL", "15"))  # 秒
 CRON_KEY = os.getenv("CRON_KEY", "")  # 可選：保護 /cron/tick
 
 app = FastAPI(title="tixwatch-linebot")
+
+# 若 token/secret 沒給，避免初始化失敗
+if not LINE_CHANNEL_SECRET or not LINE_CHANNEL_ACCESS_TOKEN:
+    raise RuntimeError("請設定 LINE_CHANNEL_ACCESS_TOKEN 與 LINE_CHANNEL_SECRET 環境變數")
+
 line_bot_api = LineBotApi(LINE_CHANNEL_ACCESS_TOKEN)
 handler = WebhookHandler(LINE_CHANNEL_SECRET)
-db = firestore.Client()  # 依賴 Cloud Run 預設服務帳號
+
+# Firestore（本機請先設定 ADC；Cloud Run 上會自動帶服務帳戶）
+db = firestore.Client()
 
 USAGE = (
     "🎫 票數偵測 Bot 使用說明\n"
@@ -49,7 +70,6 @@ def _now_ts() -> int:
     return int(time.time())
 
 def _gen_tid() -> str:
-    # 短 ID（字母數字），用來當 Firestore doc id & 對使用者顯示
     import secrets, string
     alphabet = string.ascii_lowercase + string.digits
     return "".join(secrets.choice(alphabet) for _ in range(8))
@@ -69,15 +89,19 @@ def add_task(user_id: str, url: str, interval_sec: int) -> str:
     return tid
 
 def list_tasks(user_id: str) -> List[Dict]:
-    docs = TASKS.where("user_id", "==", user_id).order_by("created_at", direction=firestore.Query.DESCENDING).stream()
+    docs = TASKS.where("user_id", "==", user_id).order_by(
+        "created_at", direction=firestore.Query.DESCENDING
+    ).stream()
     return [d.to_dict() for d in docs]
 
 def deactivate_task(user_id: str, tid: str) -> bool:
     ref = TASKS.document(tid)
     snap = ref.get()
-    if not snap.exists: return False
+    if not snap.exists:
+        return False
     data = snap.to_dict()
-    if data.get("user_id") != user_id: return False
+    if data.get("user_id") != user_id:
+        return False
     ref.update({"is_active": False})
     return True
 
@@ -93,7 +117,9 @@ UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like 
 
 def fetch_html(url: str, timeout=15) -> str:
     headers = {"User-Agent": UA, "Accept-Language": "zh-TW,zh;q=0.9,en;q=0.8"}
-    session = cloudscraper.create_scraper(browser={"browser": "chrome", "platform": "windows"}) if cloudscraper else requests.Session()
+    session = cloudscraper.create_scraper(
+        browser={"browser": "chrome", "platform": "windows"}
+    ) if cloudscraper else requests.Session()
     r = session.get(url, headers=headers, timeout=timeout)
     r.raise_for_status()
     return r.text
@@ -113,7 +139,9 @@ def extract_snapshot_and_ticket(html: str) -> Tuple[str, bool]:
     ticket_keywords  = ["立即購票", "購票", "加入購物車", "選擇座位", "剩餘", "可售", "尚有", "開賣", "tickets"]
 
     t_low = text.lower()
-    has_ticket = any(kw.lower() in t_low for kw in ticket_keywords) and not any(kw.lower() in t_low for kw in soldout_keywords)
+    has_ticket = any(kw.lower() in t_low for kw in ticket_keywords) and not any(
+        kw.lower() in t_low for kw in soldout_keywords
+    )
 
     important_bits = []
     for btn in soup.find_all(["a", "button"]):
@@ -123,106 +151,129 @@ def extract_snapshot_and_ticket(html: str) -> Tuple[str, bool]:
     snapshot = text + "\n\nBTN:" + "|".join(important_bits[:50])
     return snapshot, has_ticket
 
-# ========== LINE 工具 ==========
-def reply(event: MessageEvent, message: str):
-    try:
-        line_bot_api.reply_message(event.reply_token, TextSendMessage(text=message))
-    except LineBotApiError as e:
-        print("[reply] error:", getattr(e, "status_code", "?"), getattr(e, "message", repr(e)))
-
-def push(user_id: str, message: str):
-    try:
-        line_bot_api.push_message(user_id, TextSendMessage(text=message))
-    except LineBotApiError as e:
-        print("[push] error:", getattr(e, "status_code", "?"), getattr(e, "message", repr(e)))
-
 def norm(s: Optional[str]) -> str:
-    if not s: return ""
+    if not s:
+        return ""
     s = unicodedata.normalize("NFKC", s).strip().lower()
     return re.sub(r"\s+", " ", s)
 
+# ========== Logger ==========
+logger = logging.getLogger("tixwatch")
+logger.setLevel(logging.INFO)
+logger.handlers.clear()
+logger.addHandler(logging.StreamHandler(sys.stdout))
+logger.propagate = False
+
 # ========== Webhook（LINE → /callback）==========
 @app.post("/callback")
-async def callback(request: Request, x_line_signature: Optional[str] = Header(default=None)):
-    body = await request.body()
-    body_text = body.decode("utf-8", errors="ignore")
+@app.post("/callback/")
+async def callback(request: Request, x_line_signature: str | None = Header(default=None)):
+    body_text = (await request.body()).decode("utf-8", errors="ignore")
+    logger.info(f"[callback] UA={request.headers.get('user-agent')} "
+                f"sig={'Y' if x_line_signature else 'N'} body={body_text[:300]}")
+
+    if not x_line_signature:
+        # LINE 後台的 Verify 會走這裡（沒帶簽章），直接 200
+        return PlainTextResponse("OK", status_code=200)
+
     try:
-        handler.handle(body_text, x_line_signature or "")
+        handler.handle(body_text, x_line_signature)
     except InvalidSignatureError:
-        # 簽章錯誤才回 400；其他錯誤不影響 Webhook 200
+        logger.error("[callback] invalid signature (check LINE_CHANNEL_SECRET)")
         raise HTTPException(status_code=400, detail="Invalid signature")
+
     return PlainTextResponse("OK", status_code=200)
 
 # ========== 訊息處理 ==========
 @handler.add(MessageEvent, message=TextMessage)
 def handle_message(event: MessageEvent):
-    raw = (event.message.text or "")
-    text = norm(raw)
+    text = (event.message.text or "").strip()
+    # ✅ 一次正確取得 user_id；群組/聊天室可自行擴充
     user_id = getattr(event.source, "user_id", None)
+    logger.info(f"[event] user={user_id} text={text} replyToken={event.reply_token}")
 
-    if text in HELP_ALIASES or text.startswith("/start"):
-        usage = TextSendMessage(
-            text=USAGE,
-            quick_reply=QuickReply(items=[
-                QuickReplyButton(action=MessageAction(label="啟動監看", text="/watch https://tixcraft.com/ 15")),
-                QuickReplyButton(action=MessageAction(label="查看列表", text="/list")),
-                QuickReplyButton(action=MessageAction(label="停止任務", text="/stop <任務ID>")),
-            ])
-        )
-        try:
-            line_bot_api.reply_message(event.reply_token, usage)
-        except LineBotApiError as e:
-            print("[reply] error:", getattr(e, "status_code", "?"), getattr(e, "message", repr(e)))
-        return
-
-    if text.startswith("/watch"):
-        parts = raw.split()
-        if len(parts) < 2:
-            reply(event, "用法：/watch <URL> [秒數]")
-            return
-        url = parts[1]
-        try:
-            interval_sec = int(parts[2]) if len(parts) >= 3 else DEFAULT_INTERVAL
-            interval_sec = max(5, min(300, interval_sec))
-        except ValueError:
-            interval_sec = DEFAULT_INTERVAL
-
-        if not user_id:
-            reply(event, "請在與機器人「1 對 1」聊天中使用 /watch 指令。")
+    try:
+        if text.startswith("/start") or text in HELP_ALIASES:
+            line_bot_api.reply_message(
+                event.reply_token,
+                TextSendMessage(text=USAGE)
+            )
+            logger.info("[event] reply sent OK")
             return
 
-        tid = add_task(user_id, url, interval_sec)
-        reply(event, f"已建立監看任務 #{tid}\nURL: {url}\n頻率：每 {interval_sec} 秒")
-        return
+        # ---- /watch ----
+        if text.startswith("/watch"):
+            parts = text.split()  # ✅ 修正：原本用 raw.split()（未定義）
+            if len(parts) < 2:
+                reply(event, "用法：/watch <URL> [秒數]")
+                return
+            url = parts[1]
+            try:
+                interval_sec = int(parts[2]) if len(parts) >= 3 else DEFAULT_INTERVAL
+                interval_sec = max(5, min(300, interval_sec))
+            except ValueError:
+                interval_sec = DEFAULT_INTERVAL
 
-    if text.startswith("/list"):
-        items = list_tasks(user_id or "")
-        if not items:
-            reply(event, "目前沒有監看任務。用 /watch <URL> 開始吧！")
+            if not user_id:
+                reply(event, "請在與機器人「1 對 1」聊天中使用 /watch 指令。")
+                return
+
+            tid = add_task(user_id, url, interval_sec)
+            reply(event, f"已建立監看任務 #{tid}\nURL: {url}\n頻率：每 {interval_sec} 秒")
             return
-        lines = ["你的監看任務："]
-        for it in items:
-            status = "監看中" if it.get("is_active") else "已停止"
-            dt = datetime.fromtimestamp(it.get("created_at", 0)).strftime("%Y-%m-%d %H:%M")
-            lines.append(f"#{it.get('tid')}｜{status}｜每{it.get('interval_sec')}秒｜{it.get('url')}｜{dt}")
-        reply(event, "\n".join(lines))
-        return
 
-    if text.startswith("/stop"):
-        parts = raw.split()
-        if len(parts) < 2:
-            reply(event, "用法：/stop <任務ID>")
+        # ---- /list ----
+        if text.startswith("/list"):
+            items = list_tasks(user_id or "")
+            if not items:
+                reply(event, "目前沒有監看任務。用 /watch <URL> 開始吧！")
+                return
+            lines = ["你的監看任務："]
+            for it in items:
+                status = "監看中" if it.get("is_active") else "已停止"
+                dt = datetime.fromtimestamp(it.get("created_at", 0)).strftime("%Y-%m-%d %H:%M")
+                lines.append(f"#{it.get('tid')}｜{status}｜每{it.get('interval_sec')}秒｜{it.get('url')}｜{dt}")
+            reply(event, "\n".join(lines))
             return
-        tid = parts[1]
-        ok = deactivate_task(user_id or "", tid)
-        reply(event, f"{'已停止' if ok else '找不到'}任務 #{tid}")
-        return
 
-    reply(event, "嗨！輸入「取得說明」或 /start 取得使用說明")
+        # ---- /stop ----
+        if text.startswith("/stop"):
+            parts = text.split()  # ✅ 修正：原本用 raw.split()（未定義）
+            if len(parts) < 2:
+                reply(event, "用法：/stop <任務ID>")
+                return
+            tid = parts[1]
+            ok = deactivate_task(user_id or "", tid)
+            reply(event, f"{'已停止' if ok else '找不到'}任務 #{tid}")
+            return
+
+        # 其他訊息：先 echo 確認回覆正常
+        line_bot_api.reply_message(event.reply_token, TextSendMessage(text=f"echo: {text}"))
+        logger.info("[event] reply sent OK")
+
+    except LineBotApiError as e:
+        # 更穩健的錯誤輸出
+        detail = getattr(e, "error", None)
+        logger.error(f"[event] LINE API error status={getattr(e, 'status_code', '?')} detail={detail}")
+    except Exception as e:
+        logger.exception(f"[event] unhandled error: {e}")
+
+# ========== LINE 工具 ==========
+def reply(event: MessageEvent, message: str):
+    try:
+        line_bot_api.reply_message(event.reply_token, TextSendMessage(text=message))
+    except LineBotApiError as e:
+        logger.error(f"[reply] error status={getattr(e, 'status_code', '?')} detail={getattr(e, 'error', None)}")
+
+def push(user_id: str, message: str):
+    try:
+        line_bot_api.push_message(user_id, TextSendMessage(text=message))
+    except LineBotApiError as e:
+        logger.error(f"[push] error status={getattr(e, 'status_code', '?')} detail={getattr(e, 'error', None)}")
 
 # ========== 定時偵測（Cloud Scheduler → /cron/tick）==========
 @app.get("/cron/tick")
-def cron_tick(request: Request):
+async def cron_tick(request: Request):
     # 可選：用簡單金鑰防護
     if CRON_KEY and request.headers.get("X-Cron-Key") != CRON_KEY:
         raise HTTPException(status_code=403, detail="Forbidden")
@@ -245,7 +296,7 @@ def cron_tick(request: Request):
             checked += 1
             time.sleep(random.uniform(0.2, 0.6))
         except Exception as e:
-            print(f"[tick] task#{t.get('tid')} error:", repr(e))
+            logger.error(f"[tick] task#{t.get('tid')} error: {e}")
     return JSONResponse({"ok": True, "checked": checked})
 
 @app.get("/")
