@@ -63,7 +63,7 @@ LINE_CHANNEL_ACCESS_TOKEN = (os.getenv("LINE_CHANNEL_ACCESS_TOKEN") or "").strip
 DEFAULT_INTERVAL = int(os.getenv("DEFAULT_INTERVAL", "15"))  # 秒
 CRON_KEY = os.getenv("CRON_KEY", "")  # 可選：保護 /cron/tick
 
-# === NEW: 預期的 NAT 對外 IP（可選，用於對照一致性） ===
+# === 用於 Direct VPC egress 驗證：期望的 NAT 對外 IP（可選） ===
 EXPECTED_EGRESS_IP = (os.getenv("EXPECTED_EGRESS_IP") or "").strip()
 
 if not LINE_CHANNEL_SECRET or not LINE_CHANNEL_ACCESS_TOKEN:
@@ -97,7 +97,26 @@ USAGE = (
     "・輸入「取得說明」或 /start 可再看此訊息"
 )
 HELP_ALIASES = {"/start", "/help", "help", "取得說明", "說明", "指令", "使用說明", "開始使用", "教我用"}
-IP_ALIASES = {"ip", "/ip", "出口ip", "我的ip"}  # === NEW ===
+
+# ========= 指令正規化（NEW）=========
+ZERO_WIDTH_CHARS = "".join([
+    "\u200b",  # ZERO WIDTH SPACE
+    "\ufeff",  # ZERO WIDTH NO-BREAK SPACE (BOM)
+    "\u200c",  # ZERO WIDTH NON-JOINER
+    "\u200d",  # ZERO WIDTH JOINER
+])
+
+def normalize_cmd(s: str) -> str:
+    """NFKC 正規化 + 移除零寬字元 + 合併空白 + 小寫"""
+    s = unicodedata.normalize("NFKC", s or "")
+    for ch in ZERO_WIDTH_CHARS:
+        s = s.replace(ch, "")
+    s = re.sub(r"\s+", " ", s).strip().lower()
+    return s
+
+_IP_ALIASES_RAW = {"ip", "/ip", "出口ip", "我的ip"}
+IP_ALIASES = {normalize_cmd(x) for x in _IP_ALIASES_RAW}
+HELP_ALIASES_NORM = {normalize_cmd(x) for x in HELP_ALIASES}
 
 
 # ========= 小工具 =========
@@ -203,14 +222,11 @@ def extract_areas_left_from_text(text: str) -> Dict[str, int]:
     從整頁文字中抓出「xxx區... 剩餘 N」的片段，回傳 {區名: 數量}
     """
     areas: Dict[str, int] = {}
-    # 先壓縮空白，避免換行影響
     t = normalize_text(text)
-    # 例：特G區3980 剩餘 85、黃2B區3680 剩餘29 等
     patt = re.compile(r"([^\s\|]{1,12}區[^\s\|]{0,12})\s*剩餘\s*(\d+)")
     for name, num in patt.findall(t):
         n = int(num)
         if n > 0:
-            # 簡單彙總（相同區名累加）
             areas[name] = areas.get(name, 0) + n
     return areas
 
@@ -267,7 +283,6 @@ def push(user_id: str, message: str):
 
 # ========= 驗證 Direct VPC egress：取得 Cloud Run 對外 IP（經 NAT）=========
 def get_outbound_ip() -> str:
-    # 由 Cloud Run 內部對外呼叫，看到的就是 NAT 後的出口 IP
     return requests.get("https://api.ipify.org", timeout=5).text.strip()
 
 
@@ -298,13 +313,18 @@ async def callback(request: Request,
 # ========= 訊息處理 =========
 @handler.add(MessageEvent, message=TextMessageContent)
 def handle_message(event: MessageEvent):
-    text = (event.message.text or "").strip()
+    raw = (event.message.text or "")
+    text = raw.strip()
     user_id = get_user_id(event.source)
-    logger.info(f"[event] user={user_id} text={text} replyToken={event.reply_token}")
+
+    # 正規化後的指令字串（NEW）
+    cmd = normalize_cmd(text)
+    logger.info(f"[event] user={user_id} raw={repr(raw)} norm={cmd} replyToken={event.reply_token}")
 
     try:
-        # === NEW: 驗證 Direct VPC egress（輸入 'ip' / '/ip' / '出口ip' / '我的ip'） ===
-        if text.lower() in IP_ALIASES:
+        # === NEW: 驗證 Direct VPC egress（輸入 ip/ /ip/ 出口ip/ 我的ip） ===
+        first_token = cmd.split(" ", 1)[0] if cmd else ""
+        if cmd in IP_ALIASES or first_token in IP_ALIASES:
             try:
                 ip = get_outbound_ip()
                 lines = [f"Cloud Run 對外 IP：{ip}"]
@@ -317,7 +337,7 @@ def handle_message(event: MessageEvent):
             return
 
         # 說明
-        if text.startswith("/start") or text in HELP_ALIASES:
+        if cmd in HELP_ALIASES_NORM or text.startswith("/start"):
             reply(event, USAGE)
             return
 
