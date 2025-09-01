@@ -1,0 +1,6 @@
+.env
+*.txt
+__pycache__/
+.venv/
+.git
+.gcloudignore
