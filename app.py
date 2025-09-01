@@ -10,9 +10,14 @@ from fastapi import Header
 from dotenv import load_dotenv
 from pathlib import Path
 
-from linebot import LineBotApi, WebhookHandler
-from linebot.models import MessageEvent, TextMessage, TextSendMessage
-from linebot.exceptions import LineBotApiError, InvalidSignatureError
+from linebot.v3.webhook import WebhookHandler
+from linebot.v3.webhooks import MessageEvent, TextMessageContent
+from linebot.v3.messaging import (
+    Configuration, ApiClient, MessagingApi,
+    ReplyMessageRequest, TextMessage as V3TextMessage,
+    ApiException,  # v3 的 API 例外
+)
+from linebot.v3.exceptions import InvalidSignatureError
 
 import requests
 try:
