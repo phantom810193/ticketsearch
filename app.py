@@ -32,6 +32,11 @@ from bs4 import BeautifulSoup
 from google.cloud import firestore
 
 
+def get_user_id(src) -> Optional[str]:
+    # v3 的 SourceUser 是 userId；保險兼容舊屬性 user_id
+    return getattr(src, "userId", None) or getattr(src, "user_id", None)
+
+
 # ========= Logging =========
 logging.basicConfig(
     level=logging.INFO,
@@ -91,10 +96,6 @@ HELP_ALIASES = {"/start", "/help", "help", "取得說明", "說明", "指令", "
 
 
 # ========= 小工具 =========
-def get_user_id(src) -> Optional[str]:
-    # v3 的 SourceUser 欄位是 userId；保險再兼容 user_id
-    return getattr(src, "userId", None) or getattr(src, "user_id", None)
-
 def _now_ts() -> int:
     return int(time.time())
 
@@ -143,25 +144,21 @@ def update_after_check(tid: str, snapshot: str):
 
 
 # ========= 抓頁 & 判定 =========
-UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126 Safari/537.36"
+def normalize_text(s: str) -> str:
+    s = unicodedata.normalize("NFKC", s)
+    s = re.sub(r"\s+", " ", s).strip()
+    return s
 
 def fetch_html(url: str, timeout=15) -> str:
     """
-    強化版抓取：
-    - 優先使用 cloudscraper（若可用）
-    - 帶常見瀏覽器標頭、Referer
-    - 指數退避重試數次
+    強化抓取：
+    - Referer 直接用目標 URL
+    - 帶常見瀏覽器 header（含 sec-ch-ua）
+    - 指數退避重試
+    - 若環境有設定 HTTP(S)_PROXY 會自動走代理
     """
-    # 推測 Referer（使用同網域）
-    try:
-        from urllib.parse import urlparse
-        pu = urlparse(url)
-        referer = f"{pu.scheme}://{pu.netloc}/"
-    except Exception:
-        referer = "https://tixcraft.com/"
-
     headers = {
-        "User-Agent": UA,
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126 Safari/537.36",
         "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8",
         "Accept-Language": "zh-TW,zh;q=0.9,en;q=0.8",
         "Accept-Encoding": "gzip, deflate, br",
@@ -169,11 +166,14 @@ def fetch_html(url: str, timeout=15) -> str:
         "Pragma": "no-cache",
         "Connection": "keep-alive",
         "Upgrade-Insecure-Requests": "1",
-        "Referer": referer,
+        "Referer": url,
         "Sec-Fetch-Dest": "document",
         "Sec-Fetch-Mode": "navigate",
         "Sec-Fetch-Site": "same-origin",
         "Sec-Fetch-User": "?1",
+        "sec-ch-ua": '"Chromium";v="126", "Google Chrome";v="126", "Not.A/Brand";v="24"',
+        "sec-ch-ua-platform": '"Windows"',
+        "sec-ch-ua-mobile": "?0",
     }
 
     sess = cloudscraper.create_scraper(
@@ -181,7 +181,7 @@ def fetch_html(url: str, timeout=15) -> str:
     ) if cloudscraper else requests.Session()
 
     last_exc = None
-    for i in range(4):  # 最多嘗試 4 次
+    for i in range(4):  # 最多 4 次
         try:
             r = sess.get(url, headers=headers, timeout=timeout)
             if r.status_code >= 400:
@@ -192,66 +192,40 @@ def fetch_html(url: str, timeout=15) -> str:
             time.sleep(0.6 * (2 ** i) + random.uniform(0, 0.4))
     raise last_exc if last_exc else RuntimeError("fetch failed")
 
-def normalize_text(s: str) -> str:
-    s = unicodedata.normalize("NFKC", s)
-    s = re.sub(r"\s+", " ", s).strip()
-    return s
 
-def _parse_availability_from_line(line: str) -> Optional[tuple]:
+def extract_areas_left_from_text(text: str) -> Dict[str, int]:
     """
-    從一行文字解析「<名稱> 剩餘 <數字>」。
-    會回傳 (name, count) 或 None。
+    從整頁文字中抓出「xxx區... 剩餘 N」的片段，回傳 {區名: 數量}
     """
-    m = re.search(r"(.{1,40}?)\s*剩餘\s*(\d+)", line)
-    if m:
-        name = normalize_text(m.group(1))
-        try:
-            count = int(m.group(2))
-        except ValueError:
-            return None
-        return name, count
-    return None
+    areas: Dict[str, int] = {}
+    # 先壓縮空白，避免換行影響
+    t = normalize_text(text)
+    # 例：特G區3980 剩餘 85、黃2B區3680 剩餘29 等
+    patt = re.compile(r"([^\s\|]{1,12}區[^\s\|]{0,12})\s*剩餘\s*(\d+)")
+    for name, num in patt.findall(t):
+        n = int(num)
+        if n > 0:
+            # 簡單彙總（相同區名累加）
+            areas[name] = areas.get(name, 0) + n
+    return areas
 
-def _merge_availability(items: List[tuple]) -> List[tuple]:
-    """依名稱彙整剩餘數（同名取最大）。"""
-    agg: Dict[str, int] = {}
-    for name, cnt in items:
-        agg[name] = max(cnt, agg.get(name, 0))
-    return [(k, v) for k, v in agg.items()]
-
-def extract_snapshot_and_ticket(html: str) -> Tuple[str, bool, List[tuple]]:
-    """
-    回傳：
-      - snapshot: 純文字快照（含部分按鈕文字）
-      - has_ticket: 初步是否可能有票
-      - avail_list: [(區域名稱, 剩餘數), ...]
-    """
+def extract_snapshot_and_ticket(html: str) -> Tuple[str, bool, Dict[str, int]]:
     soup = BeautifulSoup(html, "html.parser")
     for tag in soup(["script", "style", "noscript"]):
         tag.decompose()
 
-    # 全文文字
     text = normalize_text(soup.get_text(" ", strip=True))
-
-    # 找「剩餘 N」的元素
-    avail_raw: List[tuple] = []
-    for node in soup.find_all(string=re.compile(r"剩餘\s*\d+")):
-        line = normalize_text(node.parent.get_text(" ", strip=True))
-        item = _parse_availability_from_line(line)
-        if item:
-            avail_raw.append(item)
-    avail_list = _merge_availability(avail_raw)
-
     soldout_keywords = ["售完", "完售", "已售完", "已售罄", "已無票", "sold out", "soldout"]
     ticket_keywords  = ["立即購票", "購票", "加入購物車", "選擇座位", "剩餘", "可售", "尚有", "開賣", "tickets"]
 
     t_low = text.lower()
-    has_ticket = bool(avail_list) or (
-        any(kw.lower() in t_low for kw in ticket_keywords) and
-        not any(kw.lower() in t_low for kw in soldout_keywords)
+    has_ticket_by_kw = any(kw.lower() in t_low for kw in ticket_keywords) and not any(
+        kw.lower() in t_low for kw in soldout_keywords
     )
 
-    # 把常見可點按鈕文字也收進快照（幫助之後比對）
+    areas_left = extract_areas_left_from_text(text)
+    has_ticket = has_ticket_by_kw or (sum(areas_left.values()) > 0)
+
     important_bits = []
     for btn in soup.find_all(["a", "button"]):
         t = btn.get_text(" ", strip=True)
@@ -259,19 +233,7 @@ def extract_snapshot_and_ticket(html: str) -> Tuple[str, bool, List[tuple]]:
             important_bits.append(normalize_text(t))
     snapshot = text + "\n\nBTN:" + "|".join(important_bits[:50])
 
-    return snapshot, has_ticket, avail_list
-
-def parse_availability_from_snapshot(snapshot: str) -> List[tuple]:
-    """從舊的 snapshot 純文字中再抓一次『剩餘 N』，用於新舊對比。"""
-    items: List[tuple] = []
-    for m in re.finditer(r"(.{1,40}?)\s*剩餘\s*(\d+)", snapshot):
-        name = normalize_text(m.group(1))
-        try:
-            cnt = int(m.group(2))
-        except ValueError:
-            continue
-        items.append((name, cnt))
-    return _merge_availability(items)
+    return snapshot, has_ticket, areas_left
 
 
 # ========= LINE 回覆/推播（v3）=========
@@ -302,7 +264,7 @@ def push(user_id: str, message: str):
 @app.post("/callback")
 @app.post("/callback/")
 async def callback(request: Request,
-                   x_line_signature: str | None = Header(None, alias="X-Line-Signature")):
+                   x_line_signature: Optional[str] = Header(None, alias="X-Line-Signature")):
     body_bytes = await request.body()
     body_text = body_bytes.decode("utf-8", errors="ignore")
     logger.info("[callback] UA=%s sig=%s body=%s",
@@ -352,7 +314,7 @@ def handle_message(event: MessageEvent):
             except ValueError:
                 interval_sec = DEFAULT_INTERVAL
 
-            # 先回覆已收到
+            # 先回覆已收到，避免 Firestore 出錯就沒回覆
             reply(event, f"收到，準備監看：\n{url}\n頻率：每 {interval_sec} 秒")
             try:
                 tid = add_task(user_id, url, interval_sec)
@@ -398,6 +360,7 @@ def handle_message(event: MessageEvent):
 # ========= 定時偵測（Cloud Scheduler → /cron/tick）=========
 @app.get("/cron/tick")
 async def cron_tick(request: Request):
+    # 可選：用簡單金鑰防護
     if CRON_KEY and request.headers.get("X-Cron-Key") != CRON_KEY:
         raise HTTPException(status_code=403, detail="Forbidden")
 
@@ -405,48 +368,47 @@ async def cron_tick(request: Request):
         tasks = all_active_tasks()
         random.shuffle(tasks)
         checked = 0
-
         for t in tasks:
-            # 遵守用戶設定輪詢間隔
+            # 確保達到用戶設定的輪詢間隔
             if _now_ts() - int(t.get("last_checked", 0)) < int(t.get("interval_sec", DEFAULT_INTERVAL)):
                 continue
-
             try:
                 html = fetch_html(t["url"])
-                snapshot, has_ticket, avail_now = extract_snapshot_and_ticket(html)
-
-                # 舊快照的可售資訊，用於比較
-                old_snapshot = t.get("last_snapshot") or ""
-                avail_old = parse_availability_from_snapshot(old_snapshot)
-                had_before = any(cnt > 0 for _, cnt in avail_old)
-                has_now = any(cnt > 0 for _, cnt in avail_now)
-
-                # 更新快照時間
+                snapshot, has_ticket, areas_left = extract_snapshot_and_ticket(html)
+                new_hash = hashlib.sha256(snapshot.encode("utf-8")).hexdigest()
+                old_hash = hashlib.sha256((t.get("last_snapshot") or "").encode("utf-8")).hexdigest()
                 update_after_check(t["tid"], snapshot)
 
-                # 僅在「過去無票 → 現在有票」時推播，避免洗通知
-                if has_now and not had_before:
-                    preview = "\n".join([f"• {name} 剩餘 {cnt}" for name, cnt in sorted(avail_now)[:8]])
-                    msg = (
-                        f"🎉 疑似有票釋出！\n"
-                        f"任務#{t['tid']}\n{t['url']}\n"
-                        f"{preview if preview else ''}\n"
-                        f"（建議立刻點進去檢查與購買）"
+                if (new_hash != old_hash) and has_ticket:
+                    # 組合區域剩餘資訊
+                    area_lines = []
+                    for name, cnt in list(areas_left.items())[:10]:
+                        area_lines.append(f"• {name}：{cnt}")
+                    detail = ("\n" + "\n".join(area_lines)) if area_lines else ""
+                    push(
+                        t["user_id"],
+                        f"🎉 疑似有票釋出！\n任務#{t['tid']}\n{t['url']}{detail}\n（建議立刻點進去檢查與購買）"
                     )
-                    push(t["user_id"], msg)
-
                 checked += 1
-                time.sleep(random.uniform(0.2, 0.6))  # 輕微節流
-
+                time.sleep(random.uniform(0.2, 0.6))
             except Exception as e:
                 logger.error(f"[tick] task#{t.get('tid')} error: {e}")
-
         return JSONResponse({"ok": True, "checked": checked})
-
     except Exception as e:
         logger.exception(f"[cron_tick] unhandled: {e}")
-        # 回 200 + 錯誤內容，避免 Scheduler 判定失敗
+        # 回 200 + 錯誤內容，避免 Scheduler 看到 5xx
         return JSONResponse({"ok": False, "error": str(e)})
+
+
+# ========= 自測端點（確認 Cloud Run 抓網頁是否被擋）=========
+@app.get("/_debug/check")
+def debug_check(url: str):
+    try:
+        html = fetch_html(url)
+        preview = normalize_text(BeautifulSoup(html, "html.parser").get_text(" ", strip=True))[:500]
+        return JSONResponse({"ok": True, "len": len(html), "preview": preview})
+    except Exception as e:
+        return JSONResponse({"ok": False, "error": str(e)}, status_code=200)
 
 
 # ========= 健康檢查 =========
