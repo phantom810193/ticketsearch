@@ -1,24 +1,34 @@
-# worker.py — 住宅網路輪詢推播（Firestore + LINE v3）
+# worker.py — 住宅網路輪詢 Worker（讀 Firestore 任務，抓票況，LINE 推播）
+# 需求：
+#   pip install google-cloud-firestore line-bot-sdk requests cloudscraper bs4 python-dotenv
+# 必要環境變數：
+#   LINE_CHANNEL_ACCESS_TOKEN   （LINE 長期存取權杖，用於 push）
+#   （可選）GOOGLE_CLOUD_PROJECT 或預設 ADC
+#   （可選）HTTP(S)_PROXY / PROXY_URL / COOKIE / USER_AGENT / REQUEST_TIMEOUT
+# 使用：
+#   python worker.py    # 會持續輪詢
+#   Windows 如要即時看 log：python worker.py *>&1 | Tee-Object -FilePath .\worker.log
+
 import os
 import sys
 import time
 import random
-import logging
 import hashlib
 import re
-import unicodedata
-from typing import Tuple, List, Dict
-from urllib.parse import urlparse
+import logging
+from datetime import datetime
+from typing import Dict, List, Tuple, Optional
 
 import requests
 try:
-    import cloudscraper  # 可選：較能處理部分 Cloudflare
+    import cloudscraper  # 若有安裝可稍微降低被擋風險
 except ImportError:
     cloudscraper = None
 
 from bs4 import BeautifulSoup
+from google.cloud import firestore
 
-# ========= Logging（避免 Windows 主控台編碼問題）=========
+# ========= Logging（避免 Windows 編碼炸裂，全部使用 ASCII）=========
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s %(levelname)s %(name)s: %(message)s",
@@ -26,239 +36,286 @@ logging.basicConfig(
     force=True,
 )
 logger = logging.getLogger("tixworker")
-logger.setLevel(logging.INFO)
-logger.handlers.clear()
-logger.addHandler(logging.StreamHandler(sys.stdout))
 logger.propagate = False
-
-def _safe(s: str) -> str:
-    """避免 console cp950 等編碼問題，去掉無法列印的字元。"""
-    try:
-        return s.encode(sys.stdout.encoding or "utf-8", errors="ignore").decode(sys.stdout.encoding or "utf-8", errors="ignore")
-    except Exception:
-        return s
 
 # ========= 環境變數 =========
 LINE_CHANNEL_ACCESS_TOKEN = (os.getenv("LINE_CHANNEL_ACCESS_TOKEN") or "").strip()
 if not LINE_CHANNEL_ACCESS_TOKEN:
-    raise RuntimeError("缺少環境變數 LINE_CHANNEL_ACCESS_TOKEN（用於推播）")
+    raise RuntimeError("缺少環境變數 LINE_CHANNEL_ACCESS_TOKEN")
 
-DEFAULT_INTERVAL = int(os.getenv("DEFAULT_INTERVAL", "15"))   # 預設任務輪詢秒數上限下限會在程式再控
-WORKER_IDLE_SEC = float(os.getenv("WORKER_IDLE_SEC", "1.5"))  # 每輪閒置秒數
-MAX_RETRY = int(os.getenv("FETCH_MAX_RETRY", "2"))
-REQUEST_TIMEOUT = int(os.getenv("REQUEST_TIMEOUT", "15"))
-USER_AGENT = os.getenv("USER_AGENT") or "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126 Safari/537.36"
-COOKIES_RAW = os.getenv("TIXCRAFT_COOKIES", "").strip()  # 可選："name=value; name2=value2"
+PROJECT_ID = (os.getenv("GOOGLE_CLOUD_PROJECT") or os.getenv("PROJECT_ID") or "").strip() or None
 
-# ========= LINE v3（僅推播用）=========
+REQUEST_TIMEOUT = float(os.getenv("REQUEST_TIMEOUT", "15"))
+UA = os.getenv(
+    "USER_AGENT",
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126 Safari/537.36",
+)
+
+# 代理（如不需要可不設）
+PROXY_URL = os.getenv("PROXY_URL", "").strip()
+HTTP_PROXY = os.getenv("HTTP_PROXY", "").strip()
+HTTPS_PROXY = os.getenv("HTTPS_PROXY", "").strip()
+
+# 站台 Cookie（選填，若需要繞過身分/排程限制）
+COOKIE_RAW = os.getenv("COOKIE", "").strip()
+
+
+# ========= LINE v3 推播 =========
 from linebot.v3.messaging import (
     Configuration, ApiClient, MessagingApi,
-    PushMessageRequest, TextMessage as V3TextMessage, ApiException
+    PushMessageRequest, TextMessage as V3TextMessage,
 )
-configuration = Configuration(access_token=LINE_CHANNEL_ACCESS_TOKEN)
-api_client = ApiClient(configuration)
-messaging_api = MessagingApi(api_client)
+from linebot.v3.messaging import ApiException as LineApiException
 
-def push(user_id: str, message: str):
-    """推播給使用者：log 不印 emoji，避免 Windows 編碼錯誤。"""
+_line_cfg = Configuration(access_token=LINE_CHANNEL_ACCESS_TOKEN)
+_line_cli = ApiClient(_line_cfg)
+_line_api = MessagingApi(_line_cli)
+
+def push_line(user_id: str, text: str) -> bool:
+    """送 LINE 推播；失敗回 False。"""
     try:
-        messaging_api.push_message(
+        _line_api.push_message(
             PushMessageRequest(
                 to=user_id,
-                messages=[V3TextMessage(text=message)]
+                messages=[V3TextMessage(text=text)]
             )
         )
-        logger.info("[push] sent to %s: %s", user_id, _safe(message[:80].replace("\n", " ")))
-    except ApiException as e:
-        logger.error("[push] LINE API error: %s", e)
+        logger.info(f"[push] sent to {user_id[:8]}... ({len(text)} chars)")
+        return True
+    except LineApiException as e:
+        logger.error(f"[push] LINE error: {e}")
+        return False
+
 
 # ========= Firestore =========
-from google.cloud import firestore
-from google.cloud.firestore_v1 import FieldFilter
-
-PROJECT_ID = os.getenv("GOOGLE_CLOUD_PROJECT") or os.getenv("GCP_PROJECT") or "ticketsearch-470701"
-db = firestore.Client(project=PROJECT_ID)
+# 本機請先設定 ADC；PROJECT_ID 可省略使用預設。Cloud 本地/住宅網路都可。
+db = firestore.Client(project=PROJECT_ID) if PROJECT_ID else firestore.Client()
 TASKS = db.collection("tasks")
-print("[ENV] PROJECT_ID =", PROJECT_ID)
 
 def _now_ts() -> int:
     return int(time.time())
 
-def all_active_tasks() -> List[Dict]:
-    # 使用 FieldFilter 避免 where 的警告
-    docs = TASKS.where(filter=FieldFilter("is_active", "==", True)).stream()
-    return [d.to_dict() for d in docs]
+def list_active_tasks() -> List[Dict]:
+    # 只取 is_active==True 的任務；可依需要調整排序
+    q = TASKS.where("is_active", "==", True)
+    return [d.to_dict() for d in q.stream()]
 
 def update_after_check(tid: str, snapshot: str):
-    TASKS.document(tid).update({"last_snapshot": snapshot, "last_checked": _now_ts()})
+    TASKS.document(tid).update({
+        "last_snapshot": snapshot,
+        "last_checked": _now_ts(),
+    })
 
-# ========= 取頁面 =========
+
+# ========= 抓頁面 =========
 def _cookies_dict(raw: str) -> Dict[str, str]:
+    """把 'a=1; b=2' 轉成 {'a':'1','b':'2'}；忽略 Path/HttpOnly 等屬性片段。"""
     if not raw:
         return {}
-    pairs = [p.strip() for p in raw.split(";") if p.strip()]
-    out = {}
-    for p in pairs:
-        if "=" in p:
-            k, v = p.split("=", 1)
-            out[k.strip()] = v.strip()
-    return out
+    cookies: Dict[str, str] = {}
+    for part in re.split(r";\s*", raw.strip()):
+        if not part or "=" not in part:
+            continue
+        k, v = part.split("=", 1)
+        cookies[k.strip()] = v.strip()
+    return cookies
 
-def _make_session():
+def build_session() -> requests.Session:
     if cloudscraper:
-        return cloudscraper.create_scraper(browser={"browser": "chrome", "platform": "windows"})
-    s = requests.Session()
-    return s
+        sess = cloudscraper.create_scraper(
+            browser={"browser": "chrome", "platform": "windows"}
+        )
+    else:
+        sess = requests.Session()
 
-def fetch_html(url: str, timeout: int = REQUEST_TIMEOUT, retries: int = MAX_RETRY) -> str:
-    """以一般/residential 環境存取，偵測 403/5xx 重試。"""
-    sess = _make_session()
-    headers = {
-        "User-Agent": USER_AGENT,
-        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+    sess.headers.update({
+        "User-Agent": UA,
         "Accept-Language": "zh-TW,zh;q=0.9,en;q=0.8",
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
         "Cache-Control": "no-cache",
         "Pragma": "no-cache",
-        "Connection": "keep-alive",
         "DNT": "1",
-        "Referer": f"{urlparse(url).scheme}://{urlparse(url).hostname}/",
-    }
-    cookies = _cookies_dict(COOKIES_RAW)
+        "Connection": "keep-alive",
+    })
 
-    last_exc = None
-    for attempt in range(retries + 1):
-        try:
-            r = sess.get(url, headers=headers, cookies=cookies or None, timeout=timeout)
-            # 某些網站對 403/429/503 才需要重試
-            if r.status_code in (403, 429, 503):
-                raise requests.HTTPError(f"{r.status_code} for {url}", response=r)
-            r.raise_for_status()
-            # 取文字
-            return r.text
-        except Exception as e:
-            last_exc = e
-            code = getattr(getattr(e, "response", None), "status_code", None)
-            logger.warning("[fetch] attempt=%s code=%s url=%s", attempt, code, url)
-            time.sleep(0.8 + attempt * 0.8 * random.random())
-    # 全部失敗
-    raise last_exc
+    # 代理
+    proxies: Dict[str, str] = {}
+    if PROXY_URL:
+        proxies["http"] = PROXY_URL
+        proxies["https"] = PROXY_URL
+    if HTTP_PROXY:
+        proxies["http"] = HTTP_PROXY
+    if HTTPS_PROXY:
+        proxies["https"] = HTTPS_PROXY
+    if proxies:
+        sess.proxies.update(proxies)
+        logger.info("[net] using proxies: %s", proxies)
 
-# ========= 文字正規化 & 票券偵測 =========
-SOLDOUT_KWS = ["售完", "完售", "已售完", "已售罄", "已無票", "sold out", "soldout"]
-TICKET_KWS  = ["立即購票", "購票", "加入購物車", "選擇座位", "剩餘", "可售", "尚有", "開賣", "tickets"]
+    # Cookie
+    if COOKIE_RAW:
+        sess.cookies.update(_cookies_dict(COOKIE_RAW))
+        logger.info("[net] using COOKIE from env (len=%d)", len(COOKIE_RAW))
 
+    return sess
+
+def fetch_html(sess: requests.Session, url: str) -> Tuple[int, str]:
+    try:
+        r = sess.get(url, timeout=REQUEST_TIMEOUT, allow_redirects=True)
+        return r.status_code, r.text if r.ok else ""
+    except requests.HTTPError as e:
+        logger.warning(f"[fetch] HTTPError {e}")
+        return 0, ""
+    except requests.RequestException as e:
+        logger.warning(f"[fetch] RequestException {type(e).__name__}: {e}")
+        return 0, ""
+
+
+# ========= 解析與偵測 =========
 def normalize_text(s: str) -> str:
-    s = unicodedata.normalize("NFKC", s)
-    s = re.sub(r"\s+", " ", s).strip()
-    return s
+    # 簡化空白、避免雜訊
+    s = re.sub(r"\s+", " ", s or "")
+    return s.strip()
 
-def extract_snapshot_and_ticket(html: str) -> Tuple[str, bool, List[str]]:
+def extract_availability(html: str) -> Tuple[str, bool, Dict[str, int]]:
     """
-    萃取頁面文字快照與是否判定「有票」。
-    另外傳回 area_hits：例如 ['A區 剩餘 12', 'B區 尚有 5']，可放進推播訊息。
+    回傳 (snapshot, has_ticket, area_left_map)
+    - snapshot：拿來做 diff（避免重複推播）
+    - has_ticket：是否偵測到有票字樣
+    - area_left_map：嘗試從區塊附近抓出 '剩餘/可售/尚有' 數字
     """
     soup = BeautifulSoup(html, "html.parser")
     for tag in soup(["script", "style", "noscript"]):
         tag.decompose()
 
     text = normalize_text(soup.get_text(" ", strip=True))
-    low = text.lower()
 
-    # 關鍵字判斷（不包含 soldout）
-    has_kw = any(kw.lower() in low for kw in TICKET_KWS)
-    is_soldout = any(kw.lower() in low for kw in SOLDOUT_KWS)
-    has_ticket = has_kw and not is_soldout
+    # 一般關鍵字
+    soldout_keywords = ["售完", "完售", "已售完", "已售罄", "已無票", "sold out", "soldout"]
+    ticket_keywords  = ["立即購票", "購票", "加入購物車", "選擇座位", "剩餘", "可售", "尚有", "tickets"]
 
-    # 進一步抓各區「剩餘/尚有/可售 數字」
-    area_hits = []
-    # 範例：A區 剩餘 12、搖滾區 尚有10、B3 可售 3
-    for m in re.finditer(r"([A-Za-z0-9\u4e00-\u9fff]{1,12}區)\s*(?:座位|門票|票)?\s*(剩餘|尚有|可售)\s*(\d+)", text):
-        g = f"{m.group(1)} {m.group(2)} {m.group(3)}"
-        if g not in area_hits:
-            area_hits.append(g)
-    # 補抓「立即購票/選擇座位/加入購物車」的按鈕文字
-    important_bits = []
+    t_low = text.lower()
+    has_ticket = any(kw.lower() in t_low for kw in ticket_keywords) and not any(
+        kw.lower() in t_low for kw in soldout_keywords
+    )
+
+    # 針對 tixcraft area 頁面常見樣式，嘗試抓「區域／尚有／剩餘」數字
+    area_left: Dict[str, int] = {}
+    # 找可能的「剩餘/可售/尚有 + 數字」
+    for m in re.finditer(r"(剩餘|可售|尚有)\s*(\d+)", text):
+        count = int(m.group(2))
+        if count <= 0:
+            continue
+        # 嘗試在匹配附近拿一小段字作為區域名稱（很 heuristics，但通常夠用）
+        start = max(0, m.start() - 20)
+        ctx = text[start:m.start()]
+        # 取最後一個「區/樓/排/座/票種」等字樣附近的短字串當區名
+        area_match = re.search(r"([A-Za-z0-9一-龥]{1,8}區|[A-Za-z0-9一-龥]{1,8}樓|[A-Za-z0-9一-龥]{1,8}側|[A-Za-z0-9一-龥]{1,8}排)?$", ctx)
+        area_name = (area_match.group(0) if area_match else "").strip(" ，:;")
+        if not area_name:
+            area_name = "某區"
+        area_left[area_name] = max(count, area_left.get(area_name, 0))
+        has_ticket = True  # 有找到數字也視為疑似有票
+
+    # 另外把頁面上常見 button/連結文字收集至 snapshot
+    important_bits: List[str] = []
     for btn in soup.find_all(["a", "button"]):
-        t = btn.get_text(" ", strip=True)
+        t = normalize_text(btn.get_text(" ", strip=True))
         if t:
-            important_bits.append(normalize_text(t))
-    snapshot = text + "\n\nBTN:" + "|".join(important_bits[:60])
+            important_bits.append(t)
+    snapshot = text[:4000] + "\n\nBTN:" + "|".join(important_bits[:80])
+    return snapshot, has_ticket, area_left
 
-    # 如果解析到 area_hits，則一定視為 has_ticket
-    if area_hits:
-        has_ticket = True
 
-    return snapshot, has_ticket, area_hits
-
-# ========= 主迴圈 =========
-def _clamp_interval(v: int) -> int:
-    try:
-        v = int(v)
-    except Exception:
-        v = DEFAULT_INTERVAL
-    return max(5, min(300, v))
-
-def run_once() -> int:
-    """執行一輪：掃描到期的任務，回傳已檢查數量。"""
-    tasks = all_active_tasks()
+# ========= 主流程 =========
+def sweep_once(sess: requests.Session) -> int:
+    """跑一輪：挑達到間隔的任務去抓，回傳檢查數量。"""
+    tasks = list_active_tasks()
     random.shuffle(tasks)
-
-    logger.info("抓到 %d 個活躍任務", len(tasks))
+    logger.info(f"active tasks = {len(tasks)}")
     checked = 0
     now = _now_ts()
 
     for t in tasks:
         try:
-            last_checked = int(t.get("last_checked", 0) or 0)
-            interval_sec = _clamp_interval(t.get("interval_sec", DEFAULT_INTERVAL))
-            if (now - last_checked) < interval_sec:
-                continue
-
             tid = t.get("tid")
             url = t.get("url")
             user_id = t.get("user_id")
-            logger.info("→ 檢查 task#%s 每 %ss url=%s", tid, interval_sec, url)
+            interval_sec = int(t.get("interval_sec") or 15)
+            last_checked = int(t.get("last_checked") or 0)
 
-            html = fetch_html(url)
-            snapshot, has_ticket, area_hits = extract_snapshot_and_ticket(html)
+            if not tid or not url or not user_id:
+                continue
 
-            new_hash = hashlib.sha256(snapshot.encode("utf-8")).hexdigest()
-            old_hash = hashlib.sha256((t.get("last_snapshot") or "").encode("utf-8")).hexdigest()
-            first_run = not bool(t.get("last_snapshot"))
+            if now - last_checked < max(5, min(300, interval_sec)):
+                continue
 
+            logger.info(f"-> check task#{tid} {url}")
+
+            code, html = fetch_html(sess, url)
+            if code == 403:
+                logger.warning(f"[fetch] code=403 for {url}")
+                # 更新 last_checked，避免短時間內被擋重試過多
+                update_after_check(tid, t.get("last_snapshot") or "")
+                time.sleep(random.uniform(0.2, 0.6))
+                continue
+            if code == 0:
+                # 網路錯誤，不更新 last_checked 以便下輪重試
+                continue
+            if code != 200:
+                logger.warning(f"[fetch] code={code} for {url}")
+                update_after_check(tid, t.get("last_snapshot") or "")
+                time.sleep(random.uniform(0.2, 0.6))
+                continue
+
+            snapshot, has_ticket, area_left = extract_availability(html)
+            new_hash = hashlib.sha256(snapshot.encode("utf-8", errors="ignore")).hexdigest()
+            old_hash = hashlib.sha256((t.get("last_snapshot") or "").encode("utf-8", errors="ignore")).hexdigest()
+
+            # 一定要更新 last_snapshot / last_checked（避免重複抓）
             update_after_check(tid, snapshot)
-            changed = (new_hash != old_hash)
-
-            logger.info("[check] task#%s has_ticket=%s first_run=%s changed=%s", tid, has_ticket, first_run, changed)
-
-            # == 通知條件 ==
-            # 1) 有票 且 (第一次 | 內容變更) 就推播
-            if has_ticket and (first_run or changed):
-                detail = f"\n" + "\n".join(f"・{h}" for h in area_hits[:10]) if area_hits else ""
-                # 推播文字可以包含 emoji，不寫入 log
-                msg = f"🎉 疑似有票釋出！\n任務#{tid}\n{url}{detail}\n（建議立刻點進去檢查與購買）"
-                push(user_id, msg)
-
             checked += 1
-            time.sleep(random.uniform(0.2, 0.6))
 
-        except requests.HTTPError as he:
-            code = getattr(getattr(he, "response", None), "status_code", None)
-            logger.error("[check] HTTPError %s for %s", code, t.get("url"))
+            # 推播條件：內容有變化且偵測到疑似有票
+            if has_ticket and new_hash != old_hash:
+                # 組裝摘要
+                summary_lines: List[str] = []
+                if area_left:
+                    # 只取前幾個區域以免訊息太長
+                    top = list(area_left.items())[:6]
+                    summary = ", ".join([f"{k}:{v}" for k, v in top])
+                    summary_lines.append(f"區域剩餘：{summary}")
+                msg = "疑似有票釋出！\n" + f"任務#{tid}\n{url}"
+                if summary_lines:
+                    msg += "\n" + "\n".join(summary_lines)
+                # 無表情符號，避免 Windows 主控台編碼問題
+                push_line(user_id, msg)
+
+            time.sleep(random.uniform(0.2, 0.6))
         except Exception as e:
-            logger.exception("[check] task#%s error: %s", t.get("tid"), e)
+            logger.error(f"[sweep] task#{t.get('tid')} error: {e}")
+            # 錯誤也不要卡住其他任務
+            time.sleep(0.2)
 
     return checked
 
+
 def main():
-    logger.info("%s", _safe("worker 啟動（住宅網路模式）"))
-    try:
-        while True:
-            n = run_once()
-            # 沒任務就稍微休息久一點
-            time.sleep(WORKER_IDLE_SEC if n else max(WORKER_IDLE_SEC, 2.5))
-    except KeyboardInterrupt:
-        logger.info("收到中斷訊號，結束。")
+    logger.info("worker start (residential mode)")
+    sess = build_session()
+    # 立即先跑一輪，之後固定間隔巡迴
+    while True:
+        try:
+            n = sweep_once(sess)
+            # 若沒有檢查任何任務，稍微等久一點
+            sleep_sec = 2 if n > 0 else 5
+            time.sleep(sleep_sec)
+        except KeyboardInterrupt:
+            logger.info("stopped by user")
+            break
+        except Exception as e:
+            logger.error(f"[main] unhandled error: {e}")
+            time.sleep(3)
+
 
 if __name__ == "__main__":
     main()
