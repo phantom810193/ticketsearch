@@ -278,24 +278,55 @@ def check_ibon_playwright(any_url: str) -> Tuple[bool, str, str]:
 def webhook():
     raw = request.get_data()
     if not _verify_line_signature(raw):
-        abort(400, "Invalid LINE signature")
+        # 如果這邊被擋，LINE 端會收不到任何訊息
+        app.logger.error("Invalid LINE signature")
+        return "bad signature", 400
 
     body = request.get_json(silent=True) or {}
     events = body.get("events", [])
+    HELP = (
+        "我是票券監看機器人 👋\n"
+        "指令：\n"
+        "/start 或 /help － 顯示這個說明\n"
+        "/watch <URL> [秒] － 開始監看（最小 60 秒）\n"
+        "/unwatch <任務ID> － 停用任務\n"
+        "/list － 查看最近任務"
+    )
+
     for ev in events:
         etype = ev.get("type")
+
+        # 使用者把你加入好友時，LINE 會送 follow 事件
+        if etype == "follow":
+            reply_token = ev.get("replyToken")
+            _line_reply(reply_token, HELP)
+            continue
+
+        # 被加入群組／聊天室
+        if etype == "join":
+            reply_token = ev.get("replyToken")
+            _line_reply(reply_token, "大家好！輸入 /start 看指令。")
+            continue
+
+        # 只處理文字訊息
         if etype != "message":
             continue
         msg = ev.get("message", {})
         if msg.get("type") != "text":
             continue
 
-        text: str = (msg.get("text") or "").strip()
+        text = (msg.get("text") or "").strip()
         reply_token = ev.get("replyToken")
         source = ev.get("source", {})  # 可能有 userId / groupId / roomId
 
+        # ----- 新增：/start /help -----
+        if text.lower() in ("/start", "start", "/help", "help", "？", "help me"):
+            _line_reply(reply_token, HELP)
+            continue
+        # ----- 以上為新增 -----
+
+        # 原有指令：/watch
         if text.lower().startswith("/watch"):
-            # 用法：/watch <URL> [秒]（最小 60 秒）
             parts = text.split()
             if len(parts) < 2:
                 _line_reply(reply_token, "用法：/watch <票券網址>\n可貼活動頁或 orders 內頁")
@@ -312,6 +343,7 @@ def webhook():
             target_type = "user" if source.get("userId") else ("group" if source.get("groupId") else "room")
             target_id = source.get("userId") or source.get("groupId") or source.get("roomId")
 
+            import secrets, time
             task_id = secrets.token_urlsafe(4)
             now = int(time.time())
             db.collection("watches").document(task_id).set({
@@ -330,6 +362,7 @@ def webhook():
             )
             continue
 
+        # 原有指令：/unwatch
         if text.lower().startswith("/unwatch"):
             parts = text.split()
             if len(parts) < 2:
@@ -344,12 +377,13 @@ def webhook():
                 _line_reply(reply_token, f"找不到任務 {tid}")
             continue
 
+        # 原有指令：/list
         if text.lower().startswith("/list"):
-            # 列出這位使用者/群組的前 10 個任務
             target_id = source.get("userId") or source.get("groupId") or source.get("roomId")
+            from google.cloud import firestore as _fs
             q = (db.collection("watches")
                  .where("targetId", "==", target_id)
-                 .order_by("createdAt", direction=firestore.Query.DESCENDING)
+                 .order_by("createdAt", direction=_fs.Query.DESCENDING)
                  .limit(10))
             docs = list(q.stream())
             if not docs:
@@ -363,11 +397,10 @@ def webhook():
                 _line_reply(reply_token, "你的任務：\n" + "\n\n".join(lines))
             continue
 
-        # 其它訊息 → 提示用法
-        _line_reply(reply_token, "指令：\n/watch <URL> [秒]\n/unwatch <任務ID>\n/list")
+        # 其它訊息 → 回說明
+        _line_reply(reply_token, HELP)
 
     return "OK"
-
 
 # -------------------- Cloud Scheduler 入口（熱修版：永遠回 200） --------------------
 @app.get("/cron/tick")
