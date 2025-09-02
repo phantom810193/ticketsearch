@@ -1,6 +1,18 @@
-# app.py — ibon 票券監看（LINE Bot）
-# 新增：活動主視覺圖自動抓取（og:image → 000頁img → 連到 ActivityInfo/Details 頁抓 → 直接 regex 撈 AzureEdge）
-# 既有：/watch 去重、/list 過濾、/check 深入 001 票區抓可售張數、Cloud Tasks 0/15/30/45 扇出、日期清洗(防亂碼)
+# app.py — ibon 票券監看（LINE Bot on Cloud Run）
+# 功能：
+# - /check <URL>：手動查詢，可自動深入 001 票區抓可售張數（含 HTML/JSON 扫描）
+# - /watch <URL> [秒]：建立監看（同網址不重複；帶新秒數會更新；/unwatch 停用；/list 檢視）
+# - /cron/tick：被 Cloud Scheduler 叫醒，處理 due 任務並發 LINE push
+# - 圖片：會自動抓活動主視覺（og:image / <img> / regex / ActivityInfo 頁）
+# - 補助：/diag?url=... 直接看解析結果（測試便利）
+# 建議環境變數：
+#   LINE_CHANNEL_ACCESS_TOKEN / LINE_TOKEN
+#   LINE_CHANNEL_SECRET / LINE_SECRET
+#   GOOGLE_CLOUD_PROJECT（Cloud Run 預設會有）
+#   DEFAULT_PERIOD_SEC=60 （選填）
+#   TICK_FANOUT=0 或 1（預設 1；若不使用 Cloud Tasks 扇出，建議設 0）
+#   ALWAYS_NOTIFY=0 或 1（預設 0；設 1 表示每次排程都推播現況）
+#   ＊若要用 Cloud Tasks 扇出：TASKS_QUEUE / TASKS_LOCATION / TASKS_SERVICE_ACCOUNT / TASKS_TARGET_URL
 
 import base64
 import hashlib
@@ -22,9 +34,7 @@ from google.cloud import firestore
 app = Flask(__name__)
 logging.basicConfig(level=os.getenv("LOG_LEVEL", "INFO"))
 
-# ---------- 基礎設定 ----------
-ALWAYS_NOTIFY = os.getenv("ALWAYS_NOTIFY", "0") == "1"   # 1=每次排程都推播（有讀到數字/售完時）
-
+# ---------- 環境變數 ----------
 db = firestore.Client()
 LINE_TOKEN = os.environ.get("LINE_CHANNEL_ACCESS_TOKEN") or os.environ.get("LINE_TOKEN")
 LINE_SECRET = os.environ.get("LINE_CHANNEL_SECRET") or os.environ.get("LINE_SECRET")
@@ -39,8 +49,22 @@ TASKS_SERVICE_ACCOUNT = os.environ.get("TASKS_SERVICE_ACCOUNT", "")
 TASKS_TARGET_URL = os.environ.get("TASKS_TARGET_URL", "")
 TICK_FANOUT = os.environ.get("TICK_FANOUT", "1") == "1"
 
+ALWAYS_NOTIFY = os.getenv("ALWAYS_NOTIFY", "0") == "1"   # 1=每次排程都推播；0=狀態變動時才推
+
 UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
       "(KHTML, like Gecko) Chrome/126.0 Safari/537.36")
+
+HELP_TEXT = (
+    "我是票券監看機器人 👋\n"
+    "指令：\n"
+    "/start 或 /help － 顯示這個說明\n"
+    "/watch <URL> [秒] － 開始監看（同網址不重複；帶新秒數會更新；最小 15 秒）\n"
+    "/unwatch <任務ID> － 停用任務\n"
+    "/list － 顯示啟用中任務（/list all 看全部；/list off 只看停用）\n"
+    "/check <URL> － 立刻手動查詢該頁剩餘票數\n"
+    "/checkid <任務ID> － 立刻手動查詢該任務的 URL\n"
+    "也可輸入「查詢」或 /check 不帶參數，會查你最近一筆啟用中的任務"
+)
 
 # ---------- 規則 ----------
 _RE_QTY = re.compile(r"(空位|剩餘|尚餘|尚有|可售|餘票|名額|席位|剩餘張數|剩餘票數|餘數|可購|剩下)[^\d]{0,6}(\d+)", re.I)
@@ -49,10 +73,8 @@ _RE_AREANAME_NEAR = re.compile(
     r"(搖滾.?[A-Z]?\s*區|搖滾區|身障席|身心障礙席|無障礙席|內野|外野|[A-Z]\s*區|[A-Z]\d+\s*區|看台\d+|[一二三四五六七八九十]\s*樓|[東西南北上下]\s*(?=區|層)|\S{1,8}區)",
     re.I
 )
-# 活動主圖：azureedge 上的 ActivityImage
 _RE_ACTIVITY_IMG = re.compile(r"https?://[^\"'<>]*azureedge\.net/[^\"'<>]*ActivityImage[^\"'<>]*\.(?:jpg|jpeg|png)", re.I)
-
-# 日期樣式
+_RE_ACTIVITY_INFO = re.compile(r"(https?://ticket\.ibon\.com\.tw)?/?ActivityInfo/Details/\d+", re.I)
 _DATE_PAT = re.compile(
     r"(\d{4}[./-年]\s*\d{1,2}[./-月]\s*\d{1,2}"
     r"(?:\s*[（(]?[一二三四五六日天週周MonTueWedThuFriSatSun星期]{1,3}[)）]?)?"
@@ -64,19 +86,60 @@ _DATE_PAT = re.compile(
     r")"
 )
 
-HELP_TEXT = (
-    "我是票券監看機器人 👋\n"
-    "指令：\n"
-    "/start 或 /help － 顯示這個說明\n"
-    "/watch <URL> [秒] － 開始監看（最小 15 秒；同網址不可重複建立，帶新秒數會更新既有任務）\n"
-    "/unwatch <任務ID> － 停用任務\n"
-    "/list － 顯示啟用中任務（/list all 看全部；/list off 只看停用）\n"
-    "/check <URL> － 立刻手動查詢該頁剩餘票數\n"
-    "/checkid <任務ID> － 立刻手動查詢該任務的 URL\n"
-    "也可輸入「查詢」或 /check 不帶參數，會查你最近一筆啟用中的任務"
-)
+# ---------- LINE ----------
+def _line_reply(reply_token: str, text: str) -> None:
+    if not LINE_TOKEN or not reply_token: return
+    url = "https://api.line.me/v2/bot/message/reply"
+    headers = {"Authorization": f"Bearer {LINE_TOKEN}", "Content-Type": "application/json"}
+    body = {"replyToken": reply_token, "messages": [{"type": "text", "text": text[:4000]}]}
+    try:
+        resp = requests.post(url, headers=headers, json=body, timeout=10)
+        if resp.status_code >= 400:
+            app.logger.error(f"LINE reply failed {resp.status_code}: {resp.text}")
+        resp.raise_for_status()
+    except Exception as e:
+        app.logger.exception(f"LINE reply failed: {e}")
 
-# ---------- 小工具 ----------
+def _line_reply_rich(reply_token: str, text: str, image_url: Optional[str] = None) -> None:
+    if not LINE_TOKEN or not reply_token: return
+    url = "https://api.line.me/v2/bot/message/reply"
+    headers = {"Authorization": f"Bearer {LINE_TOKEN}", "Content-Type": "application/json"}
+    messages = []
+    if image_url:
+        messages.append({"type": "image","originalContentUrl": image_url,"previewImageUrl": image_url})
+    messages.append({"type": "text", "text": text[:4000]})
+    try:
+        resp = requests.post(url, headers=headers, json={"replyToken": reply_token, "messages": messages}, timeout=10)
+        if resp.status_code >= 400:
+            app.logger.error(f"LINE reply (rich) failed {resp.status_code}: {resp.text}")
+        resp.raise_for_status()
+    except Exception as e:
+        app.logger.exception(f"LINE reply (rich) failed: {e}")
+
+def _line_push_rich(to: str, text: str, image_url: Optional[str] = None) -> None:
+    if not LINE_TOKEN or not to: return
+    url = "https://api.line.me/v2/bot/message/push"
+    headers = {"Authorization": f"Bearer {LINE_TOKEN}", "Content-Type": "application/json"}
+    messages = []
+    if image_url:
+        messages.append({"type": "image","originalContentUrl": image_url,"previewImageUrl": image_url})
+    messages.append({"type": "text", "text": text[:4000]})
+    try:
+        resp = requests.post(url, headers=headers, json={"to": to, "messages": messages}, timeout=10)
+        if resp.status_code >= 400:
+            app.logger.error(f"LINE push failed {resp.status_code}: {resp.text}")
+        resp.raise_for_status()
+    except Exception as e:
+        app.logger.exception(f"LINE push (rich) failed: {e}")
+
+def _verify_line_signature(raw_body: bytes) -> bool:
+    if not LINE_SECRET: return True
+    sig = request.headers.get("X-Line-Signature", "")
+    digest = hmac.new(LINE_SECRET.encode("utf-8"), raw_body, hashlib.sha256).digest()
+    expected = base64.b64encode(digest).decode("utf-8")
+    return hmac.compare_digest(sig, expected)
+
+# ---------- 工具 ----------
 def _req_session() -> requests.Session:
     s = requests.Session()
     s.headers.update({"User-Agent": UA, "Accept-Language": "zh-TW,zh;q=0.9,en;q=0.8", "Cache-Control": "no-cache"})
@@ -98,6 +161,7 @@ def _only_date_like(s: str) -> str:
     m = _DATE_PAT.search(s)
     return m.group(0) if m else ""
 
+# ---------- URL 整理 ----------
 def resolve_ibon_orders_url(any_url: str) -> Optional[str]:
     u = urlparse(any_url)
     if "orders.ibon.com.tw" in u.netloc and "UTK0201" in u.path.upper():
@@ -145,42 +209,32 @@ def canonicalize_ibon_url(any_url: str) -> str:
     if q: canon += "?" + q
     return canon
 
-# ---------- 000：基本資訊/表格抓數量 ----------
+# ---------- 000：基本資訊/靜態數量 ----------
 def _extract_activity_meta(soup: BeautifulSoup) -> Dict[str, str]:
     _strip_scripts(soup)
-
     def find_label(labels):
         pat = re.compile("|".join(map(re.escape, labels)))
         for node in soup.find_all(string=pat):
             parent = node.parent
             if not parent or parent.name in ("script", "style", "noscript"): continue
-            # 表格
             if parent.name in ("td", "th") and parent.parent:
                 cells = [c.get_text(" ", strip=True) for c in parent.parent.find_all(["td", "th"])]
                 for i, val in enumerate(cells):
                     if re.search(pat, val) and i + 1 < len(cells):
                         out = _clean_text(cells[i + 1])
                         if out: return out
-            # 同元素
             txt = parent.get_text(" ", strip=True)
             if re.search(pat, txt):
                 out = _clean_text(pat.sub("", txt).replace("：", " ").strip())
                 if out: return out
-            # 兄弟
             sib = parent.find_next_sibling()
             if sib:
                 out = _clean_text(sib.get_text(" ", strip=True))
                 if out: return out
         return ""
-
-    title = _clean_text(
-        find_label(["活動名稱"]) or (
-            soup.select_one('meta[property="og:title"]') and soup.select_one('meta[property="og:title"]').get("content", "")
-        )
-    )
+    title = _clean_text(find_label(["活動名稱"]) or (soup.select_one('meta[property="og:title"]') and soup.select_one('meta[property="og:title"]').get("content", "")))
     dt = _only_date_like(find_label(["活動時間", "演出時間"])) or _only_date_like(soup.get_text(" ", strip=True))
     venue = _clean_text(find_label(["活動地點", "地點", "場館", "地點/場館"]))
-    # image 改到外層統一解析（為了跳到活動頁抓主視覺）
     return {"title": title, "datetime": dt, "venue": venue}
 
 def _guess_area_from_text(txt: str) -> str:
@@ -246,41 +300,35 @@ def parse_ibon_orders_static(html: str) -> Dict:
 
     return {"sections": sections, "total": total, "soldout": (total == 0 and soldout_hint), "soup": soup}
 
-# ---------- 001 票區：擴充抓取 ----------
+# ---------- 001 票區：URL/ID/名稱 ----------
 def _extract_ids_from_url(url: str) -> Dict[str, str]:
     q = dict((k.upper(), v) for k, v in parse_qsl(urlparse(url).query, keep_blank_values=True))
     return {"PERFORMANCE_ID": q.get("PERFORMANCE_ID",""), "PRODUCT_ID": q.get("PRODUCT_ID",""), "STRITEM": q.get("STRITEM","")}
+
+def _collect_area_ids_from_html(html: str) -> Set[str]:
+    ids: Set[str] = set()
+    for m in re.finditer(r"PERFORMANCE_PRICE_AREA_ID\s*=\s*([A-Za-z0-9]+)", html, re.I):
+        ids.add(m.group(1))
+    for m in re.finditer(r"(UTK0201_001\.aspx[^\"'>)]+)", html):
+        frag = m.group(1)
+        mm = re.search(r"PERFORMANCE_PRICE_AREA_ID=([A-Za-z0-9]+)", frag, re.I)
+        if mm: ids.add(mm.group(1))
+    for m in re.finditer(r"data-?areaid\s*=\s*['\"]?([A-Za-z0-9]+)['\"]?", html, re.I):
+        ids.add(m.group(1))
+    return ids
 
 def _build_001_base_url(base: str, perf_id: str, prod_id: str, stritem: str = "") -> str:
     p = urlparse(base)
     path = "/application/UTK02/UTK0201_001.aspx"
     q = f"PERFORMANCE_ID={quote(perf_id)}&PRODUCT_ID={quote(prod_id)}"
-    if stritem:
-        q += f"&strItem={quote(stritem)}"
+    if stritem: q += f"&strItem={quote(stritem)}"
     return f"{p.scheme}://{p.netloc}{path}?{q}"
-
-def _collect_area_ids_from_html(html: str) -> Set[str]:
-    ids: Set[str] = set()
-    # 任何大小寫變形
-    for m in re.finditer(r"PERFORMANCE_PRICE_AREA_ID\s*=\s*([A-Za-z0-9]+)", html, re.I):
-        ids.add(m.group(1))
-    # onclick / form 片段
-    for m in re.finditer(r"(UTK0201_001\.aspx[^\"'>)]+)", html):
-        frag = m.group(1)
-        mm = re.search(r"PERFORMANCE_PRICE_AREA_ID=([A-Za-z0-9]+)", frag, re.I)
-        if mm:
-            ids.add(mm.group(1))
-    # data-* 標記
-    for m in re.finditer(r"data-?areaid\s*=\s*['\"]?([A-Za-z0-9]+)['\"]?", html, re.I):
-        ids.add(m.group(1))
-    return ids
 
 def _build_001_url(base: str, perf_id: str, prod_id: str, area_id: str, stritem: str = "") -> str:
     p = urlparse(base)
     path = "/application/UTK02/UTK0201_001.aspx"
     q = f"PERFORMANCE_ID={quote(perf_id)}&PRODUCT_ID={quote(prod_id)}&PERFORMANCE_PRICE_AREA_ID={quote(area_id)}"
-    if stritem:
-        q += f"&strItem={quote(stritem)}"
+    if stritem: q += f"&strItem={quote(stritem)}"
     return f"{p.scheme}://{p.netloc}{path}?{q}"
 
 def _extract_area_name_001(soup: BeautifulSoup, fallback: str) -> str:
@@ -291,24 +339,63 @@ def _extract_area_name_001(soup: BeautifulSoup, fallback: str) -> str:
     if og and og.get("content"): return re.sub(r"\s+", "", og["content"])[:20]
     return fallback or "票區"
 
+# ---------- 活動主視覺圖 ----------
+def _find_image_in_soup(base_url: str, soup: BeautifulSoup) -> str:
+    for prop in ("og:image", "og:image:url", "twitter:image"):
+        og = soup.select_one(f'meta[property="{prop}"], meta[name="{prop}"]')
+        if og and og.get("content"):
+            return urljoin(base_url, og["content"])
+    for img in soup.find_all("img"):
+        cand = img.get("src") or img.get("data-src") or ""
+        if not cand and img.get("srcset"):
+            cand = img["srcset"].split(",")[0].split()[0]
+        if cand and ("ActivityImage" in cand or "azureedge" in cand):
+            return urljoin(base_url, cand)
+    for u in re.findall(r'url\(([^)]+)\)', soup.decode()):
+        u = u.strip('\'"')
+        if "ActivityImage" in u or "azureedge" in u:
+            return urljoin(base_url, u)
+    return ""
+
+def _resolve_activity_image(orders_url: str, html_000: str, soup_000: BeautifulSoup, sess: requests.Session) -> str:
+    img = _find_image_in_soup(orders_url, soup_000)
+    if img: return img
+    m = _RE_ACTIVITY_IMG.search(html_000)
+    if m: return m.group(0)
+    m2 = _RE_ACTIVITY_INFO.search(html_000)
+    if m2:
+        details_url = m2.group(0)
+        if not details_url.startswith("http"):
+            details_url = urljoin(orders_url, details_url)
+        try:
+            r2 = sess.get(details_url, timeout=15); r2.raise_for_status()
+            soup2 = BeautifulSoup(r2.text, "html.parser")
+            _strip_scripts(soup2)
+            img2 = _find_image_in_soup(details_url, soup2)
+            if img2: return img2
+            m3 = _RE_ACTIVITY_IMG.search(r2.text)
+            if m3: return m3.group(0)
+        except Exception as e:
+            app.logger.warning(f"[image] details fetch fail: {details_url} {e}")
+    return ""
+
+# ---------- 深入 001 票區 ----------
 def deep_parse_areas(orders_url: str, soup_000: BeautifulSoup, html_000: str, limit: int = 20) -> Tuple[Dict[str, int], int, bool]:
-    # 先從 000 抓 area id
     ids = _collect_area_ids_from_html(html_000)
     info = _extract_ids_from_url(orders_url)
     perf, prod, stritem = info["PERFORMANCE_ID"], info["PRODUCT_ID"], info["STRITEM"]
+
     s = _req_session()
     s.headers.update({"Referer": orders_url})
 
-    # 如果 000 沒抓到 id，先去 001 base 掃一次
+    # 000 沒 id → 先打 001 base 看看
     if not ids:
         url_001_base = _build_001_base_url(orders_url, perf, prod, stritem)
         try:
             r0 = s.get(url_001_base, timeout=15); r0.raise_for_status()
-            # 先看 base 頁是否就有數字
             parsed0 = parse_ibon_orders_static(r0.text)
             if parsed0["total"] > 0:
                 return parsed0["sections"], parsed0["total"], parsed0["soldout"]
-            # 沒有就從 base 抓 area id
             ids = _collect_area_ids_from_html(r0.text)
         except Exception as e:
             app.logger.warning(f"[deep] fetch 001 base fail: {e}")
@@ -333,25 +420,27 @@ def deep_parse_areas(orders_url: str, soup_000: BeautifulSoup, html_000: str, li
         soup = BeautifulSoup(r.text, "html.parser")
         _strip_scripts(soup)
         text = soup.get_text(" ", strip=True)
+        html = r.text
 
-        if _RE_SOLDOUT.search(text):
+        if _RE_SOLDOUT.search(text) or _RE_SOLDOUT.search(html):
             soldout_hint = True
 
-        # 票區名稱
         area = _extract_area_name_001(soup, fallback=f"區-{area_id[-4:]}")
 
-        # 數量：關鍵字 + 近鄰 (\d+)張
         qsum = 0
+        # 文字
         for m in _RE_QTY.finditer(text):
-            try:
-                qsum += int(m.group(2))
-            except:  # pragma: no cover
-                pass
+            try: qsum += int(m.group(2))
+            except: pass
+        # HTML 原文（屬性/JSON 內）
         if qsum == 0:
-            for m in re.finditer(r"(\d+)\s*張", text):
-                left = text[max(0, m.start()-10):m.start()]
-                if re.search(r"(空位|剩餘|尚餘|可售|可購|餘票)", left):
-                    qsum += int(m.group(1))
+            for m in _RE_QTY.finditer(html):
+                try: qsum += int(m.group(2))
+                except: pass
+        # 常見 JSON 欄位保底
+        if qsum == 0:
+            for m in re.finditer(r'"(?:AvailableQty|Qty|Remain|Left|剩餘|可售)"\s*:\s*(\d+)', html, re.I):
+                qsum += int(m.group(1))
 
         if qsum > 0:
             key = re.sub(r"\s+", "", area) or f"區-{area_id[-4:]}"
@@ -360,91 +449,7 @@ def deep_parse_areas(orders_url: str, soup_000: BeautifulSoup, html_000: str, li
 
     return sections, total, soldout_hint
 
-# ---------- 活動主視覺圖：多階段解析 ----------
-# 取圖：先 og:image / <img>，再 regex，最後跳到 ActivityInfo 頁面抓
-_RE_ACTIVITY_IMG = re.compile(r"https?://[^\"'<>]*azureedge\.net/[^\"'<>]*ActivityImage[^\"'<>]*\.(?:jpg|jpeg|png)", re.I)
-_RE_ACTIVITY_INFO = re.compile(r"(https?://ticket\.ibon\.com\.tw)?/?ActivityInfo/Details/(\d+)", re.I)
-
-def _find_image_in_soup(base_url: str, soup: BeautifulSoup) -> str:
-    # og:image
-    for prop in ("og:image", "og:image:url", "twitter:image"):
-        og = soup.select_one(f'meta[property="{prop}"], meta[name="{prop}"]')
-        if og and og.get("content"):
-            return urljoin(base_url, og["content"])
-    # <img src / data-src / srcset>
-    for img in soup.find_all("img"):
-        cand = img.get("src") or img.get("data-src") or ""
-        if not cand and img.get("srcset"):
-            cand = img["srcset"].split(",")[0].split()[0]
-        if not cand: 
-            continue
-        if "ActivityImage" in cand or "azureedge" in cand:
-            return urljoin(base_url, cand)
-    # 可能寫在 style 裡
-    for u in re.findall(r'url\(([^)]+)\)', soup.decode()):
-        u = u.strip('\'"')
-        if "ActivityImage" in u or "azureedge" in u:
-            return urljoin(base_url, u)
-    return ""
-
-def _resolve_activity_image(orders_url: str, html_000: str, soup_000: BeautifulSoup, sess: requests.Session) -> str:
-    # A) 先在 000 頁找
-    img = _find_image_in_soup(orders_url, soup_000)
-    if img:
-        return img
-    m = _RE_ACTIVITY_IMG.search(html_000)
-    if m:
-        return m.group(0)
-
-    # B) 從整份 HTML（不只 <a>）抓活動頁連結 ActivityInfo/Details/XXXX
-    m2 = _RE_ACTIVITY_INFO.search(html_000)
-    if m2:
-        details_url = m2.group(0)
-        if not details_url.startswith("http"):
-            details_url = urljoin(orders_url, details_url)
-        try:
-            r2 = sess.get(details_url, timeout=15); r2.raise_for_status()
-            soup2 = BeautifulSoup(r2.text, "html.parser")
-            _strip_scripts(soup2)
-            img2 = _find_image_in_soup(details_url, soup2)
-            if img2:
-                return img2
-            m3 = _RE_ACTIVITY_IMG.search(r2.text)
-            if m3:
-                return m3.group(0)
-        except Exception as e:
-            app.logger.warning(f"[image] details fetch fail: {details_url} {e}")
-
-    return ""
-
-def _resolve_activity_image(orders_url: str, html_000: str, soup_000: BeautifulSoup, sess: requests.Session) -> str:
-    # A) 先在 000 頁找
-    img = _find_image_in_soup(orders_url, soup_000)
-    if img: return img
-
-    # B) 嘗試找到活動資訊頁（ActivityInfo/Details/...）
-    for a in soup_000.find_all("a", href=True):
-        href = a["href"]
-        if "ticket.ibon.com.tw" in href and "ActivityInfo" in href:
-            details_url = urljoin(orders_url, href)
-            try:
-                r2 = sess.get(details_url, timeout=15); r2.raise_for_status()
-                soup2 = BeautifulSoup(r2.text, "html.parser")
-                _strip_scripts(soup2)
-                img2 = _find_image_in_soup(details_url, soup2)
-                if img2: return img2
-            except Exception as e:
-                app.logger.warning(f"[image] details fetch fail: {details_url} {e}")
-                break  # 換下一招
-
-    # C) 直接在 HTML 字串 regex 撈 AzureEdge ActivityImage
-    m = _RE_ACTIVITY_IMG.search(html_000)
-    if m:
-        return m.group(0)
-
-    return ""
-
-# ---------- 查詢主流程 ----------
+# ---------- 主流程 ----------
 def check_ibon(any_url: str) -> Tuple[bool, str, str, Dict[str, str]]:
     orders_url = resolve_ibon_orders_url(any_url)
     if not orders_url:
@@ -458,20 +463,11 @@ def check_ibon(any_url: str) -> Tuple[bool, str, str, Dict[str, str]]:
     title = meta.get("title") or "活動資訊"
     venue = meta.get("venue")
     dt = meta.get("datetime")
-
-    # （如果你有做主視覺圖解析，這行保留）
     img = _resolve_activity_image(orders_url, r.text, parsed["soup"], s)
 
-    # ★★★ 這裡就是要加／保留的地方 ★★★
-    # 000 沒數字 → 解析 001 票區
+    # 000 沒數字 → 解析 001 票區（★★★注意第三個參數要傳 r.text）
     if parsed["total"] == 0:
-        # 第三個參數要帶 000 頁原始 HTML：r.text
-        sec2, tot2, sold2 = deep_parse_areas(
-            orders_url,
-            parsed["soup"],  # 000 頁的 BeautifulSoup
-            r.text,          # ← 000 頁的原始 HTML（這行就是你問的那一行）
-            limit=20,
-        )
+        sec2, tot2, sold2 = deep_parse_areas(orders_url, parsed["soup"], r.text, limit=20)
         if tot2 > 0:
             parsed["sections"], parsed["total"], parsed["soldout"] = sec2, tot2, False
         else:
@@ -494,55 +490,16 @@ def check_ibon(any_url: str) -> Tuple[bool, str, str, Dict[str, str]]:
 
     return False, prefix + "暫時讀不到剩餘數（可能為動態載入）。\n" + orders_url, "NA", {"image_url": img}
 
-# ---------- LINE Webhook ----------
+# ---------- Webhook ----------
 def _get_target_id(src: dict) -> str:
     return src.get("userId") or src.get("groupId") or src.get("roomId") or ""
-
-def _line_reply(reply_token: str, text: str) -> None:  # 重新宣告以靜態檢查安靜
-    if not LINE_TOKEN or not reply_token: return
-    url = "https://api.line.me/v2/bot/message/reply"
-    headers = {"Authorization": f"Bearer {LINE_TOKEN}", "Content-Type": "application/json"}
-    body = {"replyToken": reply_token, "messages": [{"type": "text", "text": text[:4000]}]}
-    try:
-        requests.post(url, headers=headers, json=body, timeout=10).raise_for_status()
-    except Exception as e:
-        app.logger.exception(f"LINE reply failed: {e}")
-
-def _line_reply_rich(reply_token: str, text: str, image_url: Optional[str] = None) -> None:
-    if not LINE_TOKEN or not reply_token: return
-    url = "https://api.line.me/v2/bot/message/reply"
-    headers = {"Authorization": f"Bearer {LINE_TOKEN}", "Content-Type": "application/json"}
-    messages = []
-    if image_url:
-        messages.append({"type": "image","originalContentUrl": image_url,"previewImageUrl": image_url})
-    messages.append({"type": "text", "text": text[:4000]})
-    try:
-        requests.post(url, headers=headers, json={"replyToken": reply_token, "messages": messages}, timeout=10).raise_for_status()
-    except Exception as e:
-        app.logger.exception(f"LINE reply (rich) failed: {e}")
-
-def _line_push_rich(to: str, text: str, image_url: Optional[str] = None) -> None:
-    if not LINE_TOKEN or not to: return
-    url = "https://api.line.me/v2/bot/message/push"
-    headers = {"Authorization": f"Bearer {LINE_TOKEN}", "Content-Type": "application/json"}
-    messages = []
-    if image_url:
-        messages.append({"type": "image","originalContentUrl": image_url,"previewImageUrl": image_url})
-    messages.append({"type": "text", "text": text[:4000]})
-    try:
-        requests.post(url, headers=headers, json={"to": to, "messages": messages}, timeout=10).raise_for_status()
-    except Exception as e:
-        app.logger.exception(f"LINE push (rich) failed: {e}")
 
 @app.post("/webhook")
 def webhook():
     raw = request.get_data()
-    if LINE_SECRET:
-        sig = request.headers.get("X-Line-Signature", "")
-        digest = hmac.new(LINE_SECRET.encode("utf-8"), raw, hashlib.sha256).digest()
-        expected = base64.b64encode(digest).decode("utf-8")
-        if not hmac.compare_digest(sig, expected):
-            return "bad signature", 400
+    if not _verify_line_signature(raw):
+        app.logger.error("Invalid LINE signature")
+        return "bad signature", 400
 
     body = request.get_json(silent=True) or {}
     events = body.get("events", [])
@@ -620,8 +577,8 @@ def webhook():
                       .limit(1))
                 docs0 = list(q0.stream())
                 existing = docs0[0] if docs0 else None
-            except Exception:
-                pass
+            except Exception as e:
+                app.logger.warning(f"/watch query by urlCanon failed, fallback scan: {e}")
             if not existing:
                 q1 = (db.collection("watches")
                       .where("targetId", "==", target_id)
@@ -762,7 +719,6 @@ def do_tick():
                 if should_push:
                     _line_push_rich(task["targetId"], msg, (meta or {}).get("image_url"))
                     d.reference.update({"lastSig": sig})
-
         except Exception as e:
             app.logger.exception(f"[tick] task {d.id} failed: {e}")
             errors.append(f"{d.id}:{type(e).__name__}")
@@ -775,6 +731,7 @@ def do_tick():
 
 @app.get("/cron/tick")
 def cron_tick():
+    # Scheduler 直呼：未帶 mode=run 時，可選擇扇出
     if request.args.get("mode") == "run" or request.headers.get("X-From-Tasks") == "1":
         return do_tick()
     if TICK_FANOUT:
@@ -785,6 +742,14 @@ def cron_tick():
 @app.get("/healthz")
 def healthz():
     return "ok", 200
+
+# 方便自查
+@app.get("/diag")
+def diag():
+    url = request.args.get("url", "")
+    if not url: return jsonify({"error":"missing url"}), 400
+    ok, msg, sig, meta = check_ibon(url)
+    return jsonify({"ok": ok, "sig": sig, "image": meta.get("image_url") if meta else None, "msg": msg})
 
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=int(os.getenv("PORT", "8080")))
