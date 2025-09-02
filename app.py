@@ -40,6 +40,9 @@ if not LINE_CHANNEL_ACCESS_TOKEN or not LINE_CHANNEL_SECRET:
 line_bot_api = LineBotApi(LINE_CHANNEL_ACCESS_TOKEN) if LINE_CHANNEL_ACCESS_TOKEN else None
 handler = WebhookHandler(LINE_CHANNEL_SECRET) if LINE_CHANNEL_SECRET else None
 
+MAX_PER_TICK = int(os.getenv("MAX_PER_TICK", "6"))          # 每次最多處理幾個任務
+TICK_SOFT_DEADLINE_SEC = int(os.getenv("TICK_SOFT_DEADLINE_SEC", "50"))  # 軟性截止(秒)
+
 # Firestore
 try:
     fs_client = firestore.Client()
@@ -537,8 +540,8 @@ def on_message(ev: MessageEvent):
 
 @app.route("/cron/tick", methods=["GET"])
 def cron_tick():
-    # 統一保證 2xx 回應，避免 Scheduler 收到 5xx
-    resp = {"ok": True, "processed": 0, "errors": []}
+    start = time.time()
+    resp = {"ok": True, "processed": 0, "skipped": 0, "errors": []}
     try:
         if not FS_OK:
             resp["ok"] = False
@@ -546,21 +549,31 @@ def cron_tick():
             return jsonify(resp), 200
 
         now = datetime.now(timezone.utc)
-        # 讀取任務清單也加 try/except，避免任何 SDK 例外冒出去
+
         try:
-            docs = list(fs_client.collection(COL)
-                        .where("enabled", "==", True).stream())
+            # 只抓啟用中的；不排序避免索引問題，改在 Python 端做 limit
+            docs = list(fs_client.collection(COL).where("enabled", "==", True).stream())
         except Exception as e:
             app.logger.error(f"[tick] list watchers failed: {e}")
             resp["ok"] = False
             resp["errors"].append(f"list failed: {e}")
             return jsonify(resp), 200
 
+        handled = 0
         for d in docs:
+            # 先檢查軟性截止與每次上限
+            if (time.time() - start) > TICK_SOFT_DEADLINE_SEC:
+                resp["errors"].append("soft-deadline reached; remaining will run next tick")
+                break
+            if handled >= MAX_PER_TICK:
+                resp["errors"].append("max-per-tick reached; remaining will run next tick")
+                break
+
             r = d.to_dict()
             period = int(r.get("period", DEFAULT_PERIOD_SEC))
             next_run_at = r.get("next_run_at") or (now - timedelta(seconds=1))
             if now < next_run_at:
+                resp["skipped"] += 1
                 continue
 
             url = r.get("url")
@@ -570,14 +583,14 @@ def cron_tick():
                 app.logger.error(f"[tick] probe error for {url}: {e}")
                 res = {"ok": False, "msg": f"probe error: {e}", "sig": "NA", "url": url}
 
-            # 更新紀錄也包 try/except
+            # 更新紀錄（即使失敗也往後排下一次，避免卡死）
             try:
                 fs_client.collection(COL).document(d.id).update({
                     "last_sig": res.get("sig", "NA"),
                     "last_total": res.get("total", 0),
                     "last_ok": bool(res.get("ok", False)),
                     "updated_at": now,
-                    "next_run_at": now + timedelta(seconds=int(r.get("period", DEFAULT_PERIOD_SEC))),
+                    "next_run_at": now + timedelta(seconds=period),
                 })
             except Exception as e:
                 app.logger.error(f"[tick] update doc error: {e}")
@@ -590,19 +603,21 @@ def cron_tick():
                     text = fmt_result_text(res)
                     img = res.get("image", "")
                     chat_id = r.get("chat_id")
-                    if img and img != "https://ticketimg2.azureedge.net/logo.png":
+                    if img and img != LOGO:
                         send_image(chat_id, img)
                     send_text(chat_id, text)
                 except Exception as e:
                     app.logger.error(f"[tick] notify error: {e}")
                     resp["errors"].append(f"notify error: {e}")
 
+            handled += 1
             resp["processed"] += 1
 
+        app.logger.info(f"[tick] processed={resp['processed']} skipped={resp['skipped']} "
+                        f"errors={len(resp['errors'])} duration={time.time()-start:.1f}s")
         return jsonify(resp), 200
 
     except Exception as e:
-        # 最外層保險絲
         app.logger.error(f"[tick] fatal: {e}\n{traceback.format_exc()}")
         resp["ok"] = False
         resp["errors"].append(str(e))
