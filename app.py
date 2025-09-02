@@ -3,13 +3,12 @@
 # Flask + Firestore + Cloud Scheduler + LINE Bot
 # 票券監看：支援 ibon 活動頁與 orders 內頁，回傳各區剩餘/合計
 #
-# requirements.txt（建議）
-# Flask==3.*
-# requests
-# beautifulsoup4
-# google-cloud-firestore
-# gunicorn
-# playwright (可選；若用備援解析)
+# 需要的環境變數：
+# - LINE_CHANNEL_ACCESS_TOKEN（或 LINE_TOKEN）
+# - LINE_CHANNEL_SECRET（或 LINE_SECRET，可留空：跳過驗簽）
+# - DEFAULT_PERIOD_SEC（預設 60）
+# - MAX_TASKS_PER_TICK（預設 25）
+# - USE_PLAYWRIGHT=1（可選，啟用備援解析）
 # ------------------------------------------------------------
 import base64
 import hashlib
@@ -44,7 +43,7 @@ LINE_SECRET = (
     or os.environ.get("LINE_SECRET")
 )
 
-DEFAULT_PERIOD_SEC = int(os.environ.get("DEFAULT_PERIOD_SEC", "60"))  # Cloud Scheduler 最小1分鐘
+DEFAULT_PERIOD_SEC = int(os.environ.get("DEFAULT_PERIOD_SEC", "60"))  # Cloud Scheduler 最小 60 秒
 MAX_TASKS_PER_TICK = int(os.environ.get("MAX_TASKS_PER_TICK", "25"))
 
 UA = (
@@ -209,7 +208,8 @@ def check_ibon_playwright(any_url: str) -> Tuple[bool, str, str]:
     備援：用 Playwright 攔截 JSON/XHR 來推估各區剩餘。
     只有在設置 USE_PLAYWRIGHT=1 時才會被呼叫。
     """
-    from playwright.sync_api import sync_playwright
+    # 延遲匯入，避免未安裝 playwright 造成啟動失敗
+    from playwright.sync_api import sync_playwright  # type: ignore
 
     orders_url = resolve_ibon_orders_url(any_url)
     if not orders_url:
@@ -248,8 +248,10 @@ def check_ibon_playwright(any_url: str) -> Tuple[bool, str, str]:
     def walk(node):
         nonlocal total
         if isinstance(node, dict):
-            name = node.get("AreaName") or node.get("Section") or node.get("Zone") or node.get("Name")
-            qty = node.get("Remain") or node.get("Remaining") or node.get("Available") or node.get("Qty")
+            name = (node.get("AreaName") or node.get("Section")
+                    or node.get("Zone") or node.get("Name"))
+            qty = (node.get("Remain") or node.get("Remaining")
+                   or node.get("Available") or node.get("Qty"))
             if name and isinstance(qty, (int, float)):
                 sections[str(name)] = sections.get(str(name), 0) + int(qty)
                 total += int(qty)
@@ -293,7 +295,7 @@ def webhook():
         source = ev.get("source", {})  # 可能有 userId / groupId / roomId
 
         if text.lower().startswith("/watch"):
-            # 允許：/watch <URL> [每X秒，不填預設60]
+            # 用法：/watch <URL> [秒]（最小 60 秒）
             parts = text.split()
             if len(parts) < 2:
                 _line_reply(reply_token, "用法：/watch <票券網址>\n可貼活動頁或 orders 內頁")
@@ -367,7 +369,7 @@ def webhook():
     return "OK"
 
 
-# -------------------- Cloud Scheduler 入口 --------------------
+# -------------------- Cloud Scheduler 入口（熱修版：永遠回 200） --------------------
 @app.get("/cron/tick")
 def cron_tick():
     now = int(time.time())
@@ -375,28 +377,29 @@ def cron_tick():
          .where("active", "==", True)
          .where("nextCheckAt", "<=", now)
          .limit(MAX_TASKS_PER_TICK))
-    docs = list(q.stream())
+    try:
+        docs = list(q.stream())
+    except Exception as e:
+        app.logger.exception(f"[tick] Firestore query failed: {e}")
+        return jsonify({"ok": False, "stage": "query", "error": str(e)}), 200
 
-    processed = 0
+    processed, errors = 0, []
     for d in docs:
         task = d.to_dict()
         try:
             ok, msg, sig = check_ibon(task["url"])
-            if ok:
-                if sig != task.get("lastSig"):
-                    _line_push(task["targetId"], msg)
-                    d.reference.update({"lastSig": sig})
-            else:
-                app.logger.info(f"check_ibon no data: {task['url']} -> {msg}")
+            if ok and sig != task.get("lastSig"):
+                _line_push(task["targetId"], msg)
+                d.reference.update({"lastSig": sig})
         except Exception as e:
-            app.logger.exception(f"tick error {d.id}: {e}")
+            app.logger.exception(f"[tick] task {d.id} failed: {e}")
+            errors.append(f"{d.id}:{type(e).__name__}")
         finally:
-            # 推進下一次
             period = int(task.get("periodSec", DEFAULT_PERIOD_SEC))
             d.reference.update({"nextCheckAt": now + max(60, period)})
             processed += 1
 
-    return jsonify({"processed": processed, "due": len(docs), "ts": now})
+    return jsonify({"ok": True, "processed": processed, "due": len(docs), "errors": errors, "ts": now}), 200
 
 
 # 健康檢查

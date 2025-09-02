@@ -1,23 +1,23 @@
+# Python base（體積小）
 FROM python:3.11-slim
 
-ENV PYTHONDONTWRITEBYTECODE=1 \
-    PYTHONUNBUFFERED=1 \
-    PIP_DISABLE_PIP_VERSION_CHECK=1 \
-    DEBIAN_FRONTEND=noninteractive
-
-WORKDIR /app
-
-# 基本工具（build-essential 讓某些套件能編譯；curl/ca-certificates 方便除錯）
+# 安裝 Chromium 及 Playwright 需要的系統套件
 RUN apt-get update && apt-get install -y --no-install-recommends \
-    build-essential curl ca-certificates \
+    libnss3 libatk1.0-0 libatk-bridge2.0-0 libxkbcommon0 libdrm2 libxcomposite1 \
+    libxdamage1 libxfixes3 libxrandr2 libgbm1 libasound2 fonts-noto-color-emoji \
+    curl ca-certificates \
  && rm -rf /var/lib/apt/lists/*
 
-# 先裝套件，再複製原始碼（可利用 docker layer cache）
+WORKDIR /app
 COPY requirements.txt .
-RUN python -m pip install --no-cache-dir --upgrade pip \
- && pip install --no-cache-dir -r requirements.txt
+RUN pip install --no-cache-dir -r requirements.txt
+
+# 如果 requirements 有 playwright，就安裝 chromium
+# （沒裝 playwright 的話，這步會自動略過）
+RUN python -c "import importlib; import sys; \
+    sys.exit(0) if importlib.util.find_spec('playwright') else sys.exit(0)" && \
+    python -m playwright install chromium || true
 
 COPY . .
-
-# Cloud Run 會注入 PORT=8080；預設值保險也設 8080
-CMD ["sh","-c","gunicorn -k uvicorn.workers.UvicornWorker -w 2 -b 0.0.0.0:${PORT:-8080} app:app"]
+# Cloud Run 入口
+CMD ["gunicorn", "-b", "0.0.0.0:8080", "app:app"]
