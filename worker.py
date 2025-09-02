@@ -76,8 +76,10 @@ def push(user_id: str, message: str):
 from google.cloud import firestore
 from google.cloud.firestore_v1 import FieldFilter
 
-db = firestore.Client()
+PROJECT_ID = os.getenv("GOOGLE_CLOUD_PROJECT") or os.getenv("GCP_PROJECT") or "ticketsearch-470701"
+db = firestore.Client(project=PROJECT_ID)
 TASKS = db.collection("tasks")
+print("[ENV] PROJECT_ID =", PROJECT_ID)
 
 def _now_ts() -> int:
     return int(time.time())
