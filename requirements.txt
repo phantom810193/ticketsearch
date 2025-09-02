@@ -1,12 +1,13 @@
-Flask
-fastapi
-uvicorn[standard]
-gunicorn
-line-bot-sdk
-requests
-cloudscraper
-beautifulsoup4
-google-cloud-firestore
-python-dotenv
-# 如要啟用備援解析才需要：
-playwright
+# Web
+Flask~=3.0
+gunicorn~=21.2
+requests>=2.31,<3
+beautifulsoup4~=4.12
+
+# Google Cloud
+google-cloud-firestore>=2.11,<3
+google-cloud-tasks>=2.11,<3
+
+# （可選）若你有把 USE_PLAYWRIGHT=1 打開，再取消下一行註解，
+# 並在 Dockerfile 內執行 `playwright install --with-deps chromium`
+# playwright~=1.45

@@ -1,15 +1,4 @@
-# app.py
-# ------------------------------------------------------------
-# Flask + Firestore + Cloud Scheduler + LINE Bot
-# 票券監看：支援 ibon 活動頁與 orders 內頁，回傳各區剩餘/合計
-#
-# 需要的環境變數：
-# - LINE_CHANNEL_ACCESS_TOKEN（或 LINE_TOKEN）
-# - LINE_CHANNEL_SECRET（或 LINE_SECRET，可留空：跳過驗簽）
-# - DEFAULT_PERIOD_SEC（預設 60）
-# - MAX_TASKS_PER_TICK（預設 25）
-# - USE_PLAYWRIGHT=1（可選，啟用備援解析）
-# ------------------------------------------------------------
+# app.py  — 支援 15 秒監看（Cloud Tasks 扇出 0/15/30/45），並顯示活動名稱/地點/日期/圖片
 import base64
 import hashlib
 import hmac
@@ -27,36 +16,48 @@ from bs4 import BeautifulSoup
 from flask import Flask, abort, jsonify, request
 from google.cloud import firestore
 
-# -------------------- 基本設定 --------------------
 app = Flask(__name__)
 logging.basicConfig(level=os.getenv("LOG_LEVEL", "INFO"))
 
-# Firestore（使用預設 Application Default Credentials）
+# ---------- 基礎設定 ----------
 db = firestore.Client()
+LINE_TOKEN = os.environ.get("LINE_CHANNEL_ACCESS_TOKEN") or os.environ.get("LINE_TOKEN")
+LINE_SECRET = os.environ.get("LINE_CHANNEL_SECRET") or os.environ.get("LINE_SECRET")
 
-LINE_TOKEN = (
-    os.environ.get("LINE_CHANNEL_ACCESS_TOKEN")
-    or os.environ.get("LINE_TOKEN")
-)
-LINE_SECRET = (
-    os.environ.get("LINE_CHANNEL_SECRET")
-    or os.environ.get("LINE_SECRET")
-)
-
-DEFAULT_PERIOD_SEC = int(os.environ.get("DEFAULT_PERIOD_SEC", "60"))  # Cloud Scheduler 最小 60 秒
+# 預設 60，最低限制我們會強制成 15 秒
+DEFAULT_PERIOD_SEC = int(os.environ.get("DEFAULT_PERIOD_SEC", "60"))
 MAX_TASKS_PER_TICK = int(os.environ.get("MAX_TASKS_PER_TICK", "25"))
+
+# Cloud Tasks 扇出（要 15 秒必備）
+PROJECT_ID = os.environ.get("GOOGLE_CLOUD_PROJECT")
+TASKS_QUEUE = os.environ.get("TASKS_QUEUE", "tick-queue")
+TASKS_LOCATION = os.environ.get("TASKS_LOCATION", "asia-east1")
+# 用來簽 OIDC token 呼叫 Cloud Run 的 SA（要有 roles/run.invoker）
+TASKS_SERVICE_ACCOUNT = os.environ.get("TASKS_SERVICE_ACCOUNT", "")
+# 你的 Cloud Run 服務根網址（不含路徑），例： https://ticketsearch-xxxx-asia-east1.run.app
+TASKS_TARGET_URL = os.environ.get("TASKS_TARGET_URL", "")
+# 是否啟用扇出（1=啟用；0=不啟用，直接每分鐘跑一次）
+TICK_FANOUT = os.environ.get("TICK_FANOUT", "1") == "1"
 
 UA = (
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
     "(KHTML, like Gecko) Chrome/126.0 Safari/537.36"
 )
 
-# 文字偵測規則
-_RE_QTY = re.compile(r"(剩餘|尚餘|尚有|可售|餘票|名額)[^\d]{0,5}(\d+)", re.I)
-_RE_SOLDOUT = re.compile(r"(售罄|完售|無票|已售完|暫無|暫時無|售完)", re.I)
+# 文字偵測規則（加入「空位」）
+_RE_QTY = re.compile(r"(空位|剩餘|尚餘|尚有|可售|餘票|名額)[^\d]{0,5}(\d+)", re.I)
+_RE_SOLDOUT = re.compile(r"(售罄|完售|無票|已售完|暫無|暫時無|售完|已售空)", re.I)
 
+HELP_TEXT = (
+    "我是票券監看機器人 👋\n"
+    "指令：\n"
+    "/start 或 /help － 顯示這個說明\n"
+    "/watch <URL> [秒] － 開始監看（最小 15 秒）\n"
+    "/unwatch <任務ID> － 停用任務\n"
+    "/list － 查看最近任務"
+)
 
-# -------------------- LINE 基本函式 --------------------
+# ---------- LINE ----------
 def _line_reply(reply_token: str, text: str) -> None:
     if not LINE_TOKEN or not reply_token:
         app.logger.warning("No LINE_TOKEN or reply_token; skip reply")
@@ -71,7 +72,7 @@ def _line_reply(reply_token: str, text: str) -> None:
         app.logger.exception(f"LINE reply failed: {e}")
 
 
-def _line_push(to: str, text: str) -> None:
+def _line_push_text(to: str, text: str) -> None:
     if not LINE_TOKEN or not to:
         app.logger.warning("No LINE_TOKEN or target; skip push")
         return
@@ -85,8 +86,29 @@ def _line_push(to: str, text: str) -> None:
         app.logger.exception(f"LINE push failed: {e}")
 
 
+def _line_push_rich(to: str, text: str, image_url: Optional[str] = None) -> None:
+    """有圖就先送圖片，再送文字"""
+    if not LINE_TOKEN or not to:
+        app.logger.warning("No LINE_TOKEN or target; skip push")
+        return
+    url = "https://api.line.me/v2/bot/message/push"
+    headers = {"Authorization": f"Bearer {LINE_TOKEN}", "Content-Type": "application/json"}
+    messages = []
+    if image_url:
+        messages.append({
+            "type": "image",
+            "originalContentUrl": image_url,
+            "previewImageUrl": image_url
+        })
+    messages.append({"type": "text", "text": text[:4000]})
+    try:
+        r = requests.post(url, headers=headers, json={"to": to, "messages": messages}, timeout=10)
+        r.raise_for_status()
+    except Exception as e:
+        app.logger.exception(f"LINE push (rich) failed: {e}")
+
+
 def _verify_line_signature(raw_body: bytes) -> bool:
-    """有設 LINE_SECRET 就驗簽；沒設就跳過（開發用）"""
     if not LINE_SECRET:
         return True
     sig = request.headers.get("X-Line-Signature", "")
@@ -94,8 +116,7 @@ def _verify_line_signature(raw_body: bytes) -> bool:
     expected = base64.b64encode(digest).decode("utf-8")
     return hmac.compare_digest(sig, expected)
 
-
-# -------------------- ibon 解析 --------------------
+# ---------- ibon 解析 ----------
 def _req_session() -> requests.Session:
     s = requests.Session()
     s.headers.update({
@@ -107,15 +128,10 @@ def _req_session() -> requests.Session:
 
 
 def resolve_ibon_orders_url(any_url: str) -> Optional[str]:
-    """
-    解析出真正的 orders.ibon 下單頁（UTK0201_xxx.aspx）連結。
-    1) 如果已經是 orders 內頁就直接回傳。
-    2) 如果是 ticket.ibon 活動頁，從頁面找「立即訂購」按鈕連結。
-    """
+    """回傳 orders.ibon 下單頁（UTK0201_xxx.aspx）"""
     u = urlparse(any_url)
     if "orders.ibon.com.tw" in u.netloc and "UTK0201" in u.path.upper():
         return any_url
-
     if "ticket.ibon.com.tw" in u.netloc:
         s = _req_session()
         r = s.get(any_url, timeout=15)
@@ -124,7 +140,6 @@ def resolve_ibon_orders_url(any_url: str) -> Optional[str]:
         a = soup.select_one('a[href*="orders.ibon.com.tw"][href*="UTK02"][href*="UTK0201"]')
         if a and a.get("href"):
             return urljoin(any_url, a["href"])
-        # 備援：有些會放在 data-url 或 onclick
         for tag in soup.find_all(["a", "button"]):
             href = (tag.get("href") or tag.get("data-url") or "").strip()
             if "orders.ibon.com.tw" in href and "UTK0201" in href.upper():
@@ -132,200 +147,220 @@ def resolve_ibon_orders_url(any_url: str) -> Optional[str]:
     return None
 
 
+def _first_text(*cands: Optional[str]) -> str:
+    for c in cands:
+        if c and str(c).strip():
+            return str(c).strip()
+    return ""
+
+
+def _extract_activity_meta(soup: BeautifulSoup) -> Dict[str, str]:
+    """
+    嘗試從 UTK0201 頁面抓「活動名稱/地點/日期/圖片」。
+    1) 先找固定標籤文字（活動名稱/活動時間/活動地點）
+    2) 退回 og:meta 或頁面首張活動圖
+    """
+    def find_label(labels):
+        pat = re.compile("|".join(map(re.escape, labels)))
+        for node in soup.find_all(text=pat):
+            tag = node.parent
+            # 表格：標籤在 th/td，值在同一列的下一個儲存格
+            if tag and tag.name in ("td", "th"):
+                cells = [c.get_text(" ", strip=True) for c in tag.parent.find_all(["td", "th"])]
+                for i, val in enumerate(cells):
+                    if re.search(pat, val) and i + 1 < len(cells):
+                        return cells[i + 1]
+            # 一般 <li>/<div>：同元素文字含標籤，去除標籤與冒號
+            text = tag.get_text(" ", strip=True) if tag else ""
+            if re.search(pat, text):
+                cleaned = pat.sub("", text).replace("：", "").strip()
+                if cleaned:
+                    return cleaned
+            # 嘗試找下一個有字的兄弟元素
+            sib = tag.find_next_sibling() if tag else None
+            if sib:
+                t = sib.get_text(" ", strip=True)
+                if t:
+                    return t
+        return ""
+
+    title = _first_text(
+        find_label(["活動名稱"]),
+        soup.select_one('meta[property="og:title"]') and soup.select_one('meta[property="og:title"]').get("content"),
+    )
+    dt = _first_text(
+        find_label(["活動時間", "活動日期"]),
+    )
+    venue = _first_text(
+        find_label(["活動地點", "地點"]),
+    )
+
+    # 圖片：先找 og:image，再找頁面上的活動圖
+    image = _first_text(
+        soup.select_one('meta[property="og:image"]') and soup.select_one('meta[property="og:image"]').get("content"),
+    )
+    if not image:
+        img = soup.find("img", src=re.compile(r"ActivityImage|azureedge|image/ActivityImage", re.I))
+        if img and img.get("src"):
+            image = urljoin("https://orders.ibon.com.tw/", img.get("src"))
+
+    return {"title": title, "datetime": dt, "venue": venue, "image_url": image}
+
+
 def parse_ibon_orders_static(html: str) -> Dict:
     """
-    從 UTK0201 頁面的 HTML 直接抓各區「剩餘xx」字樣。
-    回傳: {"sections": {"A區": 12, ...}, "total": 12, "soldout": bool}
+    解析各區可售張數；並回傳 soldout 提示。
     """
     soup = BeautifulSoup(html, "html.parser")
     sections: Dict[str, int] = {}
     total = 0
     soldout_hint = False
 
-    candidates = soup.select("section, div, li, tr, p, span")
-    for node in candidates:
-        txt = node.get_text(" ", strip=True)
-        if not txt:
+    # A) 解析有「空位/剩餘」欄位的表格
+    for table in soup.find_all("table"):
+        header_tr = None
+        for tr in table.find_all("tr", recursive=True):
+            if tr.find("th"):
+                heads = [c.get_text(" ", strip=True) for c in tr.find_all(["th", "td"])]
+                if any(h for h in heads if ("空位" in h or "剩餘" in h or "可售" in h)):
+                    header_tr = tr
+                    break
+        if not header_tr:
             continue
-        if _RE_SOLDOUT.search(txt):
-            soldout_hint = True
-        m = _RE_QTY.search(txt)
-        if m:
+
+        heads = [c.get_text(" ", strip=True) for c in header_tr.find_all(["th", "td"])]
+        try:
+            idx_qty = next(i for i, h in enumerate(heads) if ("空位" in h or "剩餘" in h or "可售" in h))
+        except StopIteration:
+            continue
+        try:
+            idx_area = next(i for i, h in enumerate(heads) if ("票區" in h or h == "區" or "座位區" in h))
+        except StopIteration:
+            idx_area = 1 if len(heads) > 1 else 0
+
+        tr = header_tr.find_next_sibling("tr")
+        while tr and tr.name == "tr":
+            tds = tr.find_all("td")
+            if len(tds) > max(idx_qty, idx_area):
+                area = tds[idx_area].get_text(" ", strip=True)
+                qty_text = tds[idx_qty].get_text(" ", strip=True)
+                if _RE_SOLDOUT.search(qty_text):
+                    soldout_hint = True
+                m = re.search(r"(\d+)", qty_text)
+                if m:
+                    qty = int(m.group(1))
+                    if qty > 0:
+                        area = re.sub(r"\s+", "", area) or "未命名區"
+                        sections[area] = sections.get(area, 0) + qty
+                        total += qty
+            tr = tr.find_next_sibling("tr")
+        if total > 0:
+            break
+
+    # B) 關鍵字掃描（含「空位」）
+    if total == 0:
+        candidates = soup.select("tr, li, div, p, span")
+        for node in candidates:
+            txt = node.get_text(" ", strip=True)
+            if not txt:
+                continue
+            if _RE_SOLDOUT.search(txt):
+                soldout_hint = True
+            m = _RE_QTY.search(txt)
+            if not m:
+                continue
             qty = int(m.group(2))
-            # 嘗試取區名（範例：A區、B看台、內野等）
-            raw = _RE_QTY.sub("", txt)
-            raw = re.sub(r"\s+", " ", raw)
-            name_match = re.findall(r"([\u4e00-\u9fa5A-Za-z0-9]{1,12}(區|看台|內野|外野|座|樓|層|排)?)", raw)
-            key = name_match[0][0] if name_match else "未命名區"
+            if qty <= 0:
+                continue
+
+            # 優先從同一列(tr)找區名
+            key = "未命名區"
+            tr = node if node.name == "tr" else node.find_parent("tr")
+            if tr:
+                cells = [c.get_text(" ", strip=True) for c in tr.find_all(["td", "th"])]
+                for c in cells:
+                    if re.search(r"(區|看台|內野|外野|座|樓|層)", c):
+                        key = re.sub(r"\s+", "", c)
+                        break
             sections[key] = sections.get(key, 0) + qty
             total += qty
 
-    if total == 0 and soldout_hint:
-        return {"sections": {}, "total": 0, "soldout": True}
-    return {"sections": sections, "total": total, "soldout": total == 0 and not sections}
+    return {"sections": sections, "total": total, "soldout": (total == 0 and soldout_hint), "soup": soup}
 
 
-def check_ibon(any_url: str) -> Tuple[bool, str, str]:
+def check_ibon(any_url: str) -> Tuple[bool, str, str, Dict[str, str]]:
     """
-    回傳: (ok, message, signature)
-     - ok: 是否成功解析
-     - message: 要推播的內容
-     - signature: 根據結果產生的 md5，用來判斷是否變化
+    回傳: (ok, message, signature, meta)
+    meta: {"title","venue","datetime","image_url"}
     """
     orders_url = resolve_ibon_orders_url(any_url)
     if not orders_url:
-        return False, "找不到 ibon 下單頁（UTK0201）。可能尚未開賣或按鈕未顯示。", "NA"
+        return False, "找不到 ibon 下單頁（UTK0201）。可能尚未開賣或按鈕未顯示。", "NA", {}
 
     s = _req_session()
     r = s.get(orders_url, timeout=15)
     r.raise_for_status()
 
-    info = parse_ibon_orders_static(r.text)
-    if info["total"] > 0:
-        parts = [f"{k}: {v} 張" for k, v in sorted(info["sections"].items(), key=lambda kv: (-kv[1], kv[0]))]
-        msg = "✅ 監看結果：目前可售\n" + "\n".join(parts) + f"\n合計：{info['total']} 張\n{orders_url}"
-        sig = hashlib.md5(("|" + "|".join(parts)).encode()).hexdigest()
-        return True, msg, sig
+    parsed = parse_ibon_orders_static(r.text)
+    meta = _extract_activity_meta(parsed["soup"])
+    title = meta.get("title") or "活動資訊"
+    venue = meta.get("venue")
+    dt = meta.get("datetime")
+    img = meta.get("image_url")
 
-    if info.get("soldout"):
-        msg = f"目前顯示完售/無票\n{orders_url}"
+    prefix_lines = [f"🎫 {title}"]
+    if venue:
+        prefix_lines.append(f"地點：{venue}")
+    if dt:
+        prefix_lines.append(f"日期：{dt}")
+    prefix = "\n".join(prefix_lines) + "\n\n"
+
+    if parsed["total"] > 0:
+        parts = [f"{k}: {v} 張" for k, v in sorted(parsed["sections"].items(), key=lambda kv: (-kv[1], kv[0]))]
+        msg = prefix + "✅ 監看結果：目前可售\n" + "\n".join(parts) + f"\n合計：{parsed['total']} 張\n{orders_url}"
+        sig = hashlib.md5(("|" + "|".join(parts)).encode()).hexdigest()
+        return True, msg, sig, {"image_url": img}
+
+    if parsed.get("soldout"):
+        msg = prefix + f"目前顯示完售/無票\n{orders_url}"
         sig = hashlib.md5("soldout".encode()).hexdigest()
-        return True, msg, sig
+        return True, msg, sig, {"image_url": img}
 
-    # 靜態抓不到 → 可選擇啟用 Playwright 備援
-    if os.getenv("USE_PLAYWRIGHT") == "1":
-        try:
-            ok, msg, sig = check_ibon_playwright(any_url)
-            return ok, msg, sig
-        except Exception as e:
-            app.logger.exception(f"Playwright 解析失敗: {e}")
+    return False, prefix + "暫時讀不到剩餘數（可能為動態載入）。\n" + orders_url, "NA", {"image_url": img}
 
-    return False, "暫時讀不到剩餘數（可能為動態載入）。", "NA"
-
-
-def check_ibon_playwright(any_url: str) -> Tuple[bool, str, str]:
-    """
-    備援：用 Playwright 攔截 JSON/XHR 來推估各區剩餘。
-    只有在設置 USE_PLAYWRIGHT=1 時才會被呼叫。
-    """
-    # 延遲匯入，避免未安裝 playwright 造成啟動失敗
-    from playwright.sync_api import sync_playwright  # type: ignore
-
-    orders_url = resolve_ibon_orders_url(any_url)
-    if not orders_url:
-        return False, "找不到 ibon 下單頁（UTK0201）。", "NA"
-
-    with sync_playwright() as p:
-        browser = p.chromium.launch(headless=True, args=["--no-sandbox"])
-        page = browser.new_page(user_agent=UA, locale="zh-TW")
-        bucket = []
-
-        def handle_response(resp):
-            try:
-                ctype = (resp.headers or {}).get("content-type", "")
-            except Exception:
-                ctype = ""
-            if "application/json" in ctype:
-                try:
-                    data = resp.json()
-                except Exception:
-                    return
-                txt = json.dumps(data, ensure_ascii=False)
-                if re.search(r"(Remain|Remaining|Available|可售|餘|剩)", txt):
-                    bucket.append(data)
-
-        page.on("response", handle_response)
-        page.goto(orders_url, wait_until="networkidle", timeout=30000)
-        page.wait_for_timeout(2000)
-        browser.close()
-
-    if not bucket:
-        return False, "動態載入也未取得剩餘 JSON。", "NA"
-
-    sections: Dict[str, int] = {}
-    total = 0
-
-    def walk(node):
-        nonlocal total
-        if isinstance(node, dict):
-            name = (node.get("AreaName") or node.get("Section")
-                    or node.get("Zone") or node.get("Name"))
-            qty = (node.get("Remain") or node.get("Remaining")
-                   or node.get("Available") or node.get("Qty"))
-            if name and isinstance(qty, (int, float)):
-                sections[str(name)] = sections.get(str(name), 0) + int(qty)
-                total += int(qty)
-            for v in node.values():
-                walk(v)
-        elif isinstance(node, list):
-            for v in node:
-                walk(v)
-
-    for item in bucket:
-        walk(item)
-
-    if total > 0:
-        parts = [f"{k}: {v} 張" for k, v in sorted(sections.items(), key=lambda kv: (-kv[1], kv[0]))]
-        msg = "✅ 監看結果：目前可售\n" + "\n".join(parts) + f"\n合計：{total} 張\n{orders_url}"
-        sig = hashlib.md5(("|" + "|".join(parts)).encode()).hexdigest()
-        return True, msg, sig
-    else:
-        return True, f"目前顯示完售/無票\n{orders_url}", hashlib.md5("soldout".encode()).hexdigest()
-
-
-# -------------------- LINE Webhook --------------------
+# ---------- Webhook ----------
 @app.post("/webhook")
 def webhook():
     raw = request.get_data()
     if not _verify_line_signature(raw):
-        # 如果這邊被擋，LINE 端會收不到任何訊息
         app.logger.error("Invalid LINE signature")
         return "bad signature", 400
 
     body = request.get_json(silent=True) or {}
     events = body.get("events", [])
-    HELP = (
-        "我是票券監看機器人 👋\n"
-        "指令：\n"
-        "/start 或 /help － 顯示這個說明\n"
-        "/watch <URL> [秒] － 開始監看（最小 60 秒）\n"
-        "/unwatch <任務ID> － 停用任務\n"
-        "/list － 查看最近任務"
-    )
 
     for ev in events:
         etype = ev.get("type")
 
-        # 使用者把你加入好友時，LINE 會送 follow 事件
-        if etype == "follow":
-            reply_token = ev.get("replyToken")
-            _line_reply(reply_token, HELP)
+        if etype in ("follow", "join"):
+            _line_reply(ev.get("replyToken"), HELP_TEXT)
             continue
 
-        # 被加入群組／聊天室
-        if etype == "join":
-            reply_token = ev.get("replyToken")
-            _line_reply(reply_token, "大家好！輸入 /start 看指令。")
-            continue
-
-        # 只處理文字訊息
         if etype != "message":
             continue
+
         msg = ev.get("message", {})
         if msg.get("type") != "text":
             continue
 
         text = (msg.get("text") or "").strip()
         reply_token = ev.get("replyToken")
-        source = ev.get("source", {})  # 可能有 userId / groupId / roomId
+        src = ev.get("source", {})
 
-        # ----- 新增：/start /help -----
-        if text.lower() in ("/start", "start", "/help", "help", "？", "help me"):
-            _line_reply(reply_token, HELP)
+        if text.lower() in ("/start", "start", "/help", "help", "？"):
+            _line_reply(reply_token, HELP_TEXT)
             continue
-        # ----- 以上為新增 -----
 
-        # 原有指令：/watch
         if text.lower().startswith("/watch"):
             parts = text.split()
             if len(parts) < 2:
@@ -336,14 +371,13 @@ def webhook():
             if len(parts) >= 3:
                 try:
                     p = int(parts[2])
-                    period = max(60, min(3600, p))  # 60~3600s
+                    period = max(15, min(3600, p))  # ★ 最小 15 秒
                 except Exception:
                     pass
 
-            target_type = "user" if source.get("userId") else ("group" if source.get("groupId") else "room")
-            target_id = source.get("userId") or source.get("groupId") or source.get("roomId")
+            target_id = src.get("userId") or src.get("groupId") or src.get("roomId")
+            target_type = "user" if src.get("userId") else ("group" if src.get("groupId") else "room")
 
-            import secrets, time
             task_id = secrets.token_urlsafe(4)
             now = int(time.time())
             db.collection("watches").document(task_id).set({
@@ -362,7 +396,6 @@ def webhook():
             )
             continue
 
-        # 原有指令：/unwatch
         if text.lower().startswith("/unwatch"):
             parts = text.split()
             if len(parts) < 2:
@@ -377,13 +410,11 @@ def webhook():
                 _line_reply(reply_token, f"找不到任務 {tid}")
             continue
 
-        # 原有指令：/list
         if text.lower().startswith("/list"):
-            target_id = source.get("userId") or source.get("groupId") or source.get("roomId")
-            from google.cloud import firestore as _fs
+            target_id = src.get("userId") or src.get("groupId") or src.get("roomId")
             q = (db.collection("watches")
                  .where("targetId", "==", target_id)
-                 .order_by("createdAt", direction=_fs.Query.DESCENDING)
+                 .order_by("createdAt", direction=firestore.Query.DESCENDING)
                  .limit(10))
             docs = list(q.stream())
             if not docs:
@@ -397,14 +428,54 @@ def webhook():
                 _line_reply(reply_token, "你的任務：\n" + "\n\n".join(lines))
             continue
 
-        # 其它訊息 → 回說明
-        _line_reply(reply_token, HELP)
+        _line_reply(reply_token, HELP_TEXT)
 
     return "OK"
 
-# -------------------- Cloud Scheduler 入口（熱修版：永遠回 200） --------------------
-@app.get("/cron/tick")
-def cron_tick():
+# ---------- 15 秒扇出：Cloud Tasks ----------
+def enqueue_tick_runs(delays=(0, 15, 30, 45)) -> int:
+    """建立 Cloud Tasks 在 0/15/30/45 秒呼叫 /cron/tick?mode=run"""
+    try:
+        from google.cloud import tasks_v2
+        from google.protobuf import timestamp_pb2
+    except Exception as e:
+        app.logger.warning(f"[fanout] cloud-tasks lib missing, run once. {e}")
+        return 0
+
+    if not (PROJECT_ID and TASKS_QUEUE and TASKS_LOCATION and TASKS_SERVICE_ACCOUNT and TASKS_TARGET_URL):
+        app.logger.warning("[fanout] env incomplete; run once instead.")
+        return 0
+
+    client = tasks_v2.CloudTasksClient()
+    parent = client.queue_path(PROJECT_ID, TASKS_LOCATION, TASKS_QUEUE)
+    created = 0
+
+    for d in delays:
+        ts = timestamp_pb2.Timestamp()
+        ts.FromSeconds(int(time.time()) + int(d))
+        task = {
+            "http_request": {
+                "http_method": tasks_v2.HttpMethod.GET,
+                "url": f"{TASKS_TARGET_URL}/cron/tick?mode=run",
+                "headers": {"User-Agent": "Cloud-Tasks", "X-From-Tasks": "1"},
+                "oidc_token": {
+                    "service_account_email": TASKS_SERVICE_ACCOUNT,
+                    "audience": TASKS_TARGET_URL
+                },
+            },
+            "schedule_time": ts
+        }
+        try:
+            client.create_task(request={"parent": parent, "task": task})
+            created += 1
+        except Exception as e:
+            app.logger.exception(f"[fanout] create_task failed (delay={d}): {e}")
+
+    return created
+
+
+def do_tick():
+    """真正執行一次檢查（原本 /cron/tick 的邏輯）"""
     now = int(time.time())
     q = (db.collection("watches")
          .where("active", "==", True)
@@ -420,27 +491,41 @@ def cron_tick():
     for d in docs:
         task = d.to_dict()
         try:
-            ok, msg, sig = check_ibon(task["url"])
+            ok, msg, sig, meta = check_ibon(task["url"])
             if ok and sig != task.get("lastSig"):
-                _line_push(task["targetId"], msg)
+                _line_push_rich(task["targetId"], msg, (meta or {}).get("image_url"))
                 d.reference.update({"lastSig": sig})
         except Exception as e:
             app.logger.exception(f"[tick] task {d.id} failed: {e}")
             errors.append(f"{d.id}:{type(e).__name__}")
         finally:
             period = int(task.get("periodSec", DEFAULT_PERIOD_SEC))
-            d.reference.update({"nextCheckAt": now + max(60, period)})
+            d.reference.update({"nextCheckAt": now + max(15, period)})  # ★ 最小 15 秒
             processed += 1
 
     return jsonify({"ok": True, "processed": processed, "due": len(docs), "errors": errors, "ts": now}), 200
 
 
-# 健康檢查
+@app.get("/cron/tick")
+def cron_tick():
+    # mode=run：被 Cloud Tasks 呼叫 → 直接執行
+    if request.args.get("mode") == "run" or request.headers.get("X-From-Tasks") == "1":
+        return do_tick()
+
+    # Scheduler 進來（每分鐘一次）
+    if TICK_FANOUT:
+        n = enqueue_tick_runs((0, 15, 30, 45))
+        if n > 0:
+            return jsonify({"ok": True, "fanout": n}), 200
+
+    # 後備：若沒成功扇出，就執行一次
+    return do_tick()
+
+
 @app.get("/healthz")
 def healthz():
     return "ok", 200
 
 
-# 本地啟動
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=int(os.getenv("PORT", "8080")))
