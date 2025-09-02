@@ -286,26 +286,57 @@ def parse_ibon_orders_static(html: str) -> Dict:
 
 # -------------------- live.map 解析 & 後備 --------------------
 def _parse_livemap_text(txt: str) -> Tuple[Dict[str, int], int]:
+    """
+    解析 azureedge live.map：
+    - 不信任 rel（常見格式為 s17/s0，非張數）
+    - 以 <area ... title="..."> 內「最後一個 <1000 的數字」當作剩餘張數（避開 5800/4800/3800/3200 價格）
+    - 票區名稱優先從 title 抓不到就退而求其次取 href 內的第三個參數（區域代碼）
+    """
     sections: Dict[str, int] = {}
     total = 0
+
     for tag in _RE_AREA_TAG.findall(txt):
-        title = ""
-        mt = _RE_AREA_QTY_IN_TITLE.search(tag)
-        if mt: title = mt.group(1)
-        q = None
-        mq = re.search(r"(空位|剩餘|可售)[^\d]{0,6}(\d+)", title)
-        if mq:
-            q = int(mq.group(2))
+        # 1) 票區名稱
+        name = "未命名區"
+        # 從 title 近鄰猜名稱（即使有亂碼，仍可抓到像 "3樓A6區"、"2M" 等片段）
+        m_title = re.search(r'title="([^"]*)"', tag, re.I)
+        title_text = m_title.group(1) if m_title else ""
+        guess = _guess_area_from_text(title_text)
+        if guess and guess != "未命名區":
+            name = guess
         else:
-            mr = re.search(r'\brel=["\'](\d+)["\']', tag, re.I)
-            if mr:
-                q = int(mr.group(1))
-        if not q or q <= 0:
+            # 讀 href 裡的區域代碼當名稱備援：javascript:Send('0205','<PERF>','<AREA_CODE>','<seq>')
+            m_href = re.search(
+                r"javascript:Send\([^)]*'([A-Za-z0-9]+)'\s*,\s*'([A-Za-z0-9]+)'\s*,\s*'(\d+)'",
+                tag, re.I)
+            if m_href:
+                area_code = m_href.group(2)
+                name = area_code  # 直接用代碼，至少可辨識
+        key = re.sub(r"\s+", "", name) or "未命名區"
+
+        # 2) 張數（從 title 內所有數字挑「最後一個且 <1000」）
+        qty = None
+        nums = [int(n) for n in re.findall(r"(\d+)", title_text)]
+        for n in reversed(nums):
+            if n < 1000:  # 避開 5800/4800/3800/3200 價格
+                qty = n
+                break
+
+        # 3) 如果 title 沒有明確數字，再試常見 data-* 或 alt/aria
+        if qty is None:
+            m = re.search(r'\bdata-(?:left|remain|qty|count)=["\']?(\d+)["\']?', tag, re.I)
+            if m: qty = int(m.group(1))
+        if qty is None:
+            m = re.search(r'\b(?:alt|aria-label)=["\'][^"\']*?(\d+)[^"\']*["\']', tag, re.I)
+            if m: qty = int(m.group(1))
+
+        # 4) 小於等於 0 一律略過（代表無票或非數量欄位）
+        if not qty or qty <= 0:
             continue
-        name = _guess_area_from_text(title) or "未命名區"
-        key = re.sub(r"\s+", "", name)
-        sections[key] = sections.get(key, 0) + q
-        total += q
+
+        sections[key] = sections.get(key, 0) + qty
+        total += qty
+
     return sections, total
 
 def parse_livemap_counts_from_html_or_fetch(base_page_html: str, base_url: str, sess: requests.Session) -> Tuple[Dict[str, int], int]:
