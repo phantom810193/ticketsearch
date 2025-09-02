@@ -537,52 +537,76 @@ def on_message(ev: MessageEvent):
 
 @app.route("/cron/tick", methods=["GET"])
 def cron_tick():
-    if not FS_OK:
-        return jsonify({"ok": False, "msg": "No Firestore"}), 200
+    # 統一保證 2xx 回應，避免 Scheduler 收到 5xx
+    resp = {"ok": True, "processed": 0, "errors": []}
+    try:
+        if not FS_OK:
+            resp["ok"] = False
+            resp["errors"].append("No Firestore client")
+            return jsonify(resp), 200
 
-    now = datetime.now(timezone.utc)
-    # 取全部啟用中的任務
-    docs = fs_client.collection(COL).where("enabled", "==", True).stream()
-    processed = 0
-    for d in docs:
-        r = d.to_dict()
-        period = int(r.get("period", DEFAULT_PERIOD_SEC))
-        last = r.get("updated_at") or now - timedelta(seconds=period + 1)
-        next_run_at = r.get("next_run_at") or (now - timedelta(seconds=1))
-        if now < next_run_at:
-            continue
-
-        url = r.get("url")
-        res = {}
+        now = datetime.now(timezone.utc)
+        # 讀取任務清單也加 try/except，避免任何 SDK 例外冒出去
         try:
-            res = probe(url)
+            docs = list(fs_client.collection(COL)
+                        .where("enabled", "==", True).stream())
         except Exception as e:
-            app.logger.warning(f"[tick] probe error: {e}")
-            res = {"ok": False, "msg": f"讀取失敗：{e}", "image": LOGO, "url": url, "sig": "NA"}
+            app.logger.error(f"[tick] list watchers failed: {e}")
+            resp["ok"] = False
+            resp["errors"].append(f"list failed: {e}")
+            return jsonify(resp), 200
 
-        sig = res.get("sig", "NA")
-        changed = (sig != r.get("last_sig", ""))
-        should_notify = ALWAYS_NOTIFY or changed
+        for d in docs:
+            r = d.to_dict()
+            period = int(r.get("period", DEFAULT_PERIOD_SEC))
+            next_run_at = r.get("next_run_at") or (now - timedelta(seconds=1))
+            if now < next_run_at:
+                continue
 
-        # 更新紀錄
-        fs_client.collection(COL).document(d.id).update({
-            "last_sig": sig,
-            "last_total": res.get("total", 0),
-            "last_ok": bool(res.get("ok", False)),
-            "updated_at": now,
-            "next_run_at": now + timedelta(seconds=period),
-        })
+            url = r.get("url")
+            try:
+                res = probe(url)
+            except Exception as e:
+                app.logger.error(f"[tick] probe error for {url}: {e}")
+                res = {"ok": False, "msg": f"probe error: {e}", "sig": "NA", "url": url}
 
-        if should_notify:
-            text = fmt_result_text(res)
-            chat_id = r.get("chat_id")
-            img = res.get("image", LOGO)
-            if img and img != LOGO:
-                send_image(chat_id, img)
-            send_text(chat_id, text)
-        processed += 1
+            # 更新紀錄也包 try/except
+            try:
+                fs_client.collection(COL).document(d.id).update({
+                    "last_sig": res.get("sig", "NA"),
+                    "last_total": res.get("total", 0),
+                    "last_ok": bool(res.get("ok", False)),
+                    "updated_at": now,
+                    "next_run_at": now + timedelta(seconds=int(r.get("period", DEFAULT_PERIOD_SEC))),
+                })
+            except Exception as e:
+                app.logger.error(f"[tick] update doc error: {e}")
+                resp["errors"].append(f"update error: {e}")
 
-    return jsonify({"ok": True, "processed": processed}), 200
+            # 是否推播
+            changed = (res.get("sig", "NA") != r.get("last_sig", ""))
+            if ALWAYS_NOTIFY or changed:
+                try:
+                    text = fmt_result_text(res)
+                    img = res.get("image", "")
+                    chat_id = r.get("chat_id")
+                    if img and img != "https://ticketimg2.azureedge.net/logo.png":
+                        send_image(chat_id, img)
+                    send_text(chat_id, text)
+                except Exception as e:
+                    app.logger.error(f"[tick] notify error: {e}")
+                    resp["errors"].append(f"notify error: {e}")
+
+            resp["processed"] += 1
+
+        return jsonify(resp), 200
+
+    except Exception as e:
+        # 最外層保險絲
+        app.logger.error(f"[tick] fatal: {e}\n{traceback.format_exc()}")
+        resp["ok"] = False
+        resp["errors"].append(str(e))
+        return jsonify(resp), 200
 
 @app.route("/diag", methods=["GET"])
 def diag():
