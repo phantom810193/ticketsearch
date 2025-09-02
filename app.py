@@ -56,7 +56,8 @@ _RE_AREANAME_NEAR = re.compile(
 )
 _RE_ACTIVITY_IMG = re.compile(r"https?://[^\"'<>]*azureedge\.net/[^\"'<>]*ActivityImage[^\"'<>]*\.(?:jpg|jpeg|png)", re.I)
 _RE_ACTIVITY_INFO = re.compile(r"(https?://ticket\.ibon\.com\.tw)?/?ActivityInfo/Details/\d+", re.I)
-_RE_SUSPECT_API = re.compile(r"https?://[^\"'<>]+/(?:api|API|Application)/[^\"'<>]+", re.I)
+# 也把 azureedge 的 live.map 視為「疑似 API」，方便 /probe 列出
+_RE_SUSPECT_API = re.compile(r"https?://[^\"'<>]+/(?:api|API|Application|QWARE_TICKET)/[^\"'<>]+", re.I)
 
 _DATE_PAT = re.compile(
     r"(\d{4}[./-年]\s*\d{1,2}[./-月]\s*\d{1,2}(?:\s*[（(]?[一二三四五六日天週周MonTueWedThuFriSatSun星期]{1,3}[)）]?)?(?:\s*\d{1,2}:\d{2})?"
@@ -67,7 +68,7 @@ _DATE_PAT = re.compile(
     r")"
 )
 
-# live.map
+# live.map（大小寫不敏感）
 _RE_LIVEMAP_URL = re.compile(
     r"https?://[^\"'>]+/QWARE_TICKET/images/Temp/[A-Za-z0-9]+/\d+_[A-Za-z0-9]+_live\.map[^\"'>]*",
     re.I
@@ -333,23 +334,27 @@ def _extract_performance_id_from_any(html: str, url: str) -> str:
     return ""
 
 def try_fetch_livemap_by_perf(perf_id: str, sess: requests.Session) -> Tuple[Dict[str, int], int]:
-    """000/001 頁抓不到 live.map 時，依 PERF_ID 主動猜連結（1_/2_/3_）"""
+    """
+    000/001 頁抓不到 live.map 時，依 PERF_ID 主動猜連結。
+    - 嘗試 pid 的原樣/大寫/小寫
+    - 嘗試 0_ / 1_ / 2_ / 3_ 前綴
+    - 每次嘗試會寫 log，命中會有 [livemap] guessed and hit
+    """
     if not perf_id:
         return {}, 0
-    base = f"https://qwareticket-asysimg.azureedge.net/QWARE_TICKET/images/Temp/{perf_id}"
-    candidates = [
-        f"{base}/1_{perf_id}_live.map",
-        f"{base}/2_{perf_id}_live.map",
-        f"{base}/3_{perf_id}_live.map",
-    ]
-    for u in candidates:
-        try:
-            r = sess.get(u, timeout=12)
-            if r.status_code == 200 and "<area" in r.text:
-                app.logger.info(f"[livemap] guessed and hit: {u}")
-                return _parse_livemap_text(r.text)
-        except Exception as e:
-            app.logger.warning(f"[livemap] guess fail {u}: {e}")
+    pids = {perf_id, perf_id.upper(), perf_id.lower()}
+    prefixes = ["1", "2", "3", "0"]  # 常見的幾種
+    for pid in pids:
+        for pref in prefixes:
+            u = f"https://qwareticket-asysimg.azureedge.net/QWARE_TICKET/images/Temp/{pid}/{pref}_{pid}_live.map"
+            try:
+                app.logger.info(f"[livemap] try {u}")
+                r = sess.get(u, timeout=12)
+                if r.status_code == 200 and "<area" in r.text:
+                    app.logger.info(f"[livemap] guessed and hit: {u}")
+                    return _parse_livemap_text(r.text)
+            except Exception as e:
+                app.logger.warning(f"[livemap] guess fail {u}: {e}")
     return {}, 0
 
 # -------------------- 主視覺圖 --------------------
@@ -523,7 +528,7 @@ def check_ibon(any_url: str) -> Tuple[bool, str, str, Dict[str, str]]:
     # 先試：從 000/001 HTML 直接找 live.map
     secL, totL = parse_livemap_counts_from_html_or_fetch(r.text, orders_url, s)
     if totL == 0:
-        # 還是沒有 → 由 PERFORMANCE_ID 主動猜 live.map
+        # 還是沒有 → 由 PERFORMANCE_ID 主動猜 live.map（加強版）
         perf_id = _extract_performance_id_from_any(r.text, orders_url)
         secG, totG = try_fetch_livemap_by_perf(perf_id, s)
         if totG > 0:
