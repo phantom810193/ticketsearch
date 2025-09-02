@@ -23,6 +23,8 @@ app = Flask(__name__)
 logging.basicConfig(level=os.getenv("LOG_LEVEL", "INFO"))
 
 # ---------- 基礎設定 ----------
+ALWAYS_NOTIFY = os.getenv("ALWAYS_NOTIFY", "0") == "1"   # 1=每次排程都推播（有讀到數字/售完時）
+
 db = firestore.Client()
 LINE_TOKEN = os.environ.get("LINE_CHANNEL_ACCESS_TOKEN") or os.environ.get("LINE_TOKEN")
 LINE_SECRET = os.environ.get("LINE_CHANNEL_SECRET") or os.environ.get("LINE_SECRET")
@@ -249,14 +251,28 @@ def _extract_ids_from_url(url: str) -> Dict[str, str]:
     q = dict((k.upper(), v) for k, v in parse_qsl(urlparse(url).query, keep_blank_values=True))
     return {"PERFORMANCE_ID": q.get("PERFORMANCE_ID",""), "PRODUCT_ID": q.get("PRODUCT_ID",""), "STRITEM": q.get("STRITEM","")}
 
+def _build_001_base_url(base: str, perf_id: str, prod_id: str, stritem: str = "") -> str:
+    p = urlparse(base)
+    path = "/application/UTK02/UTK0201_001.aspx"
+    q = f"PERFORMANCE_ID={quote(perf_id)}&PRODUCT_ID={quote(prod_id)}"
+    if stritem:
+        q += f"&strItem={quote(stritem)}"
+    return f"{p.scheme}://{p.netloc}{path}?{q}"
+
 def _collect_area_ids_from_html(html: str) -> Set[str]:
     ids: Set[str] = set()
-    for m in re.finditer(r"PERFORMANCE_PRICE_AREA_ID=([A-Za-z0-9]+)", html):
+    # 任何大小寫變形
+    for m in re.finditer(r"PERFORMANCE_PRICE_AREA_ID\s*=\s*([A-Za-z0-9]+)", html, re.I):
         ids.add(m.group(1))
+    # onclick / form 片段
     for m in re.finditer(r"(UTK0201_001\.aspx[^\"'>)]+)", html):
         frag = m.group(1)
-        mm = re.search(r"PERFORMANCE_PRICE_AREA_ID=([A-Za-z0-9]+)", frag)
-        if mm: ids.add(mm.group(1))
+        mm = re.search(r"PERFORMANCE_PRICE_AREA_ID=([A-Za-z0-9]+)", frag, re.I)
+        if mm:
+            ids.add(mm.group(1))
+    # data-* 標記
+    for m in re.finditer(r"data-?areaid\s*=\s*['\"]?([A-Za-z0-9]+)['\"]?", html, re.I):
+        ids.add(m.group(1))
     return ids
 
 def _build_001_url(base: str, perf_id: str, prod_id: str, area_id: str, stritem: str = "") -> str:
@@ -276,21 +292,31 @@ def _extract_area_name_001(soup: BeautifulSoup, fallback: str) -> str:
     return fallback or "票區"
 
 def deep_parse_areas(orders_url: str, soup_000: BeautifulSoup, html_000: str, limit: int = 20) -> Tuple[Dict[str, int], int, bool]:
+    # 先從 000 抓 area id
     ids = _collect_area_ids_from_html(html_000)
+    info = _extract_ids_from_url(orders_url)
+    perf, prod, stritem = info["PERFORMANCE_ID"], info["PRODUCT_ID"], info["STRITEM"]
+    s = _req_session()
+    s.headers.update({"Referer": orders_url})
+
+    # 如果 000 沒抓到 id，先去 001 base 掃一次
     if not ids:
-        for a in soup_000.find_all("a", href=True):
-            if "UTK0201_001.aspx" in a["href"]:
-                mm = re.search(r"PERFORMANCE_PRICE_AREA_ID=([A-Za-z0-9]+)", a["href"])
-                if mm: ids.add(mm.group(1))
+        url_001_base = _build_001_base_url(orders_url, perf, prod, stritem)
+        try:
+            r0 = s.get(url_001_base, timeout=15); r0.raise_for_status()
+            # 先看 base 頁是否就有數字
+            parsed0 = parse_ibon_orders_static(r0.text)
+            if parsed0["total"] > 0:
+                return parsed0["sections"], parsed0["total"], parsed0["soldout"]
+            # 沒有就從 base 抓 area id
+            ids = _collect_area_ids_from_html(r0.text)
+        except Exception as e:
+            app.logger.warning(f"[deep] fetch 001 base fail: {e}")
+
     if not ids:
         return {}, 0, False
 
     ids = set(list(ids)[:limit])
-    info = _extract_ids_from_url(orders_url)
-    perf, prod, stritem = info["PERFORMANCE_ID"], info["PRODUCT_ID"], info["STRITEM"]
-
-    s = _req_session()
-    s.headers.update({"Referer": orders_url})
 
     sections: Dict[str, int] = {}
     total = 0
@@ -308,14 +334,18 @@ def deep_parse_areas(orders_url: str, soup_000: BeautifulSoup, html_000: str, li
         _strip_scripts(soup)
         text = soup.get_text(" ", strip=True)
 
-        if _RE_SOLDOUT.search(text): soldout_hint = True
+        if _RE_SOLDOUT.search(text):
+            soldout_hint = True
 
+        # 票區名稱
         area = _extract_area_name_001(soup, fallback=f"區-{area_id[-4:]}")
+
+        # 數量：關鍵字 + 近鄰 (\d+)張
         qsum = 0
         for m in _RE_QTY.finditer(text):
             try:
                 qsum += int(m.group(2))
-            except:
+            except:  # pragma: no cover
                 pass
         if qsum == 0:
             for m in re.finditer(r"(\d+)\s*張", text):
@@ -331,25 +361,59 @@ def deep_parse_areas(orders_url: str, soup_000: BeautifulSoup, html_000: str, li
     return sections, total, soldout_hint
 
 # ---------- 活動主視覺圖：多階段解析 ----------
+# 取圖：先 og:image / <img>，再 regex，最後跳到 ActivityInfo 頁面抓
+_RE_ACTIVITY_IMG = re.compile(r"https?://[^\"'<>]*azureedge\.net/[^\"'<>]*ActivityImage[^\"'<>]*\.(?:jpg|jpeg|png)", re.I)
+_RE_ACTIVITY_INFO = re.compile(r"(https?://ticket\.ibon\.com\.tw)?/?ActivityInfo/Details/(\d+)", re.I)
+
 def _find_image_in_soup(base_url: str, soup: BeautifulSoup) -> str:
-    # 1) og:image
-    og = soup.select_one('meta[property="og:image"]')
-    if og and og.get("content"):
-        return urljoin(base_url, og["content"])
-
-    # 2) <img src / data-src> 含 ActivityImage 或 azureedge
+    # og:image
+    for prop in ("og:image", "og:image:url", "twitter:image"):
+        og = soup.select_one(f'meta[property="{prop}"], meta[name="{prop}"]')
+        if og and og.get("content"):
+            return urljoin(base_url, og["content"])
+    # <img src / data-src / srcset>
     for img in soup.find_all("img"):
-        src = img.get("src") or img.get("data-src") or ""
-        if not src: continue
-        if "ActivityImage" in src or "azureedge" in src:
-            return urljoin(base_url, src)
-
-    # 3) 其他連結（例如 CSS 背景寫在 style）
-    style_imgs = re.findall(r'url\(([^)]+)\)', soup.decode())
-    for u in style_imgs:
+        cand = img.get("src") or img.get("data-src") or ""
+        if not cand and img.get("srcset"):
+            cand = img["srcset"].split(",")[0].split()[0]
+        if not cand: 
+            continue
+        if "ActivityImage" in cand or "azureedge" in cand:
+            return urljoin(base_url, cand)
+    # 可能寫在 style 裡
+    for u in re.findall(r'url\(([^)]+)\)', soup.decode()):
         u = u.strip('\'"')
         if "ActivityImage" in u or "azureedge" in u:
             return urljoin(base_url, u)
+    return ""
+
+def _resolve_activity_image(orders_url: str, html_000: str, soup_000: BeautifulSoup, sess: requests.Session) -> str:
+    # A) 先在 000 頁找
+    img = _find_image_in_soup(orders_url, soup_000)
+    if img:
+        return img
+    m = _RE_ACTIVITY_IMG.search(html_000)
+    if m:
+        return m.group(0)
+
+    # B) 從整份 HTML（不只 <a>）抓活動頁連結 ActivityInfo/Details/XXXX
+    m2 = _RE_ACTIVITY_INFO.search(html_000)
+    if m2:
+        details_url = m2.group(0)
+        if not details_url.startswith("http"):
+            details_url = urljoin(orders_url, details_url)
+        try:
+            r2 = sess.get(details_url, timeout=15); r2.raise_for_status()
+            soup2 = BeautifulSoup(r2.text, "html.parser")
+            _strip_scripts(soup2)
+            img2 = _find_image_in_soup(details_url, soup2)
+            if img2:
+                return img2
+            m3 = _RE_ACTIVITY_IMG.search(r2.text)
+            if m3:
+                return m3.group(0)
+        except Exception as e:
+            app.logger.warning(f"[image] details fetch fail: {details_url} {e}")
 
     return ""
 
@@ -395,12 +459,19 @@ def check_ibon(any_url: str) -> Tuple[bool, str, str, Dict[str, str]]:
     venue = meta.get("venue")
     dt = meta.get("datetime")
 
-    # ★ 新增：主視覺圖解析（000 → 活動頁 → HTML regex）
+    # （如果你有做主視覺圖解析，這行保留）
     img = _resolve_activity_image(orders_url, r.text, parsed["soup"], s)
 
+    # ★★★ 這裡就是要加／保留的地方 ★★★
     # 000 沒數字 → 解析 001 票區
     if parsed["total"] == 0:
-        sec2, tot2, sold2 = deep_parse_areas(orders_url, parsed["soup"], r.text, limit=20)
+        # 第三個參數要帶 000 頁原始 HTML：r.text
+        sec2, tot2, sold2 = deep_parse_areas(
+            orders_url,
+            parsed["soup"],  # 000 頁的 BeautifulSoup
+            r.text,          # ← 000 頁的原始 HTML（這行就是你問的那一行）
+            limit=20,
+        )
         if tot2 > 0:
             parsed["sections"], parsed["total"], parsed["soldout"] = sec2, tot2, False
         else:
@@ -686,9 +757,12 @@ def do_tick():
         task = d.to_dict()
         try:
             ok, msg, sig, meta = check_ibon(task["url"])
-            if ok and sig != task.get("lastSig"):
-                _line_push_rich(task["targetId"], msg, (meta or {}).get("image_url"))
-                d.reference.update({"lastSig": sig})
+            if ok:
+                should_push = (ALWAYS_NOTIFY or sig != task.get("lastSig"))
+                if should_push:
+                    _line_push_rich(task["targetId"], msg, (meta or {}).get("image_url"))
+                    d.reference.update({"lastSig": sig})
+
         except Exception as e:
             app.logger.exception(f"[tick] task {d.id} failed: {e}")
             errors.append(f"{d.id}:{type(e).__name__}")
