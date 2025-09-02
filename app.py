@@ -1,22 +1,8 @@
 # app.py — ibon 票券監看（Cloud Run + LINE Bot + Firestore）
-# 功能：
-# - /check <URL>：手動查詢，支援 UTK0201_000/001 與 live.map 直連
-# - /watch <URL> [秒]：建立監看（同網址不重複；帶新秒數會更新；最小 15s）
-# - /unwatch <任務ID>：停用任務
-# - /list（/list all /list off）：列出啟用/全部/停用任務
-# - /checkid <任務ID>：立即查該任務的 URL
-# - /probe <URL>：掃頁面內疑似 XHR/Fetch API 端點（給你在 DevTools 快速定位）
-# - /cron/tick：被 Cloud Scheduler 叫醒時執行；依變更或 ALWAYS_NOTIFY 推播
-# - /diag?url=...：伺服器端自測
-#
-# 需要的環境變數：
-# - LINE_CHANNEL_ACCESS_TOKEN（或 LINE_TOKEN）
-# - LINE_CHANNEL_SECRET（或 LINE_SECRET）
-# - GOOGLE_CLOUD_PROJECT（Cloud Run 預設會有）
-# - DEFAULT_PERIOD_SEC（選填，預設 60；最小 15）
-# - ALWAYS_NOTIFY=1（每次 tick 都推播；預設 0 只在變動時推）
-#
-# 依賴：Flask、requests、beautifulsoup4、google-cloud-firestore
+# 解析順序：live.map → 由 PERFORMANCE_ID 推導 live.map → 001 逐區 → 靜態表格/就近字串
+# 指令：
+# /check <URL>、/watch <URL> [秒]、/unwatch <ID>、/list（/list all /list off）
+# /checkid <ID>、/probe <URL>、/cron/tick、/diag?url=...、/healthz
 
 import base64
 import hashlib
@@ -38,7 +24,7 @@ from google.cloud import firestore
 app = Flask(__name__)
 logging.basicConfig(level=os.getenv("LOG_LEVEL", "INFO"))
 
-# -------------------- 環境設定 --------------------
+# -------------------- 環境 --------------------
 db = firestore.Client()
 LINE_TOKEN = os.getenv("LINE_CHANNEL_ACCESS_TOKEN") or os.getenv("LINE_TOKEN")
 LINE_SECRET = os.getenv("LINE_CHANNEL_SECRET") or os.getenv("LINE_SECRET")
@@ -61,7 +47,7 @@ HELP_TEXT = (
     "也可輸入「查詢」或 /check 不帶參數，會查你最近一筆啟用中的任務"
 )
 
-# -------------------- 通用正則 --------------------
+# -------------------- 正則 --------------------
 _RE_QTY = re.compile(r"(空位|剩餘|尚餘|尚有|可售|餘票|名額|席位|剩餘張數|剩餘票數|餘數|可購|剩下)[^\d]{0,6}(\d+)", re.I)
 _RE_SOLDOUT = re.compile(r"(售罄|完售|無票|已售完|暫無|暫時無|售完|已售空|無可售|無剩餘)", re.I)
 _RE_AREANAME_NEAR = re.compile(
@@ -81,7 +67,7 @@ _DATE_PAT = re.compile(
     r")"
 )
 
-# live.map 解析用
+# live.map
 _RE_LIVEMAP_URL = re.compile(
     r"https?://[^\"'>]+/QWARE_TICKET/images/Temp/[A-Za-z0-9]+/\d+_[A-Za-z0-9]+_live\.map[^\"'>]*",
     re.I
@@ -165,7 +151,7 @@ def _guess_area_from_text(txt: str) -> str:
 
 # -------------------- URL 整理 --------------------
 def resolve_ibon_orders_url(any_url: str) -> Optional[str]:
-    """由活動頁導回 UTK0201 票頁"""
+    """由活動頁或外部頁導回 UTK0201 票頁"""
     u = urlparse(any_url)
     if "orders.ibon.com.tw" in u.netloc and "UTK0201" in u.path.upper():
         return any_url
@@ -297,24 +283,7 @@ def parse_ibon_orders_static(html: str) -> Dict:
 
     return {"sections": sections, "total": total, "soldout": (total == 0 and soldout_hint), "soup": soup}
 
-# -------------------- live.map 解析 --------------------
-def parse_livemap_counts_from_html_or_fetch(base_page_html: str, base_url: str, sess: requests.Session) -> Tuple[Dict[str, int], int]:
-    m = _RE_LIVEMAP_URL.search(base_page_html)
-    if not m:
-        return {}, 0
-    live_url = m.group(0)
-    try:
-        r = sess.get(live_url, timeout=12)
-        r.raise_for_status()
-    except Exception as e:
-        app.logger.warning(f"[livemap] fetch fail: {live_url} {e}")
-        return {}, 0
-    return _parse_livemap_text(r.text)
-
-def parse_livemap_direct(live_url: str, sess: requests.Session) -> Tuple[Dict[str, int], int]:
-    r = sess.get(live_url, timeout=12); r.raise_for_status()
-    return _parse_livemap_text(r.text)
-
+# -------------------- live.map 解析 & 後備 --------------------
 def _parse_livemap_text(txt: str) -> Tuple[Dict[str, int], int]:
     sections: Dict[str, int] = {}
     total = 0
@@ -330,13 +299,58 @@ def _parse_livemap_text(txt: str) -> Tuple[Dict[str, int], int]:
             mr = re.search(r'\brel=["\'](\d+)["\']', tag, re.I)
             if mr:
                 q = int(mr.group(1))
-        if not q or q <= 0: 
+        if not q or q <= 0:
             continue
         name = _guess_area_from_text(title) or "未命名區"
         key = re.sub(r"\s+", "", name)
         sections[key] = sections.get(key, 0) + q
         total += q
     return sections, total
+
+def parse_livemap_counts_from_html_or_fetch(base_page_html: str, base_url: str, sess: requests.Session) -> Tuple[Dict[str, int], int]:
+    m = _RE_LIVEMAP_URL.search(base_page_html)
+    if not m:
+        app.logger.info(f"[livemap] not found in {base_url}")
+        return {}, 0
+    live_url = m.group(0)
+    try:
+        r = sess.get(live_url, timeout=12)
+        r.raise_for_status()
+    except Exception as e:
+        app.logger.warning(f"[livemap] fetch fail: {live_url} {e}")
+        return {}, 0
+    return _parse_livemap_text(r.text)
+
+def parse_livemap_direct(live_url: str, sess: requests.Session) -> Tuple[Dict[str, int], int]:
+    r = sess.get(live_url, timeout=12); r.raise_for_status()
+    return _parse_livemap_text(r.text)
+
+def _extract_performance_id_from_any(html: str, url: str) -> str:
+    m = re.search(r"[?&]PERFORMANCE_ID=([A-Za-z0-9]+)", url, re.I)
+    if m: return m.group(1)
+    m = re.search(r"PERFORMANCE_ID['\"=:\s]+([A-Za-z0-9]+)", html, re.I)
+    if m: return m.group(1)
+    return ""
+
+def try_fetch_livemap_by_perf(perf_id: str, sess: requests.Session) -> Tuple[Dict[str, int], int]:
+    """000/001 頁抓不到 live.map 時，依 PERF_ID 主動猜連結（1_/2_/3_）"""
+    if not perf_id:
+        return {}, 0
+    base = f"https://qwareticket-asysimg.azureedge.net/QWARE_TICKET/images/Temp/{perf_id}"
+    candidates = [
+        f"{base}/1_{perf_id}_live.map",
+        f"{base}/2_{perf_id}_live.map",
+        f"{base}/3_{perf_id}_live.map",
+    ]
+    for u in candidates:
+        try:
+            r = sess.get(u, timeout=12)
+            if r.status_code == 200 and "<area" in r.text:
+                app.logger.info(f"[livemap] guessed and hit: {u}")
+                return _parse_livemap_text(r.text)
+        except Exception as e:
+            app.logger.warning(f"[livemap] guess fail {u}: {e}")
+    return {}, 0
 
 # -------------------- 主視覺圖 --------------------
 def _find_image_in_soup(base_url: str, soup: BeautifulSoup) -> str:
@@ -376,7 +390,7 @@ def _resolve_activity_image(orders_url: str, html_000: str, soup_000: BeautifulS
             if m3: return m3.group(0)
         except Exception as e:
             app.logger.warning(f"[image] details fetch fail: {details_url} {e}")
-    return ""
+    return "https://ticketimg2.azureedge.net/logo.png"
 
 # -------------------- 深入 001 票區 --------------------
 def _extract_ids_from_url(url: str) -> Dict[str, str]:
@@ -506,13 +520,21 @@ def check_ibon(any_url: str) -> Tuple[bool, str, str, Dict[str, str]]:
     dt = meta.get("datetime")
     img = _resolve_activity_image(orders_url, r.text, parsed["soup"], s)
 
-    # 先試 live.map（最快）
+    # 先試：從 000/001 HTML 直接找 live.map
     secL, totL = parse_livemap_counts_from_html_or_fetch(r.text, orders_url, s)
+    if totL == 0:
+        # 還是沒有 → 由 PERFORMANCE_ID 主動猜 live.map
+        perf_id = _extract_performance_id_from_any(r.text, orders_url)
+        secG, totG = try_fetch_livemap_by_perf(perf_id, s)
+        if totG > 0:
+            secL, totL = secG, totG
+
     if totL > 0:
         parsed["sections"], parsed["total"], parsed["soldout"] = secL, totL, False
 
     # 若仍無 → 走 001 逐區
     if parsed["total"] == 0:
+        app.logger.info("[deep] entering 001 fallback")
         sec2, tot2, sold2 = deep_parse_areas(orders_url, parsed["soup"], r.text, limit=20)
         if tot2 > 0:
             parsed["sections"], parsed["total"], parsed["soldout"] = sec2, tot2, False
@@ -536,14 +558,13 @@ def check_ibon(any_url: str) -> Tuple[bool, str, str, Dict[str, str]]:
 
     return False, prefix + "暫時讀不到剩餘數（可能為動態載入）。\n" + orders_url, "NA", {"image_url": img}
 
-# -------------------- /probe：列出疑似 API --------------------
+# -------------------- /probe：疑似 API --------------------
 def probe_candidates(any_url: str) -> List[str]:
     url = resolve_ibon_orders_url(any_url) or any_url
     s = _req_session()
     r = s.get(url, timeout=15); r.raise_for_status()
     html = r.text
     urls = set(u.group(0) for u in _RE_SUSPECT_API.finditer(html))
-    # 也試試 001 base
     ids = dict((k.upper(), v) for k, v in parse_qsl(urlparse(url).query, keep_blank_values=True))
     if "UTK0201_000" in url or "UTK0201_001" in url:
         base_001 = _build_001_base_url(url, ids.get("PERFORMANCE_ID",""), ids.get("PRODUCT_ID",""), ids.get("STRITEM",""))
@@ -551,7 +572,6 @@ def probe_candidates(any_url: str) -> List[str]:
             r2 = s.get(base_001, timeout=15); r2.raise_for_status()
             urls |= set(u.group(0) for u in _RE_SUSPECT_API.finditer(r2.text))
         except: pass
-    # live.map 也列給你
     m = _RE_LIVEMAP_URL.search(html)
     if m: urls.add(m.group(0))
     return sorted(list(urls))[:10]
@@ -754,7 +774,6 @@ def do_tick():
 
 @app.get("/cron/tick")
 def cron_tick():
-    # 直接執行一次（你用 Cloud Scheduler 設 GET 這個網址即可）
     return do_tick()
 
 # -------------------- 健康檢查 & 自測 --------------------
@@ -766,7 +785,7 @@ def diag():
     url = request.args.get("url", "")
     if not url: return jsonify({"error":"missing url"}), 400
     ok, msg, sig, meta = check_ibon(url)
-    return jsonify({"ok": ok, "sig": sig, "image": meta.get("image_url") if meta else None, "msg": msg})
+    return jsonify({"ok": ok, "sig": sig, "image": (meta or {}).get("image_url"), "msg": msg})
 
 # -------------------- 入口 --------------------
 if __name__ == "__main__":
