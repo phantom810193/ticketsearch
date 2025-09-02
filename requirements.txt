@@ -1,3 +1,4 @@
+Flask
 fastapi
 uvicorn[standard]
 gunicorn
@@ -7,3 +8,5 @@ cloudscraper
 beautifulsoup4
 google-cloud-firestore
 python-dotenv
+# 如要啟用備援解析才需要：
+playwright
