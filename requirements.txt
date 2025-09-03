@@ -3,13 +3,13 @@ Flask==3.0.3
 gunicorn==21.2.0
 requests==2.32.3
 beautifulsoup4==4.12.3
-lxml==5.2.2
+lxml>=5.3,<6
 line-bot-sdk>=3.11,<4
 
 # Google Cloud
 google-cloud-firestore==2.16.0
 google-cloud-tasks==2.16.3
-grpcio==1.62.2
+grpcio>=1.74,<1.76
 
-# Dynamic fallback for ibon (headless Chromium)
-playwright==1.45.0
+# Playwright 只在 Linux/Mac 安裝（Docker/Cloud Run 會裝，Windows 本機不裝）
+playwright==1.45.0 ; sys_platform != "win32"

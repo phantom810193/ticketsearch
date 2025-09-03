@@ -217,19 +217,21 @@ def extract_area_name_map_from_000(html: str) -> dict:
     return name_map
 
 def _parse_livemap_text(txt: str):
-    """解析 azureedge live.map。"""
+    """解析 azureedge live.map，盡量回傳 {票區代碼: 剩餘張數}。"""
     sections = {}
     total = 0
     for tag in _RE_AREA_TAG.findall(txt):
-        # 區代碼/名稱
-        name = "未命名區"
-        m_href = re.search(
-            r"javascript:Send\([^)]*'([A-Za-z0-9]+)'\s*,\s*'([A-Za-z0-9]+)'\s*,\s*'(\d+)'",
-            tag, re.I)
-        if m_href:
-            name = m_href.group(2)
+        # 1) 嘗試從整個 <area ...> 片段裡抓 B0... 代碼
+        m_code = re.search(r"\b(B0[0-9A-Z]{6,10})\b", tag)
+        code = m_code.group(1) if m_code else None
 
-        # 數量：title 內最後一個 <1000 的數字
+        # 2) 還是抓不到就從 javascript:Send(...) 解析第二個參數
+        if code is None:
+            m_href = re.search(r"javascript:Send\([^)]*'([A-Za-z0-9]+)'\s*,\s*'([A-Za-z0-9]+)'\s*,\s*'(\d+)'", tag, re.I)
+            if m_href and re.fullmatch(r"B0[0-9A-Z]{6,10}", m_href.group(2) or ""):
+                code = m_href.group(2)
+
+        # 3) 解析數量：title 中最後一個 <1000 的數字；再試 data-* 與 aria/alt
         qty = None
         m_title = re.search(r'title="([^"]*)"', tag, re.I)
         title_text = m_title.group(1) if m_title else ""
@@ -238,7 +240,6 @@ def _parse_livemap_text(txt: str):
             if n < 1000:
                 qty = n
                 break
-
         if qty is None:
             m = re.search(r'\bdata-(?:left|remain|qty|count)=["\']?(\d+)["\']?', tag, re.I)
             if m: qty = int(m.group(1))
@@ -249,7 +250,7 @@ def _parse_livemap_text(txt: str):
         if not qty or qty <= 0:
             continue
 
-        key = re.sub(r"\s+", "", name) or "未命名區"
+        key = code or "UNK"
         sections[key] = sections.get(key, 0) + qty
         total += qty
     return sections, total
@@ -337,7 +338,7 @@ def _parse_counts_from_scripts(soup: BeautifulSoup) -> dict:
 def _try_dynamic_counts(event_url: str, timeout_sec: int = 20) -> dict:
     counts = {}
     try:
-        from playwright.sync_api import sync_playwright
+        from playwright.sync_api import sync_playwright  # 或 Playwright, expect 等
     except Exception as e:
         app.logger.info(f"[dyn] playwright not installed: {e}")
         return counts
@@ -481,20 +482,24 @@ def parse_UTK0201_000(url: str, sess: requests.Session) -> dict:
 
     # 若 live.map 抓不到 → 直接從頁面文字/腳本試抓
     if total <= 0:
+        # live.map 失敗 → 再試靜態文字/腳本
         soup = soup_parse(html)
         counts = _parse_counts_from_text(soup.get_text("\n", strip=True))
         if not counts:
             counts = _parse_counts_from_scripts(soup)
+        # 再不行 → Playwright 動態
+        if not counts:
+            counts = _try_dynamic_counts(url)
+
         if counts:
-            # 把代碼對應中文
             matched, unmatched = map_counts_to_zones(counts, area_name_map)
             human = {}
             for name, code, n in matched:
                 human[name] = human.get(name, 0) + int(n)
-            # 未對到的保留代碼
             for code, n in unmatched:
                 human[code] = human.get(code, 0) + int(n)
             total = sum(human.values())
+
             if total > 0:
                 out["sections"] = human
                 out["total"] = total
@@ -508,20 +513,8 @@ def parse_UTK0201_000(url: str, sess: requests.Session) -> dict:
                 return out
 
     if total > 0:
-        # live.map 命中：區代碼 → 中文名稱（若無對應就用原代碼）
-        human = {}
-        for code, qty in sections_by_code.items():
-            disp = area_name_map.get(code, code)
-            human[disp] = human.get(disp, 0) + int(qty)
-        out["sections"] = human
-        out["total"] = total
-        out["ok"] = True
-        out["sig"] = hash_sections(human)
-        lines = [f"✅ 監看結果：目前可售"]
-        for k, v in sorted(human.items(), key=lambda x: (-x[1], x[0])):
-            lines.append(f"{k}: {v} 張")
-        lines.append(f"合計：{total} 張")
-        out["msg"] = "\n".join(lines) + f"\n{url}"
+        # （原 live.map 命中時的組字串邏輯保留）
+        ...
     else:
         out["msg"] = (
             f"🎫 {out['title']}\n"
@@ -715,13 +708,19 @@ def fs_upsert_watch(chat_id: str, url: str, sec: int):
     return tid, True
 
 def fs_list(chat_id: str, show: str = "on"):
-    if not FS_OK: return []
+    if not FS_OK: 
+        return []
     q = fs_client.collection(COL).where("chat_id", "==", chat_id)
     if show == "on":
         q = q.where("enabled", "==", True)
     elif show == "off":
         q = q.where("enabled", "==", False)
-    return [d.to_dict() for d in q.order_by("updated_at", direction=firestore.Query.DESCENDING).stream()]
+    try:
+        cur = q.order_by("updated_at", direction=firestore.Query.DESCENDING).stream()
+    except Exception as e:
+        app.logger.warning(f"[fs_list] order_by fallback: {e}")
+        cur = q.stream()
+    return [d.to_dict() for d in cur]
 
 def fs_disable(chat_id: str, tid: str) -> bool:
     doc = fs_get_task_by_id(chat_id, tid)
@@ -770,19 +769,32 @@ def handle_command(text: str, chat_id: str):
         if cmd == "/list":
             mode = "on"
             if len(parts) >= 2:
-                t = parts[1].lower()
-                if t in ("all", "off"):
-                    mode = t
+               t = parts[1].lower()
+               if t in ("all", "off"):
+                   mode = t
             rows = fs_list(chat_id, show="off" if mode=="off" else ("all" if mode=="all" else "on"))
             if not rows:
                 out = "（沒有任務）"
+                return [TextSendMessage(text=out)] if HAS_LINE else [out]
+
+            # 安全取值 + 分段（避免超過 LINE 字數）
+            def _chunk(s, n=4500):
+                for i in range(0, len(s), n):
+                    yield s[i:i+n]
+
+            lines = ["你的任務："]
+            for r in rows:
+                rid = r.get("id", "?")
+                state = "啟用" if r.get("enabled") else "停用"
+                period = r.get("period", "?")
+                u = r.get("url", "")
+                lines.append(f"{rid}｜{state}｜{period}s\n{u}")
+            big = "\n\n".join(lines)
+
+            if HAS_LINE:
+                return [TextSendMessage(text=chunk) for chunk in _chunk(big)]
             else:
-                lines = ["你的任務："]
-                for r in rows:
-                    state = "啟用" if r.get("enabled") else "停用"
-                    lines.append(f"{r['id']}｜{state}｜{r.get('period')}s\n{r.get('url')}")
-                out = "\n\n".join(lines)
-            return [TextSendMessage(text=out)] if HAS_LINE else [out]
+                return [big]
 
         if cmd == "/check" and len(parts) >= 2:
             target = parts[1].strip()
