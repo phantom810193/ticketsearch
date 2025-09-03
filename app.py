@@ -188,13 +188,13 @@ def fetch_game_info_from_api(perf_id: Optional[str], product_id: Optional[str], 
     tries: List[Tuple[str, Dict[str, Optional[str]]]] = []
     if perf_id or product_id:
         tries += [
-            ("GET", {"Performance_ID": perf_id, "Product_ID": product_id}),
-            ("GET", {"PerformanceId": perf_id, "ProductId": product_id}),
-            ("GET", {"PERFORMANCE_ID": perf_id, "PRODUCT_ID": product_id}),
+            ("GET",  {"Performance_ID": perf_id, "Product_ID": product_id}),
+            ("GET",  {"PerformanceId": perf_id,  "ProductId":  product_id}),
+            ("GET",  {"PERFORMANCE_ID": perf_id,"PRODUCT_ID": product_id}),
             ("POST", {"Performance_ID": perf_id, "Product_ID": product_id}),
-            ("POST", {"PerformanceId": perf_id, "ProductId": product_id}),
+            ("POST", {"PerformanceId": perf_id,  "ProductId":  product_id}),
         ]
-    tries.append(("GET", {}))  # 無參也試一次
+    tries.append(("GET", {}))  # 無參數也試
 
     wanted: Dict[str, str] = {}
     for method, params in tries:
@@ -205,31 +205,51 @@ def fetch_game_info_from_api(perf_id: Optional[str], product_id: Optional[str], 
                 r = sess.post(TICKET_API, json={k: v for k, v in (params or {}).items() if v}, headers=headers, timeout=12)
             if r.status_code != 200:
                 continue
+
             data = r.json()
+            s = json.dumps(data, ensure_ascii=False)
+
+            # 先做通用欄位抽取（標題/地點/時間/圖片）
             info = _deep_pick_activity_info(data)
 
-            # 嘗試從列表找包含 perf/product id 的那一筆
-            def match_obj(obj):
-                s = json.dumps(obj, ensure_ascii=False)
-                ok = True
-                if perf_id: ok = ok and (perf_id in s)
-                if product_id: ok = ok and (product_id in s)
-                return ok
-            if isinstance(data, list):
-                for it in data:
-                    if match_obj(it): info.update(_deep_pick_activity_info(it)); break
-            elif isinstance(data, dict):
-                for v in data.values():
-                    if isinstance(v, list):
-                        for it in v:
-                            if match_obj(it): info.update(_deep_pick_activity_info(it)); break
+            # ① 直接找 JSON 內的 Details 完整網址
+            m = re.search(r'https?://ticket\.ibon\.com\.tw/ActivityInfo/Details/(\d+)', s)
+            if m:
+                info["details"] = m.group(0)
+            else:
+                # ② 沒有完整網址就找 ID 並拼接
+                m = (re.search(r'"ActivityInfoId"\s*:\s*(\d+)', s) or
+                     re.search(r'"ActivityId"\s*:\s*(\d+)', s) or
+                     re.search(r'"Id"\s*:\s*(\d+)', s))
+                if m:
+                    info["details"] = f"https://ticket.ibon.com.tw/ActivityInfo/Details/{m.group(1)}"
 
+            # ③ 若圖片還沒有，從 JSON 再掃一次 ActivityImage
             if not info.get("poster"):
-                promo = find_activity_image_any(json.dumps(data, ensure_ascii=False))
+                promo = find_activity_image_any(s)
                 if promo: info["poster"] = promo
 
             if info:
                 wanted = info
+                # 若同時也找到和 perf/product id 比對的那筆，優先使用
+                def match_obj(obj):
+                    text = json.dumps(obj, ensure_ascii=False)
+                    ok = True
+                    if perf_id: ok = ok and (perf_id in text)
+                    if product_id: ok = ok and (product_id in text)
+                    return ok
+                if isinstance(data, list):
+                    for it in data:
+                        if match_obj(it):
+                            wanted.update(_deep_pick_activity_info(it))
+                            break
+                elif isinstance(data, dict):
+                    for v in data.values():
+                        if isinstance(v, list):
+                            for it in v:
+                                if match_obj(it):
+                                    wanted.update(_deep_pick_activity_info(it))
+                                    break
                 break
         except Exception as e:
             app.logger.info(f"[api] fetch fail ({method} {params}): {e}")
