@@ -41,7 +41,6 @@ LINE_CHANNEL_ACCESS_TOKEN = os.getenv("LINE_CHANNEL_ACCESS_TOKEN", "")
 LINE_CHANNEL_SECRET = os.getenv("LINE_CHANNEL_SECRET", "")
 DEFAULT_PERIOD_SEC = int(os.getenv("DEFAULT_PERIOD_SEC", "60"))
 ALWAYS_NOTIFY = os.getenv("ALWAYS_NOTIFY", "0") == "1"
-FOLLOW_AREAS_PER_CHECK = int(os.getenv("FOLLOW_AREAS_PER_CHECK", "6"))  # 沒數字時最多追幾個區去票區頁補抓
 
 # 可選：手動覆蓋宣傳圖或 Details 連結（通常不需要）
 PROMO_IMAGE_MAP: Dict[str, str] = {}
@@ -92,9 +91,6 @@ def soup_parse(html: str) -> BeautifulSoup:
         return BeautifulSoup(html, "lxml")
     except Exception:
         return BeautifulSoup(html, "html.parser")
-
-def now_ts() -> float:
-    return time.time()
 
 def hash_sections(d: dict) -> str:
     items = sorted((k, int(v)) for k, v in d.items())
@@ -307,7 +303,8 @@ def fetch_from_ticket_details(details_url: str, sess: requests.Session) -> Dict[
             if t: out["title"] = t
 
         tx = soup.get_text(" ", strip=True)
-        m = re.search(r'(TICC|臺北國際會議中心|台北國際會議中心|高雄巨蛋|小巨蛋|桃園巨蛋)[^\n，,]{0,40}', tx)
+        # 常見地點可加關鍵字；缺省時交給 API/000 頁
+        m = re.search(r'(TICC|臺北國際會議中心|台北國際會議中心)[^\n，,]{0,40}', tx)
         if m: out["place"] = m.group(0).strip()
 
         m = re.search(r'(\d{4}/\d{2}/\d{2})\s*(?:\([\u4e00-\u9fff]\))?\s*(\d{2}:\d{2})', tx)
@@ -396,7 +393,6 @@ def extract_area_name_map_from_000(html: str) -> dict:
     name_map: Dict[str, str] = {}
     soup = soup_parse(html)
 
-    # 1) 先從 <script> 內的 jsonData 拿票區中文名
     for sc in soup.find_all("script"):
         s = sc.string or sc.text or ""
         m = re.search(r"jsonData\s*=\s*'(\[.*?\])'", s, flags=re.S)
@@ -412,7 +408,6 @@ def extract_area_name_map_from_000(html: str) -> dict:
         except Exception:
             pass
 
-    # 2) 再從超連結 fallback
     for a in soup.select('a[href*="PERFORMANCE_PRICE_AREA_ID="]'):
         href = a.get("href", "")
         m = re.search(r'PERFORMANCE_PRICE_AREA_ID=([A-Za-z0-9]+)', href)
@@ -430,7 +425,6 @@ def extract_area_name_map_from_000(html: str) -> dict:
         if name:
             name_map.setdefault(code, name)
 
-    # 3) 再從全文近鄰詞猜
     text = soup.get_text("\n", strip=True)
     for m in re.finditer(r"\b(B0[0-9A-Z]{6,10})\b", text):
         code = m.group(1)
@@ -446,61 +440,40 @@ def extract_area_name_map_from_000(html: str) -> dict:
     return name_map
 
 def _parse_livemap_text(txt: str) -> Tuple[Dict[str, int], int]:
-    """解析 live.map：只認 data-left / 關鍵字『剩餘/尚餘/可售/可購』或『(\d+) 張』；同一區取 max 去重。"""
     sections: Dict[str, int] = {}
+    total = 0
     for tag in _RE_AREA_TAG.findall(txt):
-        # 取區代碼（Send(...) 的第 2 參數或 data-*）
         code = None
         m = re.search(
-            r"javascript:Send\([^)]*'(?P<perf>B0[0-9A-Z]+)'\s*,\s*'(?P<area>B0[0-9A-Z]+)'",
-            tag, re.I
-        )
+            r"javascript:Send\([^)]*'(?P<perf>B0[0-9A-Z]{6,10})'\s*,\s*'(?P<area>B0[0-9A-Z]{6,10})'\s*,\s*'(\d+)'",
+            tag, re.I)
         if m:
             code = m.group("area")
         else:
-            m = re.search(r'(?:data-(?:area|area-id|price-area-id))=["\'](B0[0-9A-Z]+)["\']', tag, re.I)
-            if m:
-                code = m.group(1)
-        if not code:
-            continue
+            codes = re.findall(r"\b(B0[0-9A-Z]{6,10})\b", tag)
+            if codes: code = codes[-1]
 
-        # 1) 先讀 data-* 明確數值
         qty = None
-        m = re.search(r'\bdata-(?:left|remain|qty|count)=["\']?(\d{1,3})["\']?', tag, re.I)
-        if m:
-            qty = int(m.group(1))
-
-        # 2) 再讀 title / alt / aria-label 的文案
+        m_title = re.search(r'title="([^"]*)"', tag, re.I)
+        title_text = m_title.group(1) if m_title else ""
+        nums = [int(n) for n in re.findall(r"(\d+)", title_text)]
+        for n in reversed(nums):
+            if n < 1000: qty = n; break
         if qty is None:
-            text = ""
-            m = re.search(r'title="([^"]*)"', tag, re.I)
-            if m: text = m.group(1)
-            if not text:
-                m = re.search(r'(?:alt|aria-label)=["\']([^"\']*)["\']', tag, re.I)
-                if m: text = m.group(1)
-            if text:
-                m = re.search(r'(?:剩餘|尚餘|余|可售|可購)[^\d]{0,6}(\d{1,3})', text)
-                if not m:
-                    m = re.search(r'(\d{1,3})\s*張', text)
-                if m:
-                    qty = int(m.group(1))
+            m = re.search(r'\bdata-(?:left|remain|qty|count)=["\']?(\d+)["\']?', tag, re.I)
+            if m: qty = int(m.group(1))
+        if qty is None:
+            m = re.search(r'\b(?:alt|aria-label)=["\'][^"\']*?(\d+)[^"\']*["\']', tag, re.I)
+            if m: qty = int(m.group(1))
 
-        # 沒有數字或顯然是誤抓就跳過（>300 多半是區號）
-        if not qty or qty <= 0 or qty > 300:
-            continue
-
-        # 同一區多個 <area>：取最大值避免重複 shape 相加
-        prev = sections.get(code)
-        if prev is None or qty > prev:
-            sections[code] = qty
-
-    total = sum(sections.values())
+        if code and qty and qty > 0:
+            sections[code] = sections.get(code, 0) + qty
+            total += qty
     return sections, total
 
 def try_fetch_livemap_by_perf(perf_id: str, sess: requests.Session, html: Optional[str] = None) -> Tuple[Dict[str, int], int]:
     if not perf_id:
         return {}, 0
-    # 常見存放路徑
     bases = [f"https://qwareticket-asysimg.azureedge.net/QWARE_TICKET/images/Temp/{perf_id}/"]
     if html:
         poster, seatmap = pick_event_images_from_000(html, "https://orders.ibon.com.tw/")
@@ -528,7 +501,7 @@ def _parse_counts_from_text(full_text: str) -> Dict[str, int]:
     counts: Dict[str, int] = {}
     for m in re.finditer(r"(B0[0-9A-Z]{6,10}).{0,40}?(\d{1,3})\s*張", full_text):
         code, qty = m.group(1), int(m.group(2))
-        if qty > 0: counts[code] = max(counts.get(code, 0), qty)
+        if qty > 0: counts[code] = counts.get(code, 0) + qty
     return counts
 
 def _parse_counts_from_scripts(soup: BeautifulSoup) -> Dict[str, int]:
@@ -537,7 +510,7 @@ def _parse_counts_from_scripts(soup: BeautifulSoup) -> Dict[str, int]:
         s = (sc.string or sc.text or "")
         for m in re.finditer(r"(B0[0-9A-Z]{6,10})[^0-9]{0,40}?(\d{1,3})\s*張", s):
             code, qty = m.group(1), int(m.group(2))
-            if qty > 0: counts[code] = max(counts.get(code, 0), qty)
+            if qty > 0: counts[code] = counts.get(code, 0) + qty
     return counts
 
 def map_counts_to_zones(counts: Dict[str, int], area_name_map: Dict[str, str]) -> Tuple[List[Tuple[str,str,int]], List[Tuple[str,int]]]:
@@ -553,7 +526,6 @@ def map_counts_to_zones(counts: Dict[str, int], area_name_map: Dict[str, str]) -
     return matched, unmatched
 
 def _try_dynamic_counts(event_url: str, timeout_sec: int = 20) -> Dict[str, int]:
-    """可選：Playwright 動態補抓；未安裝時自動略過。"""
     counts: Dict[str, int] = {}
     try:
         from playwright.sync_api import sync_playwright  # type: ignore
@@ -587,50 +559,6 @@ def _try_dynamic_counts(event_url: str, timeout_sec: int = 20) -> Dict[str, int]
     except Exception as e:
         app.logger.info(f"[dyn] fail: {e}")
     return counts
-
-# ---- 票區頁（Step 2）補抓「熱賣中」的實際可購張數 ----
-def fetch_area_left_from_utk0101(base_000_url: str, perf_id: str, product_id: str, area_id: str, sess: requests.Session) -> Optional[int]:
-    """
-    到票區頁(UTK0101_02.aspx)嘗試抓該區『可購/剩餘張數』；抓不到回 None。
-    會匹配：剩餘/尚餘/可購買/可售 (\d+)，或 input/select 上的 max/data-max/data-left/data-remain。
-    """
-    try:
-        url = "https://orders.ibon.com.tw/Application/UTK01/UTK0101_02.aspx"
-        params = {
-            "PERFORMANCE_ID": perf_id,
-            "PERFORMANCE_PRICE_AREA_ID": area_id,
-            "PRODUCT_ID": product_id,
-            "strItem": "WEB網站入手A1",
-        }
-        headers = {
-            "Referer": base_000_url,
-            "User-Agent": UA,
-            "Accept-Language": "zh-TW,zh;q=0.9,en;q=0.6",
-        }
-        r = sess.get(url, params=params, headers=headers, timeout=12)
-        if r.status_code != 200:
-            return None
-        html = r.text
-
-        # (1) 文案關鍵字
-        m = re.search(r'(?:剩餘|尚餘|可購買|可售)[^\d]{0,6}(\d{1,3})', html)
-        if not m:
-            m = re.search(r'(\d{1,3})\s*張', html)
-        if m:
-            return int(m.group(1))
-
-        # (2) 表單/輸入元素上的最大值（常用來限制可選張數）
-        soup = soup_parse(html)
-        qty = None
-        for inp in soup.select('input[type="number"],input[name*="QTY" i],select[name*="QTY" i]'):
-            for attr in ("max", "data-max", "data-left", "data-remain"):
-                v = inp.get(attr)
-                if v and str(v).isdigit():
-                    qty = max(qty or 0, int(v))
-        return qty
-    except Exception as e:
-        app.logger.info(f"[area-left] fail {area_id}: {e}")
-        return None
 
 # --------- 主要解析器 ---------
 def parse_UTK0201_000(url: str, sess: requests.Session) -> dict:
@@ -683,11 +611,9 @@ def parse_UTK0201_000(url: str, sess: requests.Session) -> dict:
     out["place"] = details_info.get("place") or api_info.get("place") or html_place or "（未取到場地）"
     out["date"]  = details_info.get("dt")    or api_info.get("dt")    or html_dt    or "（未取到日期）"
 
-    # 票區中文名稱
     area_name_map = extract_area_name_map_from_000(html)
     out["area_names"] = area_name_map
 
-    # live.map 數字（只取可信數字）
     sections_by_code, total = try_fetch_livemap_by_perf(perf_id, sess, html=html)
     counts: Dict[str, int] = {}
     if total <= 0:
@@ -695,39 +621,17 @@ def parse_UTK0201_000(url: str, sess: requests.Session) -> dict:
     if total <= 0 and not counts:
         counts = _try_dynamic_counts(url)
 
-    # ==== 補抓：對「有區代碼但沒數字」的，走票區頁補數字 ====
-    if perf_id and product_id and area_name_map:
-        # 起始：若 live.map 有數字先帶入
-        base_counts = dict(sections_by_code) if sections_by_code else {}
-        # 待補列表：頁上所有區代碼中，沒有數字或 <=0 的
-        to_follow = [code for code in area_name_map.keys()
-                     if not base_counts.get(code) and not counts.get(code)]
-        for code in to_follow[:FOLLOW_AREAS_PER_CHECK]:
-            n = fetch_area_left_from_utk0101(url, perf_id, product_id, code, sess)
-            if isinstance(n, int) and n > 0:
-                counts[code] = n
-
-    # ==== 聚合輸出 ====
-    if (sections_by_code and sum(sections_by_code.values()) > 0) or counts:
-        # 以 counts 優先（包含補抓）；沒有就用 live.map 解析結果
-        source_counts = counts if counts else sections_by_code
-
-        matched, unmatched = map_counts_to_zones(source_counts, area_name_map)
-
+    if total > 0 or counts:
+        if not counts: counts = sections_by_code
+        matched, unmatched = map_counts_to_zones(counts, area_name_map)
         human: Dict[str, int] = {}
-        for name, code, n in matched:
-            v = int(n)
-            human[name] = max(human.get(name, 0), v)   # 同名區取最大值避免重複相加
-        for code, n in unmatched:
-            v = int(n)
-            human[code] = max(human.get(code, 0), v)
-
+        for name, code, n in matched: human[name] = human.get(name, 0) + int(n)
+        for code, n in unmatched:     human[code] = human.get(code, 0) + int(n)
         total = sum(human.values())
         out["sections"] = human
         out["total"] = total
         out["ok"] = total > 0
         out["sig"] = hash_sections(human) if total > 0 else "NA"
-
         if total > 0:
             lines = ["✅ 監看結果：目前可售"]
             for k, v in sorted(human.items(), key=lambda x: (-x[1], x[0])):
@@ -736,7 +640,6 @@ def parse_UTK0201_000(url: str, sess: requests.Session) -> dict:
             out["msg"] = "\n".join(lines) + f"\n{url}"
             return out
 
-    # 沒有可靠數字
     out["msg"] = (
         f"🎫 {out['title']}\n"
         f"地點：{out['place']}\n"
@@ -1001,7 +904,6 @@ def webhook():
         abort(400)
     return "OK"
 
-# 只有在 handler 存在時才掛 decorator
 if HAS_LINE and handler:
     @handler.add(MessageEvent, message=TextMessage)
     def on_message(ev):
@@ -1114,7 +1016,6 @@ def diag():
 def healthz():
     return "ok", 200
 
-# 方便直接用 GET 測 /check（不經 LINE）
 @app.route("/check", methods=["GET"])
 def http_check_once():
     url = request.args.get("url", "").strip()
