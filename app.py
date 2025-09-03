@@ -42,6 +42,18 @@ LINE_CHANNEL_SECRET = os.getenv("LINE_CHANNEL_SECRET", "")
 DEFAULT_PERIOD_SEC = int(os.getenv("DEFAULT_PERIOD_SEC", "60"))
 ALWAYS_NOTIFY = os.getenv("ALWAYS_NOTIFY", "0") == "1"
 
+# 可選：直接指定某些 PERF_ID 的宣傳圖或 Details 網址
+PROMO_IMAGE_MAP: Dict[str, str] = {}
+PROMO_DETAILS_MAP: Dict[str, str] = {}
+try:
+    PROMO_IMAGE_MAP = json.loads(os.getenv("PROMO_IMAGE_MAP", "{}"))
+except Exception:
+    PROMO_IMAGE_MAP = {}
+try:
+    PROMO_DETAILS_MAP = json.loads(os.getenv("PROMO_DETAILS_MAP", "{}"))
+except Exception:
+    PROMO_DETAILS_MAP = {}
+
 if not LINE_CHANNEL_ACCESS_TOKEN or not LINE_CHANNEL_SECRET:
     app.logger.warning("LINE env not set: LINE_CHANNEL_ACCESS_TOKEN / LINE_CHANNEL_SECRET")
 
@@ -155,12 +167,12 @@ def _deep_pick_activity_info(data: Any) -> Dict[str, str]:
     walk(data)
     return {k: v for k, v in out.items() if v}
 
-def find_activity_image_any(html_or_json: str) -> Optional[str]:
+def find_activity_image_any(s: str) -> Optional[str]:
     # 1) ActivityImage（最優先）
-    m = re.search(r"https?://[^\"'<>]+/image/ActivityImage/[^\s\"'<>]+\.(?:jpg|jpeg|png)", html_or_json, flags=re.I)
+    m = re.search(r"https?://[^\"'<>]+/image/ActivityImage/[^\s\"'<>]+\.(?:jpg|jpeg|png)", s, flags=re.I)
     if m: return m.group(0)
     # 2) 其他 ticketimg2 圖片
-    m = re.search(r"https?://ticketimg2\.azureedge\.net/[^\s\"'<>]+\.(?:jpg|jpeg|png)", html_or_json, flags=re.I)
+    m = re.search(r"https?://ticketimg2\.azureedge\.net/[^\s\"'<>]+\.(?:jpg|jpeg|png)", s, flags=re.I)
     return m.group(0) if m else None
 
 def fetch_game_info_from_api(perf_id: Optional[str], product_id: Optional[str], referer_url: str, sess: requests.Session) -> Dict[str, str]:
@@ -212,7 +224,6 @@ def fetch_game_info_from_api(perf_id: Optional[str], product_id: Optional[str], 
                         for it in v:
                             if match_obj(it): info.update(_deep_pick_activity_info(it)); break
 
-            # 宣傳圖：JSON 裡找不到就從 JSON 字串再掃一次
             if not info.get("poster"):
                 promo = find_activity_image_any(json.dumps(data, ensure_ascii=False))
                 if promo: info["poster"] = promo
@@ -225,88 +236,60 @@ def fetch_game_info_from_api(perf_id: Optional[str], product_id: Optional[str], 
             continue
     return wanted
 
-def pick_event_images_from_000(html: str, base_url: str) -> Tuple[str, Optional[str]]:
-    poster = LOGO
-    seatmap = None
+# ---- 解析 ticket.ibon.com.tw/ActivityInfo/Details/{id} ----
+def find_details_url_in_html(html: str) -> Optional[str]:
+    m = re.search(r"https?://ticket\.ibon\.com\.tw/ActivityInfo/Details/\d+", html)
+    return m.group(0) if m else None
+
+def fetch_from_ticket_details(details_url: str, sess: requests.Session) -> Dict[str, str]:
+    """到 ticket.ibon 的活動頁抓 title/place/dt/宣傳圖"""
+    out: Dict[str, str] = {}
     try:
+        r = sess.get(details_url, timeout=12)
+        if r.status_code != 200: return out
+        html = r.text
         soup = soup_parse(html)
 
-        # seatmap
-        for img in soup.find_all("img"):
-            src = (img.get("src") or "").strip()
-            if src and "static_bigmap" in src.lower():
-                seatmap = urljoin(base_url, src); break
-        if not seatmap:
-            m = re.search(r'https?://[^\s"\'<>]+static_bigmap[^\s"\'<>]+?\.(?:jpg|jpeg|png)', html, flags=re.I)
-            if m: seatmap = m.group(0)
+        # 宣傳圖
+        mt = soup.select_one('meta[property="og:image"], meta[name="twitter:image"]')
+        if mt and mt.get("content"):
+            out["poster"] = urljoin(details_url, mt["content"])
+        if not out.get("poster"):
+            for img in soup.find_all("img"):
+                src = (img.get("src") or "").strip()
+                if src and any(k in src.lower() for k in ("activityimage", "azureedge", "banner", "cover")):
+                    out["poster"] = urljoin(details_url, src); break
 
-        # 宣傳圖（先掃全文 ActivityImage）
-        promo = find_activity_image_any(html)
-        if promo:
-            poster = promo
-        else:
-            # 再退回 og/twitter image
-            for sel in ['meta[property="og:image"]', 'meta[name="twitter:image"]']:
-                m = soup.select_one(sel)
-                if m and m.get("content"):
-                    poster = urljoin(base_url, m["content"]); break
+        # 標題
+        h1 = soup.select_one("h1")
+        if h1:
+            title = h1.get_text(" ", strip=True)
+            if title: out["title"] = title
 
-            # 次選：頁面上的 img
-            if poster == LOGO:
-                for img in soup.find_all("img"):
-                    src = (img.get("src") or "").strip()
-                    if src and any(k in src.lower() for k in ("activityimage","azureedge")):
-                        poster = urljoin(base_url, src); break
+        # 場地：先找 class/語意名稱帶 location 的元素
+        for sel in ['[class*=location]', '.fa-location-dot', '.icon-location', '.address', '.place']:
+            el = soup.select_one(sel)
+            if el:
+                txt = el.find_parent().get_text(" ", strip=True)
+                txt = re.sub(r"\s+", " ", txt)
+                if txt: out["place"] = txt; break
+        if "place" not in out:
+            tx = soup.get_text(" ", strip=True)
+            m = re.search(r'(TICC[^，\n]{0,40})', tx)
+            if m: out["place"] = m.group(1).strip()
+
+        # 時間
+        tx = soup.get_text(" ", strip=True)
+        m = re.search(r'(\d{4}/\d{2}/\d{2})\s*(?:\([\u4e00-\u9fff]\))?\s*(\d{2}:\d{2})', tx)
+        if m: out["dt"] = f"{m.group(1)} {m.group(2)}"
+
     except Exception as e:
-        app.logger.warning(f"[image] pick failed: {e}")
-    return poster, seatmap
-
-def extract_title_place_from_html(html: str) -> Tuple[Optional[str], Optional[str], Optional[str]]:
-    """從頁面 DOM 近鄰標籤/表格/圖片 alt/title 推斷 (title, place, datetime)"""
-    soup = soup_parse(html)
-
-    # 1) 常見 label 表格：活動名稱 / 場地 / 地點
-    def pick_by_label(labels: List[str]) -> Optional[str]:
-        for lab in labels:
-            node = soup.find(lambda t: t and t.name in ("th","td","span","div","p") and t.get_text(strip=True) == lab)
-            if not node: 
-                # label: 值
-                node = soup.find(lambda t: t and t.name in ("span","div","p") and re.fullmatch(lab, t.get_text(strip=True)))
-            if not node:
-                continue
-            # 同列最後一格
-            tr = node.find_parent("tr")
-            if tr:
-                tds = tr.find_all(["td","th"])
-                if len(tds) >= 2:
-                    val = tds[-1].get_text(" ", strip=True)
-                    if val: return val
-            # 下一個兄弟節點
-            sib = node.find_next_sibling()
-            if sib:
-                val = sib.get_text(" ", strip=True)
-                if val: return val
-        return None
-
-    title = pick_by_label(["活動名稱","演出名稱","節目名稱","場次名稱","活動主題"])
-    place = pick_by_label(["場地","地點","演出地點","地區"])
-
-    # 2) 圖片 alt/title 有時含完整名稱
-    if not title:
-        for img in soup.find_all("img"):
-            alt = (img.get("alt") or img.get("title") or "").strip()
-            if alt and len(alt) >= 8:
-                title = alt; break
-
-    # 3) 時間：yyyy/MM/dd HH:mm
-    dt_text = None
-    m = _RE_DATE.search(html)
-    if m:
-        dt_text = f"{m.group(1)} {m.group(2)}"
-
-    return title, place, dt_text
+        app.logger.info(f"[details] fetch fail: {e}")
+    return out
 
 # ============= 票區與 live.map 解析 =============
+_RE_AREA_TAG = re.compile(r"<area\b[^>]*>", re.I)
+
 def extract_area_name_map_from_000(html: str) -> dict:
     name_map: Dict[str, str] = {}
     soup = soup_parse(html)
@@ -484,6 +467,87 @@ def _try_dynamic_counts(event_url: str, timeout_sec: int = 20) -> Dict[str, int]
         app.logger.info(f"[dyn] fail: {e}")
     return counts
 
+# ---- 圖片（宣傳圖 + 座位圖） & 標題/場地（HTML 版型）----
+def pick_event_images_from_000(html: str, base_url: str) -> Tuple[str, Optional[str]]:
+    poster = LOGO
+    seatmap = None
+    try:
+        soup = soup_parse(html)
+
+        # seatmap
+        for img in soup.find_all("img"):
+            src = (img.get("src") or "").strip()
+            if src and "static_bigmap" in src.lower():
+                seatmap = urljoin(base_url, src); break
+        if not seatmap:
+            m = re.search(r'https?://[^\s"\'<>]+static_bigmap[^\s"\'<>]+?\.(?:jpg|jpeg|png)', html, flags=re.I)
+            if m: seatmap = m.group(0)
+
+        # 宣傳圖：先掃全文 ActivityImage / ticketimg2
+        promo = find_activity_image_any(html)
+        if promo:
+            poster = promo
+        else:
+            # 退回 og/twitter image
+            soup = soup_parse(html)
+            for sel in ['meta[property="og:image"]', 'meta[name="twitter:image"]']:
+                m = soup.select_one(sel)
+                if m and m.get("content"):
+                    poster = urljoin(base_url, m["content"]); break
+            if poster == LOGO:
+                for img in soup.find_all("img"):
+                    src = (img.get("src") or "").strip()
+                    if src and any(k in src.lower() for k in ("activityimage","azureedge")):
+                        poster = urljoin(base_url, src); break
+    except Exception as e:
+        app.logger.warning(f"[image] pick failed: {e}")
+    return poster, seatmap
+
+def extract_title_place_from_html(html: str) -> tuple[Optional[str], Optional[str], Optional[str]]:
+    """從頁面 DOM 近鄰標籤/列表版型/圖片 alt/title 推斷 (title, place, datetime)"""
+    soup = soup_parse(html)
+
+    title: Optional[str] = None
+    place: Optional[str] = None
+    dt_text: Optional[str] = None
+
+    # list-grid 版型（.grid-title / .grid-content）
+    for gt in soup.select('.grid-title'):
+        lab = gt.get_text(" ", strip=True)
+        sib = gt.find_next_sibling()
+        if not sib:
+            continue
+        content = sib.get_text(" ", strip=True)
+        if not content:
+            continue
+        if ("活動名稱" in lab or "演出名稱" in lab or "節目名稱" in lab or "場次名稱" in lab) and not title:
+            title = content
+        if any(k in lab for k in ("活動地點", "地點", "場地")) and not place:
+            place = re.sub(r"\s+", " ", content).strip()
+
+    if not title:
+        m = soup.select_one('[id$="_NAME"]')
+        if m:
+            t = m.get_text(" ", strip=True)
+            if t: title = t
+
+    if not title:
+        h1 = soup.select_one("h1")
+        if h1:
+            t = h1.get_text(" ", strip=True)
+            if len(t) >= 6: title = t
+
+    if not title:
+        mt = soup.select_one('meta[property="og:title"]')
+        if mt and mt.get("content"):
+            title = mt["content"].strip()
+
+    m = _RE_DATE.search(html)
+    if m:
+        dt_text = f"{m.group(1)} {m.group(2)}"
+
+    return title, place, dt_text
+
 # --------- 主要解析器 ---------
 def parse_UTK0201_000(url: str, sess: requests.Session) -> dict:
     out = {"ok": False, "sig": "NA", "url": url, "image": LOGO}
@@ -503,7 +567,7 @@ def parse_UTK0201_000(url: str, sess: requests.Session) -> dict:
     if seatmap: out["seatmap"] = seatmap
     out["image"] = poster or LOGO
 
-    # API 優先
+    # 先打 API 拿活動資訊（能抓就抓）
     api_info: Dict[str, str] = {}
     try:
         api_info = fetch_game_info_from_api(perf_id, product_id, url, sess)
@@ -513,14 +577,24 @@ def parse_UTK0201_000(url: str, sess: requests.Session) -> dict:
     # HTML 強化抽取
     html_title, html_place, html_dt = extract_title_place_from_html(html)
 
-    # 標題 / 場地 / 時間
-    out["title"] = api_info.get("title") or html_title or "（未取到標題）"
-    out["place"] = api_info.get("place") or html_place or "（未取到場地）"
-    out["date"]  = api_info.get("dt")    or html_dt    or "（未取到日期）"
+    # 可能的 Details 連結（頁面找不到就看環境變數）
+    details_url = find_details_url_in_html(html) or (PROMO_DETAILS_MAP.get(perf_id) if perf_id else None)
+    details_info: Dict[str, str] = {}
+    if details_url:
+        details_info = fetch_from_ticket_details(details_url, sess)
 
-    # API 若有更好的宣傳圖，再覆蓋一次
-    if api_info.get("poster"):
+    # 宣傳圖覆蓋優先順序：環境變數 > Details > API > 頁面 > LOGO
+    if perf_id and perf_id in PROMO_IMAGE_MAP:
+        out["image"] = PROMO_IMAGE_MAP[perf_id]
+    elif details_info.get("poster"):
+        out["image"] = details_info["poster"]
+    elif api_info.get("poster"):
         out["image"] = api_info["poster"]
+
+    # 標題 / 場地 / 時間（Details > API > HTML）
+    out["title"] = details_info.get("title") or api_info.get("title") or html_title or "（未取到標題）"
+    out["place"] = details_info.get("place") or api_info.get("place") or html_place or "（未取到場地）"
+    out["date"]  = details_info.get("dt")    or api_info.get("dt")    or html_dt    or "（未取到日期）"
 
     # 票區中文名對照
     area_name_map = extract_area_name_map_from_000(html)
