@@ -766,17 +766,13 @@ def handle_command(text: str, chat_id: str):
 
         if cmd == "/list":
             mode = "on"
-            if len(parts) >= 2:
-                t = parts[1].lower()
-                if t in ("all", "off"):
-                    mode = t
-            rows = fs_list(chat_id, show="off" if mode=="off" else ("all" if mode=="all" else "on"))
+            if len(parts) >= 2 and parts[1].lower() in ("all", "off"):
+                mode = parts[1].lower()
+
+            rows = fs_list(chat_id, show=mode)  # fs_list 內已對 order_by 做 try/except 容錯
             if not rows:
                 out = "（沒有任務）"
                 return [TextSendMessage(text=out)] if HAS_LINE else [out]
-
-            def _chunk(s, n=4500):
-                for i in range(0, len(s), n): yield s[i:i+n]
 
             lines = ["你的任務："]
             for r in rows:
@@ -785,9 +781,15 @@ def handle_command(text: str, chat_id: str):
                 period = r.get("period", "?")
                 u = r.get("url", "")
                 lines.append(f"{rid}｜{state}｜{period}s\n{u}")
+
             big = "\n\n".join(lines)
-            if HAS_LINE: return [TextSendMessage(text=chunk) for chunk in _chunk(big)]
-            else: return [big]
+
+            # 分段（LINE 單訊息最大 ~5000 字，留點緩衝）
+            chunks = [big[i:i+4800] for i in range(0, len(big), 4800)]
+            if HAS_LINE:
+                return [TextSendMessage(text=c) for c in chunks]
+            else:
+                return chunks
 
         if cmd == "/check" and len(parts) >= 2:
             target = parts[1].strip()
