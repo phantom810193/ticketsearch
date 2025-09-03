@@ -209,51 +209,51 @@ def fetch_game_info_from_api(perf_id: Optional[str], product_id: Optional[str], 
             data = r.json()
             s = json.dumps(data, ensure_ascii=False)
 
-            # 先做通用欄位抽取（標題/地點/時間/圖片）
+            # 通用抽取：標題 / 場地 / 時間 / 圖片
             info = _deep_pick_activity_info(data)
 
-            # ① 直接找 JSON 內的 Details 完整網址
+            # (1) JSON 內直接有完整 Details 連結
             m = re.search(r'https?://ticket\.ibon\.com\.tw/ActivityInfo/Details/(\d+)', s)
             if m:
                 info["details"] = m.group(0)
             else:
-                # ② 沒有完整網址就找 ID 並拼接
+                # (2) 找 ID 再拼接
                 m = (re.search(r'"ActivityInfoId"\s*:\s*(\d+)', s) or
                      re.search(r'"ActivityId"\s*:\s*(\d+)', s) or
                      re.search(r'"Id"\s*:\s*(\d+)', s))
                 if m:
                     info["details"] = f"https://ticket.ibon.com.tw/ActivityInfo/Details/{m.group(1)}"
 
-            # ③ 若圖片還沒有，從 JSON 再掃一次 ActivityImage
+            # (3) 若還沒有圖片，從 JSON 再掃一次 ActivityImage
             if not info.get("poster"):
                 promo = find_activity_image_any(s)
-                if promo: info["poster"] = promo
+                if promo:
+                    info["poster"] = promo
+
+            # 嘗試把含 perf/product id 的那筆資訊疊上去
+            def match_obj(obj):
+                text = json.dumps(obj, ensure_ascii=False)
+                ok = True
+                if perf_id: ok = ok and (perf_id in text)
+                if product_id: ok = ok and (product_id in text)
+                return ok
+            if isinstance(data, list):
+                for it in data:
+                    if match_obj(it): info.update(_deep_pick_activity_info(it)); break
+            elif isinstance(data, dict):
+                for v in data.values():
+                    if isinstance(v, list):
+                        for it in v:
+                            if match_obj(it): info.update(_deep_pick_activity_info(it)); break
 
             if info:
                 wanted = info
-                # 若同時也找到和 perf/product id 比對的那筆，優先使用
-                def match_obj(obj):
-                    text = json.dumps(obj, ensure_ascii=False)
-                    ok = True
-                    if perf_id: ok = ok and (perf_id in text)
-                    if product_id: ok = ok and (product_id in text)
-                    return ok
-                if isinstance(data, list):
-                    for it in data:
-                        if match_obj(it):
-                            wanted.update(_deep_pick_activity_info(it))
-                            break
-                elif isinstance(data, dict):
-                    for v in data.values():
-                        if isinstance(v, list):
-                            for it in v:
-                                if match_obj(it):
-                                    wanted.update(_deep_pick_activity_info(it))
-                                    break
                 break
+
         except Exception as e:
             app.logger.info(f"[api] fetch fail ({method} {params}): {e}")
             continue
+
     return wanted
 
 # ---- 解析 ticket.ibon.com.tw/ActivityInfo/Details/{id} ----
@@ -599,9 +599,9 @@ def parse_UTK0201_000(url: str, sess: requests.Session) -> dict:
 
     # 可能的 Details 連結（頁面找不到就看環境變數）
     details_url = (
-       find_details_url_in_html(html)          # 先從 000 頁掃
-       or api_info.get("details")              # 再用 API 自動推
-       or (PROMO_DETAILS_MAP.get(perf_id) if perf_id else None)  # 最後才用手動對照（可留作保險）
+        find_details_url_in_html(html)      # 先從 000 頁掃
+        or api_info.get("details")          # 再用 API 自動找
+        or (PROMO_DETAILS_MAP.get(perf_id) if perf_id else None)  # 寫死對照留作最後備援
     )
 
     details_info: Dict[str, str] = {}
@@ -736,14 +736,21 @@ def fs_upsert_watch(chat_id: str, url: str, sec: int):
     })
     return tid, True
 
+# --- 替換 fs_list ---
 def fs_list(chat_id: str, show: str = "on"):
-    if not FS_OK: return []
+    if not FS_OK:
+        return []
     q = fs_client.collection(COL).where("chat_id", "==", chat_id)
-    if show == "on": q = q.where("enabled", "==", True)
-    elif show == "off": q = q.where("enabled", "==", False)
+    if show == "on":
+        q = q.where("enabled", "==", True)
+    elif show == "off":
+        q = q.where("enabled", "==", False)
+
+    # 有索引就排序，沒有索引就退回不排序
     try:
         cur = q.order_by("updated_at", direction=firestore.Query.DESCENDING).stream()
-    except Exception:
+    except Exception as e:
+        app.logger.info(f"[fs_list] no index for order_by(updated_at): {e}; fallback to unsorted")
         cur = q.stream()
     return [d.to_dict() for d in cur]
 
