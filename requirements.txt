@@ -4,7 +4,6 @@ gunicorn>=21.2,<22
 requests>=2.31,<3
 beautifulsoup4>=4.12,<5
 lxml>=5.1,<6        # 給 BS4 用的 parser，速度快、相容性好
-line-bot-sdk>=3.11,<4
 
 # Google Cloud
 google-cloud-firestore>=2.14,<3

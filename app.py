@@ -546,7 +546,7 @@ def webhook():
 # 只有在 handler 存在時才掛 decorator，避免載入期報錯
 if HAS_LINE and handler:
     @handler.add(MessageEvent, message=TextMessage)
-    def on_message(ev: MessageEvent):
+    def on_message(ev):
         text = ev.message.text.strip()
         chat = source_id(ev)
         msgs = handle_command(text, chat)
