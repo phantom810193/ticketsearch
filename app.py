@@ -41,6 +41,7 @@ LINE_CHANNEL_ACCESS_TOKEN = os.getenv("LINE_CHANNEL_ACCESS_TOKEN", "")
 LINE_CHANNEL_SECRET = os.getenv("LINE_CHANNEL_SECRET", "")
 DEFAULT_PERIOD_SEC = int(os.getenv("DEFAULT_PERIOD_SEC", "60"))
 ALWAYS_NOTIFY = os.getenv("ALWAYS_NOTIFY", "0") == "1"
+FOLLOW_AREAS_PER_CHECK = int(os.getenv("FOLLOW_AREAS_PER_CHECK", "0"))  # 預設 0：不追票區第二步頁
 
 # 可選：手動覆蓋宣傳圖或 Details 連結（通常不需要）
 PROMO_IMAGE_MAP: Dict[str, str] = {}
@@ -92,9 +93,11 @@ def soup_parse(html: str) -> BeautifulSoup:
     except Exception:
         return BeautifulSoup(html, "html.parser")
 
-def hash_sections(d: dict) -> str:
-    items = sorted((k, int(v)) for k, v in d.items())
-    raw = json.dumps(items, ensure_ascii=False, separators=(",", ":"))
+def hash_state(sections: Dict[str, int], selling: List[str]) -> str:
+    """將『有數字區』與『熱賣中區』一起做簽章，避免只看數字漏通知。"""
+    items = sorted((k, int(v)) for k, v in sections.items())
+    hot = sorted(selling)
+    raw = json.dumps({"num": items, "hot": hot}, ensure_ascii=False, separators=(",", ":"))
     return hashlib.md5(raw.encode("utf-8")).hexdigest()
 
 def canonicalize_url(u: str) -> str:
@@ -248,6 +251,7 @@ def fetch_game_info_from_api(perf_id: Optional[str], product_id: Optional[str], 
                 if promo:
                     info["poster"] = promo
 
+            # 嘗試在結構中找對應 perf/product 的節點
             def match_obj(obj):
                 text = json.dumps(obj, ensure_ascii=False)
                 ok = True
@@ -303,10 +307,6 @@ def fetch_from_ticket_details(details_url: str, sess: requests.Session) -> Dict[
             if t: out["title"] = t
 
         tx = soup.get_text(" ", strip=True)
-        # 常見地點可加關鍵字；缺省時交給 API/000 頁
-        m = re.search(r'(TICC|臺北國際會議中心|台北國際會議中心)[^\n，,]{0,40}', tx)
-        if m: out["place"] = m.group(0).strip()
-
         m = re.search(r'(\d{4}/\d{2}/\d{2})\s*(?:\([\u4e00-\u9fff]\))?\s*(\d{2}:\d{2})', tx)
         if m: out["dt"] = f"{m.group(1)} {m.group(2)}"
 
@@ -389,10 +389,13 @@ def extract_title_place_from_html(html: str) -> tuple[Optional[str], Optional[st
     return title, place, dt_text
 
 # ============= 票區與 live.map 解析 =============
-def extract_area_name_map_from_000(html: str) -> dict:
+def extract_area_meta_from_000(html: str) -> Tuple[Dict[str, str], Dict[str, str]]:
+    """回傳 (區代碼->中文名, 區代碼->AMOUNT/狀態)。"""
     name_map: Dict[str, str] = {}
+    amount_map: Dict[str, str] = {}
     soup = soup_parse(html)
 
+    # 1) <script> jsonData（最完整）
     for sc in soup.find_all("script"):
         s = sc.string or sc.text or ""
         m = re.search(r"jsonData\s*=\s*'(\[.*?\])'", s, flags=re.S)
@@ -403,17 +406,23 @@ def extract_area_name_map_from_000(html: str) -> dict:
             for it in arr:
                 code = (it.get("PERFORMANCE_PRICE_AREA_ID") or "").strip()
                 name = (it.get("NAME") or "").strip()
+                amt  = (it.get("AMOUNT") or "").strip()
                 if code and name:
                     name_map.setdefault(code, re.sub(r"\s+", "", name))
+                if code and amt:
+                    amount_map.setdefault(code, amt)
         except Exception:
             pass
 
+    # 2) 超連結 fallback 補中文名
     for a in soup.select('a[href*="PERFORMANCE_PRICE_AREA_ID="]'):
         href = a.get("href", "")
         m = re.search(r'PERFORMANCE_PRICE_AREA_ID=([A-Za-z0-9]+)', href)
         if not m:
             continue
         code = m.group(1)
+        if code in name_map:
+            continue
         name = a.get_text(" ", strip=True) or a.get("title", "") or ""
         tr = a.find_parent("tr")
         if tr:
@@ -425,50 +434,56 @@ def extract_area_name_map_from_000(html: str) -> dict:
         if name:
             name_map.setdefault(code, name)
 
-    text = soup.get_text("\n", strip=True)
-    for m in re.finditer(r"\b(B0[0-9A-Z]{6,10})\b", text):
-        code = m.group(1)
-        if code in name_map:
-            continue
-        start = max(0, m.start() - 120)
-        end   = min(len(text), m.end() + 120)
-        ctx = text[start:end]
-        m2 = re.search(r"([0-9一二三四五六七八九十]+樓[^\s，,。；;]{1,12}區|包廂[^\s，,。；;]{0,12}區|[0-9一二三四五六七八九十]+樓[^\s，,。；;]{1,20})", ctx)
-        if m2:
-            name_map.setdefault(code, re.sub(r"\s+", "", m2.group(1)))
-
-    return name_map
+    return name_map, amount_map
 
 def _parse_livemap_text(txt: str) -> Tuple[Dict[str, int], int]:
+    """只認 data-left / 關鍵字『剩餘|尚餘|可售|可購』或『(\d+) 張』；同一區取最大值。"""
     sections: Dict[str, int] = {}
-    total = 0
     for tag in _RE_AREA_TAG.findall(txt):
+        # 抓區代碼
         code = None
         m = re.search(
-            r"javascript:Send\([^)]*'(?P<perf>B0[0-9A-Z]{6,10})'\s*,\s*'(?P<area>B0[0-9A-Z]{6,10})'\s*,\s*'(\d+)'",
-            tag, re.I)
-        if m:
-            code = m.group("area")
-        else:
-            codes = re.findall(r"\b(B0[0-9A-Z]{6,10})\b", tag)
-            if codes: code = codes[-1]
+            r"javascript:Send\([^)]*'(?P<perf>B0[0-9A-Z]{6,10})'\s*,\s*'(?P<area>B0[0-9A-Z]{6,10})'",
+            tag, re.I
+        )
+        if m: code = m.group("area")
+        if not code:
+            m = re.search(r'(?:data-(?:area|area-id|price-area-id))=["\'](B0[0-9A-Z]{6,10})["\']', tag, re.I)
+            if m: code = m.group(1)
+        if not code:
+            continue
 
+        # 1) data-* 的明確數值
         qty = None
-        m_title = re.search(r'title="([^"]*)"', tag, re.I)
-        title_text = m_title.group(1) if m_title else ""
-        nums = [int(n) for n in re.findall(r"(\d+)", title_text)]
-        for n in reversed(nums):
-            if n < 1000: qty = n; break
-        if qty is None:
-            m = re.search(r'\bdata-(?:left|remain|qty|count)=["\']?(\d+)["\']?', tag, re.I)
-            if m: qty = int(m.group(1))
-        if qty is None:
-            m = re.search(r'\b(?:alt|aria-label)=["\'][^"\']*?(\d+)[^"\']*["\']', tag, re.I)
-            if m: qty = int(m.group(1))
+        m = re.search(r'\bdata-(?:left|remain|qty|count)=["\']?(\d{1,3})["\']?', tag, re.I)
+        if m:
+            qty = int(m.group(1))
 
-        if code and qty and qty > 0:
-            sections[code] = sections.get(code, 0) + qty
-            total += qty
+        # 2) title/alt/aria-label 的文案（需含關鍵詞或「(\d+)張」）
+        if qty is None:
+            text = ""
+            m = re.search(r'title="([^"]*)"', tag, re.I)
+            if m: text = m.group(1)
+            if not text:
+                m = re.search(r'(?:alt|aria-label)=["\']([^"\']*)["\']', tag, re.I)
+                if m: text = m.group(1)
+            if text:
+                m = re.search(r'(?:剩餘|尚餘|可售|可購)[^\d]{0,6}(\d{1,3})', text)
+                if not m:
+                    m = re.search(r'(\d{1,3})\s*張', text)
+                if m:
+                    qty = int(m.group(1))
+
+        # 濾錯：大於 500 多半是誤抓；或沒有數字就略過
+        if not qty or qty <= 0 or qty > 500:
+            continue
+
+        # 同一區多個 shape：取最大值避免灌水
+        prev = sections.get(code)
+        if prev is None or qty > prev:
+            sections[code] = qty
+
+    total = sum(sections.values())
     return sections, total
 
 def try_fetch_livemap_by_perf(perf_id: str, sess: requests.Session, html: Optional[str] = None) -> Tuple[Dict[str, int], int]:
@@ -497,68 +512,38 @@ def try_fetch_livemap_by_perf(perf_id: str, sess: requests.Session, html: Option
                 app.logger.info(f"[livemap] miss {url}: {e}")
     return {}, 0
 
-def _parse_counts_from_text(full_text: str) -> Dict[str, int]:
-    counts: Dict[str, int] = {}
-    for m in re.finditer(r"(B0[0-9A-Z]{6,10}).{0,40}?(\d{1,3})\s*張", full_text):
-        code, qty = m.group(1), int(m.group(2))
-        if qty > 0: counts[code] = counts.get(code, 0) + qty
-    return counts
-
-def _parse_counts_from_scripts(soup: BeautifulSoup) -> Dict[str, int]:
-    counts: Dict[str, int] = {}
-    for sc in soup.find_all("script"):
-        s = (sc.string or sc.text or "")
-        for m in re.finditer(r"(B0[0-9A-Z]{6,10})[^0-9]{0,40}?(\d{1,3})\s*張", s):
-            code, qty = m.group(1), int(m.group(2))
-            if qty > 0: counts[code] = counts.get(code, 0) + qty
-    return counts
-
-def map_counts_to_zones(counts: Dict[str, int], area_name_map: Dict[str, str]) -> Tuple[List[Tuple[str,str,int]], List[Tuple[str,int]]]:
-    matched: List[Tuple[str,str,int]] = []
-    unmatched: List[Tuple[str,int]] = []
-    for k, v in counts.items():
-        if re.fullmatch(r"B0[0-9A-Z]{6,10}", k) and k in area_name_map:
-            matched.append((area_name_map[k], k, int(v)))
-        elif re.fullmatch(r"B0[0-9A-Z]{6,10}", k) and k not in area_name_map:
-            unmatched.append((k, int(v)))
-        else:
-            matched.append((k, k, int(v)))
-    return matched, unmatched
-
-def _try_dynamic_counts(event_url: str, timeout_sec: int = 20) -> Dict[str, int]:
-    counts: Dict[str, int] = {}
+# （可選）進第二步票區頁補抓數字：預設不啟用（FOLLOW_AREAS_PER_CHECK=0）
+def fetch_area_left_from_utk0101(base_000_url: str, perf_id: str, product_id: str, area_id: str, sess: requests.Session) -> Optional[int]:
     try:
-        from playwright.sync_api import sync_playwright  # type: ignore
+        url = "https://orders.ibon.com.tw/Application/UTK01/UTK0101_02.aspx"
+        params = {
+            "PERFORMANCE_ID": perf_id,
+            "PERFORMANCE_PRICE_AREA_ID": area_id,
+            "PRODUCT_ID": product_id,
+            "strItem": "WEB網站入手A1",
+        }
+        headers = {"Referer": base_000_url, "User-Agent": UA, "Accept-Language": "zh-TW,zh;q=0.9,en;q=0.6"}
+        r = sess.get(url, params=params, headers=headers, timeout=12)
+        if r.status_code != 200:
+            return None
+        html = r.text
+        m = re.search(r'(?:剩餘|尚餘|可購買|可售)[^\d]{0,6}(\d{1,3})', html)
+        if not m:
+            m = re.search(r'(\d{1,3})\s*張', html)
+        if m:
+            return int(m.group(1))
+
+        soup = soup_parse(html)
+        qty = None
+        for inp in soup.select('input[type="number"],input[name*="QTY" i],select[name*="QTY" i]'):
+            for attr in ("max", "data-max", "data-left", "data-remain"):
+                v = inp.get(attr)
+                if v and str(v).isdigit():
+                    qty = max(qty or 0, int(v))
+        return qty
     except Exception as e:
-        app.logger.info(f"[dyn] playwright not installed: {e}")
-        return counts
-    try:
-        with sync_playwright() as p:
-            browser = p.chromium.launch(headless=True, args=["--no-sandbox", "--disable-setuid-sandbox"])
-            ctx = browser.new_context(user_agent=UA, locale="zh-TW", java_script_enabled=True)
-            page = ctx.new_page()
-            live_map_text = {"txt": ""}
-            def on_response(resp):
-                try:
-                    u = resp.url
-                    if re.search(r"_live\.map$", u):
-                        t = resp.text()
-                        if "<area" in t: live_map_text["txt"] = t
-                except Exception: pass
-            page.on("response", on_response)
-            page.goto(event_url, wait_until="networkidle", timeout=timeout_sec * 1000)
-            time.sleep(1.0)
-            if live_map_text["txt"]:
-                secs, total = _parse_livemap_text(live_map_text["txt"])
-                if total > 0: counts.update(secs); ctx.close(); browser.close(); return counts
-            html = page.content()
-            soup = soup_parse(html)
-            c = _parse_counts_from_text(soup.get_text("\n", strip=True)) or _parse_counts_from_scripts(soup)
-            counts.update(c)
-            ctx.close(); browser.close()
-    except Exception as e:
-        app.logger.info(f"[dyn] fail: {e}")
-    return counts
+        app.logger.info(f"[area-left] fail {area_id}: {e}")
+        return None
 
 # --------- 主要解析器 ---------
 def parse_UTK0201_000(url: str, sess: requests.Session) -> dict:
@@ -574,9 +559,11 @@ def parse_UTK0201_000(url: str, sess: requests.Session) -> dict:
     perf_id = (q.get("PERFORMANCE_ID") or [None])[0]
     product_id = (q.get("PRODUCT_ID") or [None])[0]
 
+    # 圖片
     poster_from_000, seatmap = pick_event_images_from_000(html, url)
     if seatmap: out["seatmap"] = seatmap
 
+    # 活動基本資訊
     api_info: Dict[str, str] = {}
     try:
         api_info = fetch_game_info_from_api(perf_id, product_id, url, sess)
@@ -611,35 +598,69 @@ def parse_UTK0201_000(url: str, sess: requests.Session) -> dict:
     out["place"] = details_info.get("place") or api_info.get("place") or html_place or "（未取到場地）"
     out["date"]  = details_info.get("dt")    or api_info.get("dt")    or html_dt    or "（未取到日期）"
 
-    area_name_map = extract_area_name_map_from_000(html)
+    # 票區中文名 + 狀態（AMOUNT）
+    area_name_map, area_amount_map = extract_area_meta_from_000(html)
     out["area_names"] = area_name_map
 
+    # live.map 數字（僅取可信數字，且同區取最大值）
     sections_by_code, total = try_fetch_livemap_by_perf(perf_id, sess, html=html)
-    counts: Dict[str, int] = {}
-    if total <= 0:
-        counts = _parse_counts_from_text(soup.get_text("\n", strip=True)) or _parse_counts_from_scripts(soup)
-    if total <= 0 and not counts:
-        counts = _try_dynamic_counts(url)
+    numeric_counts: Dict[str, int] = dict(sections_by_code)  # 代碼 -> 數字
+    selling_unknown_codes: List[str] = []  # 只知道「熱賣中」但沒數字
 
-    if total > 0 or counts:
-        if not counts: counts = sections_by_code
-        matched, unmatched = map_counts_to_zones(counts, area_name_map)
-        human: Dict[str, int] = {}
-        for name, code, n in matched: human[name] = human.get(name, 0) + int(n)
-        for code, n in unmatched:     human[code] = human.get(code, 0) + int(n)
-        total = sum(human.values())
-        out["sections"] = human
-        out["total"] = total
-        out["ok"] = total > 0
-        out["sig"] = hash_sections(human) if total > 0 else "NA"
-        if total > 0:
-            lines = ["✅ 監看結果：目前可售"]
-            for k, v in sorted(human.items(), key=lambda x: (-x[1], x[0])):
+    # 針對「熱賣中」但沒有數字的區：是否進第二步頁補抓？
+    if FOLLOW_AREAS_PER_CHECK > 0 and perf_id and product_id and area_name_map:
+        need_follow = [code for code, amt in area_amount_map.items()
+                       if (amt and "熱賣" in amt) and (not numeric_counts.get(code))]
+        for code in need_follow[:FOLLOW_AREAS_PER_CHECK]:
+            n = fetch_area_left_from_utk0101(url, perf_id, product_id, code, sess)
+            if isinstance(n, int) and n > 0:
+                numeric_counts[code] = n
+
+    # 尚無數字者，若 AMOUNT 顯示「熱賣中/可售」→ 列入 selling_unknown
+    for code, amt in area_amount_map.items():
+        if (amt and ("熱賣" in amt or "可售" in amt)) and not numeric_counts.get(code):
+            selling_unknown_codes.append(code)
+
+    # ==== 聚合輸出 ====
+    # 把代碼映成人類名稱（同名區取最大值；不把「熱賣中(未知)」算進 total）
+    human_numeric: Dict[str, int] = {}
+    for code, n in numeric_counts.items():
+        name = area_name_map.get(code, code)
+        v = int(n)
+        # 同名取最大值避免重複 shape/多代碼灌水
+        human_numeric[name] = max(human_numeric.get(name, 0), v)
+
+    selling_names = sorted({area_name_map.get(code, code) for code in selling_unknown_codes})
+
+    total_num = sum(human_numeric.values())
+
+    out["sections"] = human_numeric
+    out["selling"] = selling_names
+    out["total"] = total_num
+    out["ok"] = (total_num > 0) or bool(selling_names)
+    out["sig"] = hash_state(human_numeric, selling_names)
+
+    if out["ok"]:
+        lines = [f"🎫 {out['title']}",
+                 f"地點：{out['place']}",
+                 f"日期：{out['date']}",
+                 ""]
+        if total_num > 0:
+            lines.append("✅ 監看結果：目前可售")
+            for k, v in sorted(human_numeric.items(), key=lambda x: (-x[1], x[0])):
                 lines.append(f"{k}: {v} 張")
-            lines.append(f"合計：{total} 張")
-            out["msg"] = "\n".join(lines) + f"\n{url}"
-            return out
+            lines.append(f"合計：{total_num} 張")
+        if selling_names:
+            if total_num > 0:
+                lines.append("")  # 分段
+            lines.append("🟢 目前熱賣中（數量未公開）：")
+            for n in selling_names:
+                lines.append(f"・{n}（熱賣中）")
+        lines.append(out["url"])
+        out["msg"] = "\n".join(lines)
+        return out
 
+    # 沒有可靠數字、也沒有熱賣中清單
     out["msg"] = (
         f"🎫 {out['title']}\n"
         f"地點：{out['place']}\n"
@@ -734,17 +755,15 @@ def fs_list(chat_id: str, show: str = "on"):
     elif show == "off":
         base = base.where("enabled", "==", False)
 
-    # 先嘗試 order_by；若在「迭代 stream」階段丟需要索引，就退回無排序
     try:
         cur = base.order_by("updated_at", direction=firestore.Query.DESCENDING).stream()
         rows = []
-        for d in cur:  # 這裡才真正發 RPC
+        for d in cur:
             rows.append(d.to_dict())
         return rows
     except Exception as e:
         app.logger.info(f"[fs_list] order_by stream failed, fallback to unsorted: {e}")
 
-    # 無排序再取一次，並在 Python 端照 updated_at DESC 排
     try:
         rows = [d.to_dict() for d in base.stream()]
         def _k(x):
@@ -769,10 +788,17 @@ def fmt_result_text(res: dict) -> str:
              f"地點：{res.get('place','')}",
              f"日期：{res.get('date','')}"]
     if res.get("ok"):
-        lines.append("\n✅ 監看結果：目前可售")
-        for k, v in sorted(res.get("sections", {}).items(), key=lambda x: (-x[1], x[0])):
-            lines.append(f"{k}: {v} 張")
-        lines.append(f"合計：{res.get('total',0)} 張")
+        secs = res.get("sections", {})
+        selling = res.get("selling", [])
+        if secs:
+            lines.append("\n✅ 監看結果：目前可售")
+            for k, v in sorted(secs.items(), key=lambda x: (-x[1], x[0])):
+                lines.append(f"{k}: {v} 張")
+            lines.append(f"合計：{res.get('total',0)} 張")
+        if selling:
+            lines.append("\n🟢 目前熱賣中（數量未公開）：")
+            for n in selling:
+                lines.append(f"・{n}（熱賣中）")
     else:
         lines.append("\n暫時讀不到剩餘數（可能為動態載入）。")
     lines.append(res.get("url", ""))
@@ -809,7 +835,6 @@ def handle_command(text: str, chat_id: str):
                     out = "（沒有任務）"
                     return [TextSendMessage(text=out)] if HAS_LINE else [out]
 
-                # 組字串 + 分段（避免單則訊息超長）
                 chunks = []
                 buf = "你的任務：\n"
                 for r in rows:
@@ -823,7 +848,7 @@ def handle_command(text: str, chat_id: str):
                         app.logger.info(f"[list] format row fail: {e}; row={r}")
                         line = f"{r}\n\n"
 
-                    if len(buf) + len(line) > 4800:      # 留安全緩衝 < 5000
+                    if len(buf) + len(line) > 4800:
                         chunks.append(buf.rstrip())
                         buf = ""
                     buf += line
@@ -831,13 +856,12 @@ def handle_command(text: str, chat_id: str):
                     chunks.append(buf.rstrip())
 
                 if HAS_LINE:
-                    # LINE reply 最多 5 則；多的用 push 送出
                     to_reply = chunks[:5]
                     to_push  = chunks[5:]
                     msgs = [TextSendMessage(text=c) for c in to_reply]
                     for c in to_push:
                         try:
-                            send_text(chat_id, c)  # push
+                            send_text(chat_id, c)
                         except Exception as e:
                             app.logger.error(f"[list] push remainder failed: {e}")
                     return msgs
