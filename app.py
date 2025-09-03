@@ -69,6 +69,11 @@ UA = (
 _RE_DATE = re.compile(r"(\d{4}/\d{2}/\d{2}\s+\d{2}:\d{2})")
 _RE_AREA_TAG = re.compile(r"<area\b[^>]*>", re.I)
 
+# === 新增：抓代碼/數量用 ===
+COUNT_CODE_RE = re.compile(r"\b(B0[0-9A-Z]{6,10})\b")
+COUNT_PAIR_RE = re.compile(r"\b(B0[0-9A-Z]{6,10})\D{0,12}(\d{1,5})\s*張")
+IBON_HOST_RE = re.compile(r"(^|\.)orders\.ibon\.com\.tw$", re.I)
+
 LOGO = "https://ticketimg2.azureedge.net/logo.png"
 
 # ================= 小工具 =================
@@ -128,7 +133,7 @@ def sess_default() -> requests.Session:
     })
     return s
 
-# ============= ibon 解析 =============
+# ============= 共同解析：標題/地點/日期/圖片 =============
 def pick_event_image_from_000(html: str, base_url: str) -> str:
     """從 000 頁面挑一張活動圖：og:image / twitter:image / 內嵌含 azureedge | ActivityImage | static_bigmap"""
     try:
@@ -153,6 +158,32 @@ def pick_event_image_from_000(html: str, base_url: str) -> str:
                 return urljoin(base_url, u)
     except Exception as e:
         app.logger.warning(f"[image] pick failed: {e}")
+    return LOGO
+
+def pick_event_image_generic(html: str, base_url: str) -> str:
+    """通用頁面的主圖：先 og:image，再找最大張圖片"""
+    try:
+        soup = soup_parse(html)
+        for sel in ['meta[property="og:image"]', 'meta[name="twitter:image"]']:
+            m = soup.select_one(sel)
+            if m and m.get("content"):
+                return urljoin(base_url, m["content"])
+        imgs = soup.find_all("img")
+        best = None
+        best_area = -1
+        for img in imgs:
+            src = img.get("src") or ""
+            if not src:
+                continue
+            w = int(img.get("width") or 0) or 0
+            h = int(img.get("height") or 0) or 0
+            area = w * h
+            if area > best_area:
+                best = src; best_area = area
+        if best:
+            return urljoin(base_url, best)
+    except Exception as e:
+        app.logger.warning(f"[image] generic pick failed: {e}")
     return LOGO
 
 def extract_area_name_map_from_000(html: str) -> dict:
@@ -190,7 +221,7 @@ def _parse_livemap_text(txt: str):
     sections = {}
     total = 0
     for tag in _RE_AREA_TAG.findall(txt):
-        # 區代碼
+        # 區代碼/名稱
         name = "未命名區"
         m_href = re.search(
             r"javascript:Send\([^)]*'([A-Za-z0-9]+)'\s*,\s*'([A-Za-z0-9]+)'\s*,\s*'(\d+)'",
@@ -198,7 +229,7 @@ def _parse_livemap_text(txt: str):
         if m_href:
             name = m_href.group(2)
 
-        # 數量：title 內最後一個 <1000 的數字（避開 5800/4800...）
+        # 數量：title 內最後一個 <1000 的數字
         qty = None
         m_title = re.search(r'title="([^"]*)"', tag, re.I)
         title_text = m_title.group(1) if m_title else ""
@@ -244,8 +275,153 @@ def try_fetch_livemap_by_perf(perf_id: str, sess: requests.Session):
                 app.logger.warning(f"[livemap] guess fail {url}: {e}")
     return {}, 0
 
+# === 新增：通用 counts 解析（文字 & script JSON） ===
+def _parse_counts_from_text(text: str) -> dict:
+    counts = {}
+    # 直接抓「代碼 ... N 張」
+    for m in COUNT_PAIR_RE.finditer(text):
+        code, n = m.group(1), int(m.group(2))
+        counts[code] = max(n, counts.get(code, 0))
+    # 若沒抓到，嘗試鄰近行的「代碼 + N 張」
+    if not counts:
+        lines = [x.strip() for x in text.splitlines() if x.strip()]
+        for i, ln in enumerate(lines):
+            m = COUNT_CODE_RE.search(ln)
+            if not m:
+                continue
+            code = m.group(1)
+            ctx = " ".join(lines[max(0, i-1): i+2])
+            m2 = re.search(r"(\d{1,5})\s*張", ctx)
+            if m2:
+                counts[code] = max(int(m2.group(1)), counts.get(code, 0))
+    return counts
+
+def _parse_counts_from_scripts(soup: BeautifulSoup) -> dict:
+    counts = {}
+    for sc in soup.find_all("script"):
+        sc_txt = (sc.string or sc.text or "").strip()
+        if not sc_txt:
+            continue
+        # 先用正則補抓
+        c2 = _parse_counts_from_text(sc_txt)
+        for k, v in c2.items():
+            counts[k] = max(v, counts.get(k, 0))
+        # 盡量解析 JSON 結構
+        if "{" in sc_txt and "}" in sc_txt and any(k in sc_txt.lower() for k in ("remain", "qty", "quantity", "left")):
+            try:
+                blob = sc_txt[sc_txt.find("{"): sc_txt.rfind("}") + 1]
+                data = json.loads(blob)
+            except Exception:
+                data = None
+            if isinstance(data, dict):
+                stack = [data]
+                while stack:
+                    node = stack.pop()
+                    if isinstance(node, dict):
+                        code = None; qty = None
+                        for k, v in node.items():
+                            k_l = str(k).lower()
+                            if isinstance(v, str) and COUNT_CODE_RE.fullmatch(v):
+                                code = v
+                            if isinstance(v, (int, str)) and k_l in ("remain", "remainqty", "qty", "quantity", "left", "remaincount"):
+                                try: qty = int(v)
+                                except: pass
+                        if code and isinstance(qty, int):
+                            counts[code] = max(qty, counts.get(code, 0))
+                        stack.extend(node.values())
+                    elif isinstance(node, list):
+                        stack.extend(node)
+    return counts
+
+# === 新增：Playwright 動態備援 ===
+def _try_dynamic_counts(event_url: str, timeout_sec: int = 20) -> dict:
+    counts = {}
+    try:
+        from playwright.sync_api import sync_playwright
+    except Exception as e:
+        app.logger.info(f"[dyn] playwright not installed: {e}")
+        return counts
+
+    with sync_playwright() as p:
+        browser = p.chromium.launch(headless=True, args=["--no-sandbox", "--disable-setuid-sandbox", "--disable-dev-shm-usage"])
+        ctx = browser.new_context(user_agent=UA, locale="zh-TW", java_script_enabled=True)
+        page = ctx.new_page()
+
+        def on_response(resp):
+            try:
+                ct = resp.headers.get("content-type", "")
+                if "application/json" not in ct:
+                    return
+                if "ibon.com.tw" not in resp.url:
+                    return
+                data = resp.json()
+            except Exception:
+                return
+            # 深度找 code+qty
+            stack = [data]
+            while stack:
+                node = stack.pop()
+                if isinstance(node, dict):
+                    code = None; qty = None
+                    for k, v in node.items():
+                        k_l = str(k).lower()
+                        if isinstance(v, str) and COUNT_CODE_RE.fullmatch(v):
+                            code = v
+                        if isinstance(v, (int, str)) and k_l in ("remain", "remainqty", "qty", "quantity", "left", "remaincount"):
+                            try: qty = int(v)
+                            except: pass
+                    if code and isinstance(qty, int):
+                        counts[code] = max(qty, counts.get(code, 0))
+                    stack.extend(node.values())
+                elif isinstance(node, list):
+                    stack.extend(node)
+
+        page.on("response", on_response)
+        page.set_extra_http_headers({"User-Agent": UA, "Accept-Language": "zh-TW,zh;q=0.9,en;q=0.6"})
+        page.goto(event_url, wait_until="domcontentloaded")
+        try:
+            page.wait_for_load_state("networkidle", timeout=timeout_sec * 1000)
+        except Exception:
+            pass
+
+        body_text = page.evaluate("document.body.innerText")
+        cc = _parse_counts_from_text(body_text)
+        for k, v in cc.items():
+            counts[k] = max(v, counts.get(k, 0))
+
+        html = page.content()
+        soup = BeautifulSoup(html, "html.parser")
+        cc2 = _parse_counts_from_text(soup.get_text("\n", strip=True))
+        for k, v in cc2.items():
+            counts[k] = max(v, counts.get(k, 0))
+
+        ctx.close()
+        browser.close()
+    return counts
+
+# === 區域名稱對應（最長前綴） ===
+def map_counts_to_zones(counts: dict, area_map: dict) -> tuple[list[tuple[str, str, int]], list[tuple[str, int]]]:
+    matched, unmatched = [], []
+    for code, n in counts.items():
+        name = area_map.get(code)
+        if not name:
+            best = None
+            for k, v in area_map.items():
+                if code.startswith(k) or k.startswith(code):
+                    if best is None or len(k) > len(best[0]):
+                        best = (k, v)
+            if best:
+                name = best[1]
+        if name:
+            matched.append((name, code, int(n)))
+        else:
+            unmatched.append((code, int(n)))
+    matched.sort(key=lambda x: x[2], reverse=True)
+    return matched, unmatched
+
+# ============= ibon 解析 =============
 def parse_UTK0201_000(url: str, sess: requests.Session) -> dict:
-    """解析 000 頁，抓標題/地點/日期/活動圖 + 試著拿 live.map 票數，並把代碼映射為中文名稱。"""
+    """解析 000 頁，抓標題/地點/日期/活動圖 + live.map 或頁面文字票數。"""
     out = {"ok": False, "sig": "NA", "url": url, "image": LOGO}
     r = sess.get(url, timeout=15)
     if r.status_code != 200:
@@ -266,8 +442,7 @@ def parse_UTK0201_000(url: str, sess: requests.Session) -> dict:
         mt = soup.select_one('meta[property="og:title"]')
         if not title and mt and mt.get("content"):
             title = mt["content"].strip()
-
-        # 地點：找表格或畫面上的「場地 / 地區」欄
+        # 地點
         candidates = soup.find_all(string=re.compile(r"場地|地區"))
         if candidates:
             for t in candidates:
@@ -281,8 +456,7 @@ def parse_UTK0201_000(url: str, sess: requests.Session) -> dict:
                         place = tds[2].get_text(" ", strip=True)
                         if place:
                             break
-
-        # 日期：全頁搜尋 yyyy/MM/dd HH:mm
+        # 日期
         m = _RE_DATE.search(html)
         if m:
             date_str = m.group(1)
@@ -296,17 +470,45 @@ def parse_UTK0201_000(url: str, sess: requests.Session) -> dict:
     # 主圖
     out["image"] = pick_event_image_from_000(html, url)
 
-    # 抓票區名稱映射
+    # 票區名稱映射
     area_name_map = extract_area_name_map_from_000(html)
     out["area_names"] = area_name_map
 
-    # 由 PERFORMANCE_ID 直接猜 live.map
+    # 先試 live.map
     q = parse_qs(urlparse(url).query)
     perf_id = (q.get("PERFORMANCE_ID") or [None])[0]
     sections_by_code, total = try_fetch_livemap_by_perf(perf_id, sess)
 
+    # 若 live.map 抓不到 → 直接從頁面文字/腳本試抓
+    if total <= 0:
+        soup = soup_parse(html)
+        counts = _parse_counts_from_text(soup.get_text("\n", strip=True))
+        if not counts:
+            counts = _parse_counts_from_scripts(soup)
+        if counts:
+            # 把代碼對應中文
+            matched, unmatched = map_counts_to_zones(counts, area_name_map)
+            human = {}
+            for name, code, n in matched:
+                human[name] = human.get(name, 0) + int(n)
+            # 未對到的保留代碼
+            for code, n in unmatched:
+                human[code] = human.get(code, 0) + int(n)
+            total = sum(human.values())
+            if total > 0:
+                out["sections"] = human
+                out["total"] = total
+                out["ok"] = True
+                out["sig"] = hash_sections(human)
+                lines = [f"✅ 監看結果：目前可售"]
+                for k, v in sorted(human.items(), key=lambda x: (-x[1], x[0])):
+                    lines.append(f"{k}: {v} 張")
+                lines.append(f"合計：{total} 張")
+                out["msg"] = "\n".join(lines) + f"\n{url}"
+                return out
+
     if total > 0:
-        # 代碼 -> 中文名稱
+        # live.map 命中：區代碼 → 中文名稱（若無對應就用原代碼）
         human = {}
         for code, qty in sections_by_code.items():
             disp = area_name_map.get(code, code)
@@ -315,7 +517,6 @@ def parse_UTK0201_000(url: str, sess: requests.Session) -> dict:
         out["total"] = total
         out["ok"] = True
         out["sig"] = hash_sections(human)
-        # 組中文說明
         lines = [f"✅ 監看結果：目前可售"]
         for k, v in sorted(human.items(), key=lambda x: (-x[1], x[0])):
             lines.append(f"{k}: {v} 張")
@@ -331,12 +532,98 @@ def parse_UTK0201_000(url: str, sess: requests.Session) -> dict:
         )
     return out
 
+def parse_ibon_generic(url: str, sess: requests.Session) -> dict:
+    """
+    通用 ibon 頁處理：
+    - 若是 000 頁 → 走 parse_UTK0201_000
+    - 其它頁：先靜態抓（頁面文字 + script），抓不到再用 Playwright 動態備援
+    """
+    p = urlparse(url)
+    if p.path.upper().endswith("/UTK0201_000.ASPX"):
+        return parse_UTK0201_000(url, sess)
+
+    out = {"ok": False, "sig": "NA", "url": url, "image": LOGO}
+    r = sess.get(url, timeout=15)
+    if r.status_code != 200:
+        out["msg"] = f"讀取失敗（HTTP {r.status_code}）"
+        return out
+    html = r.text
+    soup = soup_parse(html)
+
+    # 標題/地點/日期/圖片（通用）
+    title = (soup.title.text.strip() if soup.title and soup.title.text else "")
+    if not title:
+        mt = soup.select_one('meta[property="og:title"]')
+        if mt and mt.get("content"): title = mt["content"].strip()
+    out["title"] = title or "（未取到標題）"
+
+    place = ""
+    for t in soup.find_all(string=re.compile(r"場地|地區|地點")):
+        td = getattr(t, "parent", None)
+        if not td: continue
+        tr = td.find_parent("tr")
+        if tr:
+            tds = tr.find_all("td")
+            if len(tds) >= 2:
+                place = tds[-1].get_text(" ", strip=True)
+                if place: break
+    out["place"] = place or "（未取到場地）"
+
+    m = _RE_DATE.search(html)
+    out["date"] = m.group(1) if m else "（未取到日期）"
+
+    out["image"] = pick_event_image_generic(html, url)
+
+    # 先靜態抓 counts
+    counts = _parse_counts_from_text(soup.get_text("\n", strip=True))
+    if not counts:
+        counts = _parse_counts_from_scripts(soup)
+
+    # 票區名稱字典（能抓到就對應）
+    area_name_map = extract_area_name_map_from_000(html)  # 有些頁也沿用相同樣式
+    out["area_names"] = area_name_map
+
+    if not counts:
+        # 退到 Playwright 動態
+        counts = _try_dynamic_counts(url)
+
+    if counts:
+        matched, unmatched = map_counts_to_zones(counts, area_name_map)
+        human = {}
+        for name, code, n in matched:
+            human[name] = human.get(name, 0) + int(n)
+        for code, n in unmatched:
+            human[code] = human.get(code, 0) + int(n)
+        total = sum(human.values())
+        out["sections"] = human
+        out["total"] = total
+        out["ok"] = total > 0
+        if out["ok"]:
+            out["sig"] = hash_sections(human)
+            lines = [f"✅ 監看結果：目前可售"]
+            for k, v in sorted(human.items(), key=lambda x: (-x[1], x[0])):
+                lines.append(f"{k}: {v} 張")
+            lines.append(f"合計：{total} 張")
+            out["msg"] = "\n".join(lines) + f"\n{url}"
+            return out
+
+    # 都抓不到
+    out["msg"] = (
+        f"🎫 {out['title']}\n"
+        f"地點：{out['place']}\n"
+        f"日期：{out['date']}\n\n"
+        "暫時讀不到剩餘數（可能為動態載入）。\n"
+        f"{url}"
+    )
+    return out
+
 def probe(url: str) -> dict:
-    """入口：目前只針對 UTK0201_000 處理，其餘網址原樣回報。"""
+    """入口：改為支援所有 ibon 頁。非 ibon 仍回基本訊息。"""
     s = sess_default()
     p = urlparse(url)
-    if "orders.ibon.com.tw" in p.netloc and p.path.upper().endswith("/UTK0201_000.ASPX"):
-        return parse_UTK0201_000(url, s)
+    if IBON_HOST_RE.search(p.netloc):
+        return parse_ibon_generic(url, s)
+
     # 其他網址：僅回基本訊息
     r = s.get(url, timeout=12)
     title = ""
@@ -658,7 +945,7 @@ def healthz():
 def http_check_once():
     url = request.args.get("url", "").strip()
     if not url:
-        return jsonify({"ok": False, "msg": "provide ?url=<UTK0201_000 url>"}), 400
+        return jsonify({"ok": False, "msg": "provide ?url=<ibon url>"}), 400
     res = probe(url)
     return jsonify(res), 200
 

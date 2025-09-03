@@ -3,9 +3,13 @@ Flask==3.0.3
 gunicorn==21.2.0
 requests==2.32.3
 beautifulsoup4==4.12.3
+lxml==5.2.2
 line-bot-sdk>=3.11,<4
 
 # Google Cloud
 google-cloud-firestore==2.16.0
 google-cloud-tasks==2.16.3
 grpcio==1.62.2
+
+# Dynamic fallback for ibon (headless Chromium)
+playwright==1.45.0

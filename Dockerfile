@@ -2,9 +2,10 @@
 FROM python:3.11-slim
 
 ENV PYTHONDONTWRITEBYTECODE=1 \
-    PYTHONUNBUFFERED=1
+    PYTHONUNBUFFERED=1 \
+    PLAYWRIGHT_BROWSERS_PATH=/ms-playwright
 
-# 系統相依：grpcio 等常見套件需要的編譯工具；Chromium 依賴也一併裝好（即使你暫時不用）
+# 系統相依：grpcio 等常見套件需要的編譯工具；Chromium 依賴也一併裝好
 RUN apt-get update && apt-get install -y --no-install-recommends \
     build-essential gcc curl ca-certificates \
     libnss3 libatk1.0-0 libatk-bridge2.0-0 libxkbcommon0 libdrm2 libxcomposite1 \
@@ -18,12 +19,9 @@ COPY requirements.txt .
 RUN pip install --upgrade pip setuptools wheel \
  && pip install --no-cache-dir -r requirements.txt
 
-# （選用）若真的要用 Playwright，再開這個 ARG
-ARG USE_PLAYWRIGHT=0
-RUN if [ "$USE_PLAYWRIGHT" = "1" ]; then \
-        pip install --no-cache-dir playwright && \
-        playwright install --with-deps chromium; \
-    fi
+# 這一步很關鍵：安裝 Chromium + 相依套件（playwright 已在 requirements 裡）
+# 若你要切回「不裝瀏覽器」的版本，可改用 ARG 控制
+RUN python -m playwright install --with-deps chromium
 
 # 再送其餘程式碼
 COPY . .
