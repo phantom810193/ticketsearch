@@ -338,7 +338,7 @@ def _parse_counts_from_scripts(soup: BeautifulSoup) -> dict:
 def _try_dynamic_counts(event_url: str, timeout_sec: int = 20) -> dict:
     counts = {}
     try:
-        from playwright.sync_api import sync_playwright  # 或 Playwright, expect 等
+        from playwright.sync_api import sync_playwright  # type: ignore
     except Exception as e:
         app.logger.info(f"[dyn] playwright not installed: {e}")
         return counts
