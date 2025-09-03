@@ -251,7 +251,6 @@ def fetch_game_info_from_api(perf_id: Optional[str], product_id: Optional[str], 
                 if promo:
                     info["poster"] = promo
 
-            # 嘗試在結構中找對應 perf/product 的節點
             def match_obj(obj):
                 text = json.dumps(obj, ensure_ascii=False)
                 ok = True
@@ -389,16 +388,18 @@ def extract_title_place_from_html(html: str) -> tuple[Optional[str], Optional[st
     return title, place, dt_text
 
 # ============= 票區與 live.map 解析 =============
-def extract_area_meta_from_000(html: str) -> Tuple[Dict[str, str], Dict[str, str], Dict[str, int]]:
+def extract_area_meta_from_000(html: str) -> Tuple[Dict[str, str], Dict[str, str], Dict[str, int], Dict[str, int]]:
     """
     從 UTK0201_000 抽出：
       - name_map   : 區代碼 -> 中文名稱
       - status_map : 區代碼 -> 狀態字（熱賣中/已售完/…）
       - qty_map    : 區代碼 -> 表格「空位」欄的數字（若有）
+      - order_map  : 區代碼 -> 顯示順序（jsonData SORT；否則表格列順）
     """
     name_map: Dict[str, str] = {}
     status_map: Dict[str, str] = {}
     qty_map: Dict[str, int] = {}
+    order_map: Dict[str, int] = {}
 
     soup = soup_parse(html)
 
@@ -414,6 +415,7 @@ def extract_area_meta_from_000(html: str) -> Tuple[Dict[str, str], Dict[str, str
                 code = (it.get("PERFORMANCE_PRICE_AREA_ID") or "").strip()
                 name = (it.get("NAME") or "").strip()
                 amt  = (it.get("AMOUNT") or "").strip()
+                srt  = it.get("SORT")
                 if code and name:
                     name_map.setdefault(code, re.sub(r"\s+", "", name))
                 if code and amt:
@@ -421,16 +423,21 @@ def extract_area_meta_from_000(html: str) -> Tuple[Dict[str, str], Dict[str, str
                     nums = [int(x) for x in re.findall(r"\d+", amt) if int(x) < 1000]
                     if nums:
                         qty_map.setdefault(code, nums[-1])
+                if code and isinstance(srt, int):
+                    order_map.setdefault(code, srt)
         except Exception:
             pass
 
     # (b) 表格列
+    row_idx = 0
     for a in soup.select('a[href*="PERFORMANCE_PRICE_AREA_ID="]'):
         href = a.get("href", "")
         m = re.search(r'PERFORMANCE_PRICE_AREA_ID=([A-Za-z0-9]+)', href)
         if not m:
             continue
         code = m.group(1)
+        row_idx += 1
+        order_map.setdefault(code, 10000 + row_idx)  # 沒 SORT 就用表格序
 
         tr = a.find_parent("tr")
         if not tr:
@@ -462,13 +469,12 @@ def extract_area_meta_from_000(html: str) -> Tuple[Dict[str, str], Dict[str, str
                 if nums and code not in qty_map:
                     qty_map[code] = nums[-1]
 
-    return name_map, status_map, qty_map
+    return name_map, status_map, qty_map, order_map
 
 def _parse_livemap_text(txt: str) -> Tuple[Dict[str, int], int]:
     """只認 data-left / 關鍵字『剩餘|尚餘|可售|可購』或『(\d+) 張』；同一區取最大值。"""
     sections: Dict[str, int] = {}
     for tag in _RE_AREA_TAG.findall(txt):
-        # 抓區代碼
         code = None
         m = re.search(
             r"javascript:Send\([^)]*'(?P<perf>B0[0-9A-Z]{6,10})'\s*,\s*'(?P<area>B0[0-9A-Z]{6,10})'",
@@ -481,13 +487,11 @@ def _parse_livemap_text(txt: str) -> Tuple[Dict[str, int], int]:
         if not code:
             continue
 
-        # 1) data-* 的明確數值
         qty = None
         m = re.search(r'\bdata-(?:left|remain|qty|count)=["\']?(\d{1,3})["\']?', tag, re.I)
         if m:
             qty = int(m.group(1))
 
-        # 2) title/alt/aria-label 的文案（需含關鍵詞或「(\d+)張」）
         if qty is None:
             text = ""
             m = re.search(r'title="([^"]*)"', tag, re.I)
@@ -502,11 +506,9 @@ def _parse_livemap_text(txt: str) -> Tuple[Dict[str, int], int]:
                 if m:
                     qty = int(m.group(1))
 
-        # 濾錯：大於 500 多半是誤抓；或沒有數字就略過
         if not qty or qty <= 0 or qty > 500:
             continue
 
-        # 同一區多個 shape：取最大值避免灌水
         prev = sections.get(code)
         if prev is None or qty > prev:
             sections[code] = qty
@@ -540,7 +542,7 @@ def try_fetch_livemap_by_perf(perf_id: str, sess: requests.Session, html: Option
                 app.logger.info(f"[livemap] miss {url}: {e}")
     return {}, 0
 
-# （可選）進第二步票區頁補抓數字：預設不啟用（FOLLOW_AREAS_PER_CHECK=0）
+# （可選）進第二步票區頁補抓數字
 def fetch_area_left_from_utk0101(base_000_url: str, perf_id: str, product_id: str, area_id: str, sess: requests.Session) -> Optional[int]:
     try:
         url = "https://orders.ibon.com.tw/Application/UTK01/UTK0101_02.aspx"
@@ -626,8 +628,8 @@ def parse_UTK0201_000(url: str, sess: requests.Session) -> dict:
     out["place"] = details_info.get("place") or api_info.get("place") or html_place or "（未取到場地）"
     out["date"]  = details_info.get("dt")    or api_info.get("dt")    or html_dt    or "（未取到日期）"
 
-    # 票區中文名 + 狀態（AMOUNT）
-    area_name_map, area_status_map, area_qty_map = extract_area_meta_from_000(html)
+    # 票區中文名 + 狀態（AMOUNT）+ 順序
+    area_name_map, area_status_map, area_qty_map, area_order_map = extract_area_meta_from_000(html)
     out["area_names"] = area_name_map
 
     # live.map 數字（僅取可信數字，且同區取最大值）
@@ -663,14 +665,22 @@ def parse_UTK0201_000(url: str, sess: requests.Session) -> dict:
     for code, n in numeric_counts.items():
         name = area_name_map.get(code, code)
         v = int(n)
-        # 同名取最大值避免重複 shape/多代碼灌水
         human_numeric[name] = max(human_numeric.get(name, 0), v)
 
-    selling_names = sorted({area_name_map.get(code, code) for code in selling_unknown_codes})
+    # 順序：依網站順序（SORT 或表格列序）
+    def order_key(name: str) -> tuple:
+        # 反查代碼 → 若多個代碼同名，取其中最小 order
+        codes = [c for c, nm in area_name_map.items() if nm == name]
+        order_vals = [area_order_map.get(c, 99999) for c in codes] or [99999]
+        return (min(order_vals), name)
+
+    ordered_names = sorted(human_numeric.keys(), key=order_key)
+    selling_names = sorted({area_name_map.get(code, code) for code in selling_unknown_codes}, key=order_key)
 
     total_num = sum(human_numeric.values())
 
     out["sections"] = human_numeric
+    out["sections_order"] = ordered_names
     out["selling"] = selling_names
     out["total"] = total_num
     out["ok"] = (total_num > 0) or bool(selling_names)
@@ -683,8 +693,8 @@ def parse_UTK0201_000(url: str, sess: requests.Session) -> dict:
                  ""]
         if total_num > 0:
             lines.append("✅ 監看結果：目前可售")
-            for k, v in sorted(human_numeric.items(), key=lambda x: (-x[1], x[0])):
-                lines.append(f"{k}: {v} 張")
+            for name in ordered_names:
+                lines.append(f"{name}: {human_numeric[name]} 張")
             lines.append(f"合計：{total_num} 張")
         if selling_names:
             if total_num > 0:
@@ -820,16 +830,27 @@ def fs_disable(chat_id: str, tid: str) -> bool:
     return True
 
 def fmt_result_text(res: dict) -> str:
-    lines = [f"🎫 {res.get('title','')}".strip(),
-             f"地點：{res.get('place','')}",
-             f"日期：{res.get('date','')}"]
+    lines = []
+    if res.get("task_id"):
+        lines.append(f"任務代碼：{res['task_id']}")
+    lines += [
+        f"🎫 {res.get('title','')}".strip(),
+        f"地點：{res.get('place','')}",
+        f"日期：{res.get('date','')}",
+    ]
     if res.get("ok"):
         secs = res.get("sections", {})
+        order = res.get("sections_order") or []
         selling = res.get("selling", [])
         if secs:
             lines.append("\n✅ 監看結果：目前可售")
-            for k, v in sorted(secs.items(), key=lambda x: (-x[1], x[0])):
-                lines.append(f"{k}: {v} 張")
+            if order:
+                for name in order:
+                    if name in secs:
+                        lines.append(f"{name}: {secs[name]} 張")
+            else:
+                for k, v in sorted(secs.items(), key=lambda x: (-x[1], x[0])):
+                    lines.append(f"{k}: {v} 張")
             lines.append(f"合計：{res.get('total',0)} 張")
         if selling:
             lines.append("\n🟢 目前熱賣中（數量未公開）：")
@@ -911,6 +932,7 @@ def handle_command(text: str, chat_id: str):
 
         if cmd == "/check" and len(parts) >= 2:
             target = parts[1].strip()
+            tid_for_msg = None
             if target.lower().startswith("http"):
                 url = target
             else:
@@ -919,19 +941,22 @@ def handle_command(text: str, chat_id: str):
                     msg = "找不到該任務 ID"
                     return [TextSendMessage(text=msg)] if HAS_LINE else [msg]
                 url = doc.to_dict().get("url")
+                tid_for_msg = target
 
             res = probe(url)
+            if tid_for_msg:
+                res["task_id"] = tid_for_msg
 
             if HAS_LINE:
                 msgs = []
                 sent = set()
-                img = res.get("image")
                 sm  = res.get("seatmap")
-                if img and _url_ok(img):
-                    msgs.append(ImageSendMessage(original_content_url=img, preview_image_url=img))
-                    sent.add(img)
-                if sm and _url_ok(sm) and sm not in sent:
+                img = res.get("image")
+                if sm and _url_ok(sm):
                     msgs.append(ImageSendMessage(original_content_url=sm, preview_image_url=sm))
+                    sent.add(sm)
+                if img and _url_ok(img) and img not in sent:
+                    msgs.append(ImageSendMessage(original_content_url=img, preview_image_url=img))
                 msgs.append(TextSendMessage(text=fmt_result_text(res)))
                 return msgs
             else:
@@ -1033,17 +1058,21 @@ def cron_tick():
             changed = (res.get("sig", "NA") != r.get("last_sig", ""))
             if ALWAYS_NOTIFY or changed:
                 try:
-                    text_out = fmt_result_text(res)
-                    img = res.get("image", "")
-                    seatmap = res.get("seatmap")
+                    # 將任務代碼塞進文字
+                    res["task_id"] = r.get("id")
+
                     chat_id = r.get("chat_id")
                     sent = set()
-                    if img and _url_ok(img):
+                    sm = res.get("seatmap")
+                    img = res.get("image")
+
+                    # 先座位圖、再宣傳圖，並去重
+                    if sm and _url_ok(sm):
+                        send_image(chat_id, sm); sent.add(sm)
+                    if img and _url_ok(img) and img not in sent:
                         send_image(chat_id, img)
-                        sent.add(img)
-                    if seatmap and _url_ok(seatmap) and seatmap not in sent:
-                        send_image(chat_id, seatmap)
-                    send_text(chat_id, text_out)
+
+                    send_text(chat_id, fmt_result_text(res))
                 except Exception as e:
                     app.logger.error(f"[tick] notify error: {e}")
                     resp["errors"].append(f"notify error: {e}")
