@@ -48,8 +48,8 @@ if not LINE_CHANNEL_ACCESS_TOKEN or not LINE_CHANNEL_SECRET:
 line_bot_api = LineBotApi(LINE_CHANNEL_ACCESS_TOKEN) if (HAS_LINE and LINE_CHANNEL_ACCESS_TOKEN) else None
 handler = WebhookHandler(LINE_CHANNEL_SECRET) if (HAS_LINE and LINE_CHANNEL_SECRET) else None
 
-MAX_PER_TICK = int(os.getenv("MAX_PER_TICK", "6"))                     # 每次最多處理幾個任務
-TICK_SOFT_DEADLINE_SEC = int(os.getenv("TICK_SOFT_DEADLINE_SEC", "50"))  # 軟性截止(秒)
+MAX_PER_TICK = int(os.getenv("MAX_PER_TICK", "6"))
+TICK_SOFT_DEADLINE_SEC = int(os.getenv("TICK_SOFT_DEADLINE_SEC", "50"))
 
 # Firestore client
 try:
@@ -67,24 +67,18 @@ UA = (
     "(KHTML, like Gecko) Chrome/122.0 Safari/537.36"
 )
 
-_RE_DATE = re.compile(r"(\d{4}/\d{2}/\d{2}\s+\d{2}:\d{2})")
+_RE_DATE = re.compile(r"(\d{4}/\d{2}/\d{2})\s+(\d{2}:\d{2})")
 _RE_AREA_TAG = re.compile(r"<area\b[^>]*>", re.I)
 
 LOGO = "https://ticketimg2.azureedge.net/logo.png"
-
-# ibon 官方 API（活動資訊）
 TICKET_API = "https://ticketapi.ibon.com.tw/api/ActivityInfo/GetGameInfoList"
 
 # ================= 小工具 =================
 def soup_parse(html: str) -> BeautifulSoup:
-    """優先用 lxml，沒有再退回 html.parser。"""
     try:
         return BeautifulSoup(html, "lxml")
     except Exception:
         return BeautifulSoup(html, "html.parser")
-
-def now_ts() -> float:
-    return time.time()
 
 def hash_sections(d: dict) -> str:
     items = sorted((k, int(v)) for k, v in d.items())
@@ -132,20 +126,18 @@ def sess_default() -> requests.Session:
     })
     return s
 
-# ---------- API 活動資訊 ----------
+# ---------- 活動資訊與圖片 ----------
 def _first_http_url(s: str) -> Optional[str]:
     m = re.search(r'https?://[^\s"\'<>]+', str(s))
     return m.group(0) if m else None
 
 def _deep_pick_activity_info(data: Any) -> Dict[str, str]:
-    """很耐髒的遞迴蒐集器：從 API 回傳 JSON 裡抓常見鍵名。"""
     out: Dict[str, Optional[str]] = {"title": None, "place": None, "dt": None, "poster": None}
-
     def walk(x):
         if isinstance(x, dict):
             for k, v in x.items():
                 kl = str(k).lower()
-                if not out["title"] and any(t in kl for t in ("activityname","gamename","title","actname","activity_title")):
+                if not out["title"] and any(t in kl for t in ("activityname","gamename","title","actname","activity_title","name")):
                     if isinstance(v, str) and v.strip(): out["title"] = v.strip()
                 if not out["place"] and any(t in kl for t in ("placename","venue","place","site","location")):
                     if isinstance(v, str) and v.strip(): out["place"] = v.strip()
@@ -154,19 +146,21 @@ def _deep_pick_activity_info(data: Any) -> Dict[str, str]:
                     m = re.search(r"(\d{4})[-/](\d{1,2})[-/](\d{1,2})[\sT]+(\d{1,2}):(\d{2})", s)
                     if m:
                         out["dt"] = f"{int(m.group(1))}/{int(m.group(2)):02d}/{int(m.group(3)):02d} {int(m.group(4)):02d}:{m.group(5)}"
-                if not out["poster"] and "image" in kl:
+                if not out["poster"] and ("image" in kl or "poster" in kl):
                     url = _first_http_url(v) if isinstance(v, str) else None
                     if url: out["poster"] = url
             for v in x.values(): walk(v)
         elif isinstance(x, list):
             for it in x: walk(it)
-
     walk(data)
     return {k: v for k, v in out.items() if v}
 
-def find_activity_image(html: str) -> Optional[str]:
-    """從整頁字串直接撈 ActivityImage 的宣傳圖（有時不在 <img> 或 meta 裡）。"""
-    m = re.search(r"https?://[^\"'<>]+/image/ActivityImage/[^\s\"'<>]+\.(?:jpg|jpeg|png)", html, flags=re.I)
+def find_activity_image_any(html_or_json: str) -> Optional[str]:
+    # 1) ActivityImage（最優先）
+    m = re.search(r"https?://[^\"'<>]+/image/ActivityImage/[^\s\"'<>]+\.(?:jpg|jpeg|png)", html_or_json, flags=re.I)
+    if m: return m.group(0)
+    # 2) 其他 ticketimg2 圖片
+    m = re.search(r"https?://ticketimg2\.azureedge\.net/[^\s\"'<>]+\.(?:jpg|jpeg|png)", html_or_json, flags=re.I)
     return m.group(0) if m else None
 
 def fetch_game_info_from_api(perf_id: Optional[str], product_id: Optional[str], referer_url: str, sess: requests.Session) -> Dict[str, str]:
@@ -200,38 +194,30 @@ def fetch_game_info_from_api(perf_id: Optional[str], product_id: Optional[str], 
             if r.status_code != 200:
                 continue
             data = r.json()
-
             info = _deep_pick_activity_info(data)
 
-            # 若回傳為清單，盡量找包含 perf/product id 的那筆
+            # 嘗試從列表找包含 perf/product id 的那一筆
             def match_obj(obj):
                 s = json.dumps(obj, ensure_ascii=False)
                 ok = True
-                if perf_id:
-                    ok = ok and (perf_id in s)
-                if product_id:
-                    ok = ok and (product_id in s)
+                if perf_id: ok = ok and (perf_id in s)
+                if product_id: ok = ok and (product_id in s)
                 return ok
-
             if isinstance(data, list):
                 for it in data:
-                    if match_obj(it):
-                        info.update(_deep_pick_activity_info(it))
-                        break
+                    if match_obj(it): info.update(_deep_pick_activity_info(it)); break
             elif isinstance(data, dict):
                 for v in data.values():
                     if isinstance(v, list):
                         for it in v:
-                            if match_obj(it):
-                                info.update(_deep_pick_activity_info(it))
-                                break
+                            if match_obj(it): info.update(_deep_pick_activity_info(it)); break
+
+            # 宣傳圖：JSON 裡找不到就從 JSON 字串再掃一次
+            if not info.get("poster"):
+                promo = find_activity_image_any(json.dumps(data, ensure_ascii=False))
+                if promo: info["poster"] = promo
 
             if info:
-                # 宣傳圖優先選 ActivityImage
-                if info.get("poster") and "ActivityImage" not in info["poster"]:
-                    promo = find_activity_image(json.dumps(data, ensure_ascii=False))
-                    if promo:
-                        info["poster"] = promo
                 wanted = info
                 break
         except Exception as e:
@@ -239,9 +225,7 @@ def fetch_game_info_from_api(perf_id: Optional[str], product_id: Optional[str], 
             continue
     return wanted
 
-# ============= ibon 解析 =============
 def pick_event_images_from_000(html: str, base_url: str) -> Tuple[str, Optional[str]]:
-    """回傳 (poster, seatmap)。poster 優先 ActivityImage/azureedge；seatmap 尋找 static_bigmap。"""
     poster = LOGO
     seatmap = None
     try:
@@ -256,43 +240,74 @@ def pick_event_images_from_000(html: str, base_url: str) -> Tuple[str, Optional[
             m = re.search(r'https?://[^\s"\'<>]+static_bigmap[^\s"\'<>]+?\.(?:jpg|jpeg|png)', html, flags=re.I)
             if m: seatmap = m.group(0)
 
-        # poster（og: / twitter:）
-        for sel in ['meta[property="og:image"]', 'meta[name="twitter:image"]']:
-            m = soup.select_one(sel)
-            if m and m.get("content"):
-                poster = urljoin(base_url, m["content"]); break
+        # 宣傳圖（先掃全文 ActivityImage）
+        promo = find_activity_image_any(html)
+        if promo:
+            poster = promo
+        else:
+            # 再退回 og/twitter image
+            for sel in ['meta[property="og:image"]', 'meta[name="twitter:image"]']:
+                m = soup.select_one(sel)
+                if m and m.get("content"):
+                    poster = urljoin(base_url, m["content"]); break
 
-        # 次選：頁面上的 ActivityImage/azureedge
-        if poster == LOGO:
-            for img in soup.find_all("img"):
-                src = (img.get("src") or "").strip()
-                if src and any(k in src.lower() for k in ("activityimage","azureedge")):
-                    poster = urljoin(base_url, src); break
-
-        # 最後：挑最大 img
-        if poster == LOGO:
-            best = None; best_area = -1
-            for img in soup.find_all("img"):
-                src = (img.get("src") or "").strip()
-                if not src: continue
-                w = int(img.get("width") or 0) or 0
-                h = int(img.get("height") or 0) or 0
-                area = w*h
-                if area > best_area:
-                    best = src; best_area = area
-            if best: poster = urljoin(base_url, best)
+            # 次選：頁面上的 img
+            if poster == LOGO:
+                for img in soup.find_all("img"):
+                    src = (img.get("src") or "").strip()
+                    if src and any(k in src.lower() for k in ("activityimage","azureedge")):
+                        poster = urljoin(base_url, src); break
     except Exception as e:
         app.logger.warning(f"[image] pick failed: {e}")
     return poster, seatmap
 
+def extract_title_place_from_html(html: str) -> Tuple[Optional[str], Optional[str], Optional[str]]:
+    """從頁面 DOM 近鄰標籤/表格/圖片 alt/title 推斷 (title, place, datetime)"""
+    soup = soup_parse(html)
+
+    # 1) 常見 label 表格：活動名稱 / 場地 / 地點
+    def pick_by_label(labels: List[str]) -> Optional[str]:
+        for lab in labels:
+            node = soup.find(lambda t: t and t.name in ("th","td","span","div","p") and t.get_text(strip=True) == lab)
+            if not node: 
+                # label: 值
+                node = soup.find(lambda t: t and t.name in ("span","div","p") and re.fullmatch(lab, t.get_text(strip=True)))
+            if not node:
+                continue
+            # 同列最後一格
+            tr = node.find_parent("tr")
+            if tr:
+                tds = tr.find_all(["td","th"])
+                if len(tds) >= 2:
+                    val = tds[-1].get_text(" ", strip=True)
+                    if val: return val
+            # 下一個兄弟節點
+            sib = node.find_next_sibling()
+            if sib:
+                val = sib.get_text(" ", strip=True)
+                if val: return val
+        return None
+
+    title = pick_by_label(["活動名稱","演出名稱","節目名稱","場次名稱","活動主題"])
+    place = pick_by_label(["場地","地點","演出地點","地區"])
+
+    # 2) 圖片 alt/title 有時含完整名稱
+    if not title:
+        for img in soup.find_all("img"):
+            alt = (img.get("alt") or img.get("title") or "").strip()
+            if alt and len(alt) >= 8:
+                title = alt; break
+
+    # 3) 時間：yyyy/MM/dd HH:mm
+    dt_text = None
+    m = _RE_DATE.search(html)
+    if m:
+        dt_text = f"{m.group(1)} {m.group(2)}"
+
+    return title, place, dt_text
+
+# ============= 票區與 live.map 解析 =============
 def extract_area_name_map_from_000(html: str) -> dict:
-    """
-    從 000 頁面抽 {票區代碼 -> 區域中文名}。
-    來源：
-      1) script 的 const jsonData = ' [...] '（最可靠）
-      2) a[href*=PERFORMANCE_PRICE_AREA_ID=...]
-      3) 頁面全文近鄰（B0… 附近含「樓/區/包廂」）
-    """
     name_map: Dict[str, str] = {}
     soup = soup_parse(html)
 
@@ -346,11 +361,10 @@ def extract_area_name_map_from_000(html: str) -> dict:
     return name_map
 
 def _parse_livemap_text(txt: str) -> Tuple[Dict[str, int], int]:
-    """解析 azureedge live.map，回傳 {票區代碼: 張數}, total。避免把 PerfId 當成區代碼。"""
     sections: Dict[str, int] = {}
     total = 0
     for tag in _RE_AREA_TAG.findall(txt):
-        # 1) 優先從 javascript:Send('PERF','AREA','qty') 取「第二個」參數 → AreaId
+        # 取第二參數的 AreaId，避免誤用 PerfId
         code = None
         m = re.search(
             r"javascript:Send\([^)]*'(?P<perf>B0[0-9A-Z]{6,10})'\s*,\s*'(?P<area>B0[0-9A-Z]{6,10})'\s*,\s*'(\d+)'",
@@ -358,19 +372,15 @@ def _parse_livemap_text(txt: str) -> Tuple[Dict[str, int], int]:
         if m:
             code = m.group("area")
         else:
-            # 2) 退而求其次：同一個 tag 內若有多個 B0…，通常最後一個是 AreaId
             codes = re.findall(r"\b(B0[0-9A-Z]{6,10})\b", tag)
-            if codes:
-                code = codes[-1]
+            if codes: code = codes[-1]
 
-        # 數量
         qty = None
         m_title = re.search(r'title="([^"]*)"', tag, re.I)
         title_text = m_title.group(1) if m_title else ""
         nums = [int(n) for n in re.findall(r"(\d+)", title_text)]
         for n in reversed(nums):
-            if n < 1000:
-                qty = n; break
+            if n < 1000: qty = n; break
         if qty is None:
             m = re.search(r'\bdata-(?:left|remain|qty|count)=["\']?(\d+)["\']?', tag, re.I)
             if m: qty = int(m.group(1))
@@ -384,27 +394,20 @@ def _parse_livemap_text(txt: str) -> Tuple[Dict[str, int], int]:
     return sections, total
 
 def try_fetch_livemap_by_perf(perf_id: str, sess: requests.Session, html: Optional[str] = None) -> Tuple[Dict[str, int], int]:
-    """從多個可能路徑猜 live.map；若頁面有 static_bigmap，則優先用其資料夾。"""
     if not perf_id:
         return {}, 0
-
     bases = [f"https://qwareticket-asysimg.azureedge.net/QWARE_TICKET/images/Temp/{perf_id}/"]
-
-    # 由 static_bigmap 反推 images/UTKxxxx/
     if html:
         poster, seatmap = pick_event_images_from_000(html, "https://orders.ibon.com.tw/")
         if seatmap:
             m = re.match(r'(https?://.*/images/[^/]+/)', seatmap)
-            if m:
-                bases.insert(0, m.group(1))  # 優先用這個
-
+            if m: bases.insert(0, m.group(1))
     prefixes = ["", "1_", "2_", "3_", "01_", "02_", "03_"]
     tried = set()
     for base in bases:
         for pref in prefixes:
             url = f"{base}{pref}{perf_id}_live.map"
-            if url in tried:
-                continue
+            if url in tried: continue
             tried.add(url)
             try:
                 app.logger.info(f"[livemap] try {url}")
@@ -416,14 +419,12 @@ def try_fetch_livemap_by_perf(perf_id: str, sess: requests.Session, html: Option
                 app.logger.info(f"[livemap] miss {url}: {e}")
     return {}, 0
 
-# --------- 輔助：從文字/script 粗略解析數量（做為 live.map 的備援） ---------
+# --------- 備援解析 ---------
 def _parse_counts_from_text(full_text: str) -> Dict[str, int]:
-    """從整頁純文字找 (B0... , 數字) 的配對；數字後面常見 '張'。"""
     counts: Dict[str, int] = {}
     for m in re.finditer(r"(B0[0-9A-Z]{6,10}).{0,40}?(\d{1,3})\s*張", full_text):
         code, qty = m.group(1), int(m.group(2))
-        if qty > 0:
-            counts[code] = counts.get(code, 0) + qty
+        if qty > 0: counts[code] = counts.get(code, 0) + qty
     return counts
 
 def _parse_counts_from_scripts(soup: BeautifulSoup) -> Dict[str, int]:
@@ -432,16 +433,10 @@ def _parse_counts_from_scripts(soup: BeautifulSoup) -> Dict[str, int]:
         s = (sc.string or sc.text or "")
         for m in re.finditer(r"(B0[0-9A-Z]{6,10})[^0-9]{0,40}?(\d{1,3})\s*張", s):
             code, qty = m.group(1), int(m.group(2))
-            if qty > 0:
-                counts[code] = counts.get(code, 0) + qty
+            if qty > 0: counts[code] = counts.get(code, 0) + qty
     return counts
 
 def map_counts_to_zones(counts: Dict[str, int], area_name_map: Dict[str, str]) -> Tuple[List[Tuple[str,str,int]], List[Tuple[str,int]]]:
-    """
-    把 {code/name: qty} 分成兩群：
-    - matched: [(中文名, code, qty)]
-    - unmatched: [(code_or_name, qty)]
-    """
     matched: List[Tuple[str,str,int]] = []
     unmatched: List[Tuple[str,int]] = []
     for k, v in counts.items():
@@ -450,11 +445,10 @@ def map_counts_to_zones(counts: Dict[str, int], area_name_map: Dict[str, str]) -
         elif re.fullmatch(r"B0[0-9A-Z]{6,10}", k) and k not in area_name_map:
             unmatched.append((k, int(v)))
         else:
-            # k 本身就是中文名
             matched.append((k, k, int(v)))
     return matched, unmatched
 
-# --------- Playwright 動態備援（可選） ---------
+# --------- Playwright（可選） ---------
 def _try_dynamic_counts(event_url: str, timeout_sec: int = 20) -> Dict[str, int]:
     counts: Dict[str, int] = {}
     try:
@@ -462,45 +456,30 @@ def _try_dynamic_counts(event_url: str, timeout_sec: int = 20) -> Dict[str, int]
     except Exception as e:
         app.logger.info(f"[dyn] playwright not installed: {e}")
         return counts
-
     try:
         with sync_playwright() as p:
             browser = p.chromium.launch(headless=True, args=["--no-sandbox", "--disable-setuid-sandbox"])
             ctx = browser.new_context(user_agent=UA, locale="zh-TW", java_script_enabled=True)
             page = ctx.new_page()
-
             live_map_text = {"txt": ""}
-
             def on_response(resp):
                 try:
                     u = resp.url
                     if re.search(r"_live\.map$", u):
                         t = resp.text()
-                        if "<area" in t:
-                            live_map_text["txt"] = t
-                except Exception:
-                    pass
-
+                        if "<area" in t: live_map_text["txt"] = t
+                except Exception: pass
             page.on("response", on_response)
             page.goto(event_url, wait_until="networkidle", timeout=timeout_sec * 1000)
             time.sleep(1.0)
-
-            # 若攔到 live.map，直接解析
             if live_map_text["txt"]:
                 secs, total = _parse_livemap_text(live_map_text["txt"])
-                if total > 0:
-                    counts.update(secs)
-                    ctx.close(); browser.close()
-                    return counts
-
-            # 否則用頁面文字備援
+                if total > 0: counts.update(secs); ctx.close(); browser.close(); return counts
             html = page.content()
             soup = soup_parse(html)
             c = _parse_counts_from_text(soup.get_text("\n", strip=True)) or _parse_counts_from_scripts(soup)
             counts.update(c)
-
-            ctx.close()
-            browser.close()
+            ctx.close(); browser.close()
     except Exception as e:
         app.logger.info(f"[dyn] fail: {e}")
     return counts
@@ -519,58 +498,36 @@ def parse_UTK0201_000(url: str, sess: requests.Session) -> dict:
     perf_id = (q.get("PERFORMANCE_ID") or [None])[0]
     product_id = (q.get("PRODUCT_ID") or [None])[0]
 
-    # 圖片：座位圖 + 主宣傳圖（若頁面字串找到 ActivityImage，優先用）
+    # 圖片（宣傳圖 + 座位圖）
     poster, seatmap = pick_event_images_from_000(html, url)
-    promo = find_activity_image(html)
-    if promo:
-        poster = promo
     if seatmap: out["seatmap"] = seatmap
     out["image"] = poster or LOGO
 
-    # 先打 API 拿標題/場地/時間/宣傳圖
+    # API 優先
     api_info: Dict[str, str] = {}
     try:
         api_info = fetch_game_info_from_api(perf_id, product_id, url, sess)
     except Exception as e:
         app.logger.info(f"[api] fail: {e}")
 
-    # 標題
-    title = api_info.get("title") or ""
-    if not title:
-        m = soup.select_one("title")
-        if m and m.text.strip(): title = m.text.strip().replace("ibon售票系統","").strip()
-        mt = soup.select_one('meta[property="og:title"]')
-        if not title and mt and mt.get("content"): title = mt["content"].strip()
-    out["title"] = title or "（未取到標題）"
+    # HTML 強化抽取
+    html_title, html_place, html_dt = extract_title_place_from_html(html)
 
-    # 場地
-    place = api_info.get("place") or ""
-    if not place:
-        for lab in ("地點","場地","地區"):
-            node = soup.find(lambda t: t.name in ("th","td","span","div") and t.get_text(strip=True) == lab)
-            if not node: continue
-            tr = node.find_parent("tr")
-            if tr:
-                tds = tr.find_all("td")
-                if len(tds) >= 2:
-                    place = tds[-1].get_text(" ", strip=True)
-                    if place: break
-    out["place"] = place or "（未取到場地）"
+    # 標題 / 場地 / 時間
+    out["title"] = api_info.get("title") or html_title or "（未取到標題）"
+    out["place"] = api_info.get("place") or html_place or "（未取到場地）"
+    out["date"]  = api_info.get("dt")    or html_dt    or "（未取到日期）"
 
-    # 日期/時間
-    dt_text = api_info.get("dt") or ""
-    if not dt_text:
-        m = _RE_DATE.search(html)
-        if m: dt_text = re.sub(r"\s+", " ", m.group(1)).strip()
-    out["date"] = dt_text or "（未取到日期）"
+    # API 若有更好的宣傳圖，再覆蓋一次
+    if api_info.get("poster"):
+        out["image"] = api_info["poster"]
 
     # 票區中文名對照
     area_name_map = extract_area_name_map_from_000(html)
     out["area_names"] = area_name_map
 
-    # 票數：live.map → 靜態/腳本 → 動態
+    # 票數
     sections_by_code, total = try_fetch_livemap_by_perf(perf_id, sess, html=html)
-
     counts: Dict[str, int] = {}
     if total <= 0:
         counts = _parse_counts_from_text(soup.get_text("\n", strip=True)) or _parse_counts_from_scripts(soup)
@@ -578,8 +535,7 @@ def parse_UTK0201_000(url: str, sess: requests.Session) -> dict:
         counts = _try_dynamic_counts(url)
 
     if total > 0 or counts:
-        if not counts:
-            counts = sections_by_code  # live.map 命中
+        if not counts: counts = sections_by_code
         matched, unmatched = map_counts_to_zones(counts, area_name_map)
         human: Dict[str, int] = {}
         for name, code, n in matched: human[name] = human.get(name, 0) + int(n)
@@ -607,12 +563,10 @@ def parse_UTK0201_000(url: str, sess: requests.Session) -> dict:
     return out
 
 def probe(url: str) -> dict:
-    """入口：目前只針對 UTK0201_000 處理，其餘網址原樣回報。"""
     s = sess_default()
     p = urlparse(url)
     if "orders.ibon.com.tw" in p.netloc and p.path.upper().endswith("/UTK0201_000.ASPX"):
         return parse_UTK0201_000(url, s)
-    # 其他網址：僅回基本訊息
     r = s.get(url, timeout=12)
     title = ""
     try:
@@ -622,14 +576,8 @@ def probe(url: str) -> dict:
     except Exception:
         pass
     return {
-        "ok": False,
-        "sig": "NA",
-        "url": url,
-        "image": LOGO,
-        "title": title or "（未取到標題）",
-        "place": "",
-        "date": "",
-        "msg": url,
+        "ok": False, "sig": "NA", "url": url, "image": LOGO,
+        "title": title or "（未取到標題）", "place": "", "date": "", "msg": url,
     }
 
 # ============= LINE 指令 =============
@@ -657,8 +605,7 @@ def fs_get_task_by_canon(chat_id: str, url_canon: str):
          .where("chat_id", "==", chat_id)
          .where("url_canon", "==", url_canon)
          .limit(1).stream())
-    for d in q:
-        return d
+    for d in q: return d
     return None
 
 def fs_get_task_by_id(chat_id: str, tid: str):
@@ -667,8 +614,7 @@ def fs_get_task_by_id(chat_id: str, tid: str):
          .where("chat_id", "==", chat_id)
          .where("id", "==", tid)
          .limit(1).stream())
-    for d in q:
-        return d
+    for d in q: return d
     return None
 
 def fs_upsert_watch(chat_id: str, url: str, sec: int):
@@ -680,40 +626,25 @@ def fs_upsert_watch(chat_id: str, url: str, sec: int):
     doc = fs_get_task_by_canon(chat_id, url_c)
     if doc:
         fs_client.collection(COL).document(doc.id).update({
-            "period": sec,
-            "enabled": True,
-            "updated_at": now,
+            "period": sec, "enabled": True, "updated_at": now,
         })
         return doc.to_dict()["id"], False
     tid = make_task_id()
     fs_client.collection(COL).add({
-        "id": tid,
-        "chat_id": chat_id,
-        "url": url,
-        "url_canon": url_c,
-        "period": sec,
-        "enabled": True,
-        "created_at": now,
-        "updated_at": now,
-        "last_sig": "",
-        "last_total": 0,
-        "last_ok": False,
-        "next_run_at": now,
+        "id": tid, "chat_id": chat_id, "url": url, "url_canon": url_c,
+        "period": sec, "enabled": True, "created_at": now, "updated_at": now,
+        "last_sig": "", "last_total": 0, "last_ok": False, "next_run_at": now,
     })
     return tid, True
 
 def fs_list(chat_id: str, show: str = "on"):
-    if not FS_OK:
-        return []
+    if not FS_OK: return []
     q = fs_client.collection(COL).where("chat_id", "==", chat_id)
-    if show == "on":
-        q = q.where("enabled", "==", True)
-    elif show == "off":
-        q = q.where("enabled", "==", False)
+    if show == "on": q = q.where("enabled", "==", True)
+    elif show == "off": q = q.where("enabled", "==", False)
     try:
         cur = q.order_by("updated_at", direction=firestore.Query.DESCENDING).stream()
-    except Exception as e:
-        app.logger.warning(f"[fs_list] order_by fallback: {e}")
+    except Exception:
         cur = q.stream()
     return [d.to_dict() for d in cur]
 
@@ -721,8 +652,7 @@ def fs_disable(chat_id: str, tid: str) -> bool:
     doc = fs_get_task_by_id(chat_id, tid)
     if not doc: return False
     fs_client.collection(COL).document(doc.id).update({
-        "enabled": False,
-        "updated_at": datetime.now(timezone.utc),
+        "enabled": False, "updated_at": datetime.now(timezone.utc),
     })
     return True
 
@@ -732,8 +662,7 @@ def fmt_result_text(res: dict) -> str:
              f"日期：{res.get('date','')}"]
     if res.get("ok"):
         lines.append("\n✅ 監看結果：目前可售")
-        secs = res.get("sections", {})
-        for k, v in sorted(secs.items(), key=lambda x: (-x[1], x[0])):
+        for k, v in sorted(res.get("sections", {}).items(), key=lambda x: (-x[1], x[0])):
             lines.append(f"{k}: {v} 張")
         lines.append(f"合計：{res.get('total',0)} 張")
     else:
@@ -773,8 +702,7 @@ def handle_command(text: str, chat_id: str):
                 return [TextSendMessage(text=out)] if HAS_LINE else [out]
 
             def _chunk(s, n=4500):
-                for i in range(0, len(s), n):
-                    yield s[i:i+n]
+                for i in range(0, len(s), n): yield s[i:i+n]
 
             lines = ["你的任務："]
             for r in rows:
@@ -784,11 +712,8 @@ def handle_command(text: str, chat_id: str):
                 u = r.get("url", "")
                 lines.append(f"{rid}｜{state}｜{period}s\n{u}")
             big = "\n\n".join(lines)
-
-            if HAS_LINE:
-                return [TextSendMessage(text=chunk) for chunk in _chunk(big)]
-            else:
-                return [big]
+            if HAS_LINE: return [TextSendMessage(text=chunk) for chunk in _chunk(big)]
+            else: return [big]
 
         if cmd == "/check" and len(parts) >= 2:
             target = parts[1].strip()
@@ -913,10 +838,8 @@ def cron_tick():
                     img = res.get("image", "")
                     seatmap = res.get("seatmap")
                     chat_id = r.get("chat_id")
-                    if img and img != LOGO:
-                        send_image(chat_id, img)
-                    if seatmap:
-                        send_image(chat_id, seatmap)
+                    if img and img != LOGO: send_image(chat_id, img)
+                    if seatmap: send_image(chat_id, seatmap)
                     send_text(chat_id, text_out)
                 except Exception as e:
                     app.logger.error(f"[tick] notify error: {e}")
@@ -950,7 +873,6 @@ def diag():
 def healthz():
     return "ok", 200
 
-# 方便直接用 GET 測 /check（不經 LINE）
 @app.route("/check", methods=["GET"])
 def http_check_once():
     url = request.args.get("url", "").strip()
