@@ -598,7 +598,12 @@ def parse_UTK0201_000(url: str, sess: requests.Session) -> dict:
     html_title, html_place, html_dt = extract_title_place_from_html(html)
 
     # 可能的 Details 連結（頁面找不到就看環境變數）
-    details_url = find_details_url_in_html(html) or (PROMO_DETAILS_MAP.get(perf_id) if perf_id else None)
+    details_url = (
+       find_details_url_in_html(html)          # 先從 000 頁掃
+       or api_info.get("details")              # 再用 API 自動推
+       or (PROMO_DETAILS_MAP.get(perf_id) if perf_id else None)  # 最後才用手動對照（可留作保險）
+    )
+
     details_info: Dict[str, str] = {}
     if details_url:
         details_info = fetch_from_ticket_details(details_url, sess)
