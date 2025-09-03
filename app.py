@@ -782,53 +782,55 @@ def handle_command(text: str, chat_id: str):
             return [TextSendMessage(text=msg)] if HAS_LINE else [msg]
 
         if cmd == "/list":
-            mode = "on"
-            if len(parts) >= 2 and parts[1].lower() in ("all", "off"):
-                mode = parts[1].lower()
+            try:
+                mode = "on"
+                if len(parts) >= 2 and parts[1].lower() in ("all", "off"):
+                    mode = parts[1].lower()
 
-            rows = fs_list(chat_id, show=mode)
-            if not rows:
-                out = "（沒有任務）"
+                rows = fs_list(chat_id, show=mode)
+                if not rows:
+                    out = "（沒有任務）"
+                    return [TextSendMessage(text=out)] if HAS_LINE else [out]
+
+                # 組字串 + 分段（避免單則訊息超長）
+                chunks = []
+                buf = "你的任務：\n"
+                for r in rows:
+                    try:
+                        rid    = str(r.get("id", "?"))
+                        state  = "啟用" if r.get("enabled") else "停用"
+                        period = str(r.get("period", "?"))
+                        u      = str(r.get("url", ""))
+                        line = f"{rid}｜{state}｜{period}s\n{u}\n\n"
+                    except Exception as e:
+                        app.logger.info(f"[list] format row fail: {e}; row={r}")
+                        line = f"{r}\n\n"
+
+                    if len(buf) + len(line) > 4800:      # 留安全緩衝 < 5000
+                        chunks.append(buf.rstrip())
+                        buf = ""
+                    buf += line
+                if buf:
+                    chunks.append(buf.rstrip())
+
+                if HAS_LINE:
+                    # LINE reply 最多 5 則；多的用 push 送出
+                    to_reply = chunks[:5]
+                    to_push  = chunks[5:]
+                    msgs = [TextSendMessage(text=c) for c in to_reply]
+                    for c in to_push:
+                        try:
+                            send_text(chat_id, c)          # push
+                        except Exception as e:
+                            app.logger.error(f"[list] push remainder failed: {e}")
+                    return msgs
+                else:
+                    return chunks
+
+            except Exception as e:
+                app.logger.error(f"/list failed: {e}\n{traceback.format_exc()}")
+                out = "（讀取任務清單時發生例外）"
                 return [TextSendMessage(text=out)] if HAS_LINE else [out]
-
-            lines = ["你的任務："]
-            for r in rows:
-                rid = r.get("id", "?")
-                state = "啟用" if r.get("enabled") else "停用"
-                period = r.get("period", "?")
-                u = r.get("url", "")
-                lines.append(f"{rid}｜{state}｜{period}s\n{u}")
-            big = "\n\n".join(lines)
-
-            chunks = [big[i:i+4800] for i in range(0, len(big), 4800)]
-            if HAS_LINE:
-                return [TextSendMessage(text=c) for c in chunks]
-            else:
-                return chunks
-
-        if cmd == "/check" and len(parts) >= 2:
-            target = parts[1].strip()
-            if target.lower().startswith("http"):
-                url = target
-            else:
-                doc = fs_get_task_by_id(chat_id, target)
-                if not doc:
-                    msg = "找不到該任務 ID"
-                    return [TextSendMessage(text=msg)] if HAS_LINE else [msg]
-                url = doc.to_dict().get("url")
-            res = probe(url)
-            msgs: List[Any] = []
-            if HAS_LINE:
-                img = res.get("image")
-                if img and _url_ok(img):
-                    msgs.append(ImageSendMessage(original_content_url=img, preview_image_url=img))
-                sm = res.get("seatmap")
-                if sm and _url_ok(sm):
-                    msgs.append(ImageSendMessage(original_content_url=sm, preview_image_url=sm))
-                msgs.append(TextSendMessage(text=fmt_result_text(res)))
-                return msgs
-            else:
-                return [fmt_result_text(res)]
 
         if cmd == "/probe" and len(parts) >= 2:
             url = parts[1].strip()
@@ -930,15 +932,16 @@ def cron_tick():
                     img = res.get("image", "")
                     seatmap = res.get("seatmap")
                     chat_id = r.get("chat_id")
-                    if img and _url_ok(img): send_image(chat_id, img)
-                    if seatmap and _url_ok(seatmap): send_image(chat_id, seatmap)
+                    sent = set()
+                    if img and _url_ok(img):
+                        send_image(chat_id, img)
+                        sent.add(img)
+                    if seatmap and _url_ok(seatmap) and seatmap not in sent:
+                        send_image(chat_id, seatmap)
                     send_text(chat_id, text_out)
                 except Exception as e:
                     app.logger.error(f"[tick] notify error: {e}")
                     resp["errors"].append(f"notify error: {e}")
-
-            handled += 1
-            resp["processed"] += 1
 
         app.logger.info(f"[tick] processed={resp['processed']} skipped={resp['skipped']} "
                         f"errors={len(resp['errors'])} duration={time.time()-start:.1f}s")
