@@ -3,29 +3,36 @@ import os
 import re
 import json
 import time
-import hmac
 import uuid
 import hashlib
 import logging
 import traceback
 from datetime import datetime, timezone, timedelta
-from urllib.parse import urlparse, urlunparse, parse_qs, urlencode, urljoin, quote
+from urllib.parse import urlparse, urlunparse, parse_qs, urlencode, urljoin
 
 import requests
 from flask import Flask, request, abort, jsonify
 
-# LINE SDK
-from linebot import LineBotApi, WebhookHandler
-from linebot.exceptions import InvalidSignatureError
-from linebot.models import MessageEvent, TextMessage, TextSendMessage, ImageSendMessage
+# --------- LINE SDK（可選）---------
+HAS_LINE = True
+try:
+    from linebot import LineBotApi, WebhookHandler
+    from linebot.exceptions import InvalidSignatureError
+    from linebot.models import MessageEvent, TextMessage, TextSendMessage, ImageSendMessage
+except Exception as e:
+    HAS_LINE = False
+    LineBotApi = WebhookHandler = InvalidSignatureError = None
+    MessageEvent = TextMessage = TextSendMessage = ImageSendMessage = None
+    logging.warning(f"[init] line-bot-sdk not available: {e}")
 
-# Firestore (watch list)
+# --------- Firestore（可失敗不致命）---------
 from google.cloud import firestore
 
 # HTML 解析
 from bs4 import BeautifulSoup
 
 app = Flask(__name__)
+logging.basicConfig(level=os.getenv("LOG_LEVEL", "INFO"))
 app.logger.setLevel(logging.INFO)
 
 # ======== 環境變數 ========
@@ -37,13 +44,13 @@ ALWAYS_NOTIFY = os.getenv("ALWAYS_NOTIFY", "0") == "1"
 if not LINE_CHANNEL_ACCESS_TOKEN or not LINE_CHANNEL_SECRET:
     app.logger.warning("LINE env not set: LINE_CHANNEL_ACCESS_TOKEN / LINE_CHANNEL_SECRET")
 
-line_bot_api = LineBotApi(LINE_CHANNEL_ACCESS_TOKEN) if LINE_CHANNEL_ACCESS_TOKEN else None
-handler = WebhookHandler(LINE_CHANNEL_SECRET) if LINE_CHANNEL_SECRET else None
+line_bot_api = LineBotApi(LINE_CHANNEL_ACCESS_TOKEN) if (HAS_LINE and LINE_CHANNEL_ACCESS_TOKEN) else None
+handler = WebhookHandler(LINE_CHANNEL_SECRET) if (HAS_LINE and LINE_CHANNEL_SECRET) else None
 
-MAX_PER_TICK = int(os.getenv("MAX_PER_TICK", "6"))          # 每次最多處理幾個任務
+MAX_PER_TICK = int(os.getenv("MAX_PER_TICK", "6"))                     # 每次最多處理幾個任務
 TICK_SOFT_DEADLINE_SEC = int(os.getenv("TICK_SOFT_DEADLINE_SEC", "50"))  # 軟性截止(秒)
 
-# Firestore
+# Firestore client
 try:
     fs_client = firestore.Client()
     FS_OK = True
@@ -65,6 +72,13 @@ _RE_AREA_TAG = re.compile(r"<area\b[^>]*>", re.I)
 LOGO = "https://ticketimg2.azureedge.net/logo.png"
 
 # ================= 小工具 =================
+def soup_parse(html: str) -> BeautifulSoup:
+    """優先用 lxml，沒有再退回 html.parser。"""
+    try:
+        return BeautifulSoup(html, "lxml")
+    except Exception:
+        return BeautifulSoup(html, "html.parser")
+
 def now_ts() -> float:
     return time.time()
 
@@ -74,7 +88,6 @@ def hash_sections(d: dict) -> str:
     return hashlib.md5(raw.encode("utf-8")).hexdigest()
 
 def canonicalize_url(u: str) -> str:
-    """排序 query 參數，去掉無用空白，確保同一網址不會重複建任務。"""
     p = urlparse(u.strip())
     q = parse_qs(p.query, keep_blank_values=True)
     q_sorted = []
@@ -82,23 +95,28 @@ def canonicalize_url(u: str) -> str:
         for v in q[k]:
             q_sorted.append((k, v))
     new_q = urlencode(q_sorted, doseq=True)
-    canon = urlunparse((p.scheme, p.netloc, p.path, "", new_q, ""))
-    return canon
+    return urlunparse((p.scheme, p.netloc, p.path, "", new_q, ""))
 
 def send_text(to_id: str, text: str):
     if not line_bot_api:
         app.logger.info(f"[dry-run] send_text to {to_id}: {text}")
         return
-    line_bot_api.push_message(to_id, TextSendMessage(text=text))
+    try:
+        line_bot_api.push_message(to_id, TextSendMessage(text=text))
+    except Exception as e:
+        app.logger.error(f"[LINE] push text failed: {e}")
 
 def send_image(to_id: str, img_url: str):
     if not line_bot_api:
         app.logger.info(f"[dry-run] send_image to {to_id}: {img_url}")
         return
-    line_bot_api.push_message(
-        to_id,
-        ImageSendMessage(original_content_url=img_url, preview_image_url=img_url)
-    )
+    try:
+        line_bot_api.push_message(
+            to_id,
+            ImageSendMessage(original_content_url=img_url, preview_image_url=img_url)
+        )
+    except Exception as e:
+        app.logger.error(f"[LINE] push image failed: {e}")
 
 def sess_default() -> requests.Session:
     s = requests.Session()
@@ -111,11 +129,10 @@ def sess_default() -> requests.Session:
     return s
 
 # ============= ibon 解析 =============
-
 def pick_event_image_from_000(html: str, base_url: str) -> str:
     """從 000 頁面挑一張活動圖：og:image / twitter:image / 內嵌含 azureedge | ActivityImage | static_bigmap"""
     try:
-        soup = BeautifulSoup(html, "html.parser")
+        soup = soup_parse(html)
         for sel in ['meta[property="og:image"]', 'meta[name="twitter:image"]']:
             m = soup.select_one(sel)
             if m and m.get("content"):
@@ -139,13 +156,10 @@ def pick_event_image_from_000(html: str, base_url: str) -> str:
     return LOGO
 
 def extract_area_name_map_from_000(html: str) -> dict:
-    """
-    從 UTK0201_000 表格抽 {區代碼: 中文名稱}。
-    例如 {'B09P2J33': '5樓B區3800', 'B09P1JW8': '6樓包廂C區3200'}
-    """
+    """從 UTK0201_000 表格抽 {區代碼: 中文名稱}。"""
     name_map = {}
     try:
-        soup = BeautifulSoup(html, "html.parser")
+        soup = soup_parse(html)
         for a in soup.select('a[href*="PERFORMANCE_PRICE_AREA_ID="]'):
             href = a.get("href", "")
             m = re.search(r'PERFORMANCE_PRICE_AREA_ID=([A-Za-z0-9]+)', href)
@@ -164,7 +178,6 @@ def extract_area_name_map_from_000(html: str) -> dict:
                 cand_text = pick or (tds[0] if tds else "")
             else:
                 cand_text = a.get_text(strip=True) or a.get("title", "")
-
             cand_text = re.sub(r"\s+", "", cand_text)
             if cand_text:
                 name_map[code] = cand_text
@@ -173,11 +186,7 @@ def extract_area_name_map_from_000(html: str) -> dict:
     return name_map
 
 def _parse_livemap_text(txt: str):
-    """
-    解析 azureedge live.map：
-    - 名稱：先用 href 內的 PERFORMANCE_PRICE_AREA_ID 代碼
-    - 張數：取 title 內「最後一個 <1000 的數字」（避開 5800/4800/3800/3200 價格）
-    """
+    """解析 azureedge live.map。"""
     sections = {}
     total = 0
     for tag in _RE_AREA_TAG.findall(txt):
@@ -189,7 +198,7 @@ def _parse_livemap_text(txt: str):
         if m_href:
             name = m_href.group(2)
 
-        # 數量：title 內最後一個 <1000 的數字
+        # 數量：title 內最後一個 <1000 的數字（避開 5800/4800...）
         qty = None
         m_title = re.search(r'title="([^"]*)"', tag, re.I)
         title_text = m_title.group(1) if m_title else ""
@@ -236,7 +245,7 @@ def try_fetch_livemap_by_perf(perf_id: str, sess: requests.Session):
     return {}, 0
 
 def parse_UTK0201_000(url: str, sess: requests.Session) -> dict:
-    """解析 ibon 的 000 頁，抓標題/地點/日期/活動圖 + 試著拿 live.map 票數，並把代碼映射為中文名稱。"""
+    """解析 000 頁，抓標題/地點/日期/活動圖 + 試著拿 live.map 票數，並把代碼映射為中文名稱。"""
     out = {"ok": False, "sig": "NA", "url": url, "image": LOGO}
     r = sess.get(url, timeout=15)
     if r.status_code != 200:
@@ -249,7 +258,7 @@ def parse_UTK0201_000(url: str, sess: requests.Session) -> dict:
     place = ""
     date_str = ""
     try:
-        soup = BeautifulSoup(html, "html.parser")
+        soup = soup_parse(html)
         # 標題
         m = soup.select_one("title")
         if m and m.text.strip():
@@ -259,9 +268,8 @@ def parse_UTK0201_000(url: str, sess: requests.Session) -> dict:
             title = mt["content"].strip()
 
         # 地點：找表格或畫面上的「場地 / 地區」欄
-        candidates = soup.find_all(text=re.compile(r"場地|地區"))
+        candidates = soup.find_all(string=re.compile(r"場地|地區"))
         if candidates:
-            # 嘗試抓同一列右側欄位
             for t in candidates:
                 td = getattr(t, "parent", None)
                 if not td:
@@ -333,7 +341,7 @@ def probe(url: str) -> dict:
     r = s.get(url, timeout=12)
     title = ""
     try:
-        soup = BeautifulSoup(r.text, "html.parser")
+        soup = soup_parse(r.text)
         if soup.title and soup.title.text:
             title = soup.title.text.strip()
     except Exception:
@@ -350,7 +358,6 @@ def probe(url: str) -> dict:
     }
 
 # ============= LINE 指令 =============
-
 HELP = (
     "我是票券監看機器人 🤖\n"
     "指令：\n"
@@ -362,9 +369,8 @@ HELP = (
     "/probe <URL> － 回傳診斷 JSON（除錯用）\n"
 )
 
-def source_id(ev: MessageEvent) -> str:
+def source_id(ev):
     src = ev.source
-    # user_id / group_id / room_id 任一
     return getattr(src, "user_id", None) or getattr(src, "group_id", None) or getattr(src, "room_id", None) or ""
 
 def make_task_id() -> str:
@@ -417,7 +423,7 @@ def fs_upsert_watch(chat_id: str, url: str, sec: int):
         "last_sig": "",
         "last_total": 0,
         "last_ok": False,
-        "next_run_at": now,  # 立刻可跑
+        "next_run_at": now,
     })
     return tid, True
 
@@ -459,7 +465,7 @@ def handle_command(text: str, chat_id: str):
         parts = text.strip().split()
         cmd = parts[0].lower()
         if cmd in ("/start", "/help"):
-            return [TextSendMessage(text=HELP)]
+            return [TextSendMessage(text=HELP)] if HAS_LINE else [fmt_result_text({"msg": HELP})]
 
         if cmd == "/watch" and len(parts) >= 2:
             url = parts[1].strip()
@@ -467,11 +473,12 @@ def handle_command(text: str, chat_id: str):
             tid, created = fs_upsert_watch(chat_id, url, sec)
             status = "啟用" if created else "更新"
             msg = f"你的任務：\n{tid}｜{status}｜{sec}s\n{canonicalize_url(url)}"
-            return [TextSendMessage(text=msg)]
+            return [TextSendMessage(text=msg)] if HAS_LINE else [msg]
 
         if cmd == "/unwatch" and len(parts) >= 2:
             ok = fs_disable(chat_id, parts[1].strip())
-            return [TextSendMessage(text="已停用" if ok else "找不到該任務")]
+            msg = "已停用" if ok else "找不到該任務"
+            return [TextSendMessage(text=msg)] if HAS_LINE else [msg]
 
         if cmd == "/list":
             mode = "on"
@@ -481,49 +488,54 @@ def handle_command(text: str, chat_id: str):
                     mode = t
             rows = fs_list(chat_id, show="off" if mode=="off" else ("all" if mode=="all" else "on"))
             if not rows:
-                return [TextSendMessage(text="（沒有任務）")]
-            lines = ["你的任務："]
-            for r in rows:
-                state = "啟用" if r.get("enabled") else "停用"
-                lines.append(f"{r['id']}｜{state}｜{r.get('period')}s\n{r.get('url')}")
-            return [TextSendMessage(text="\n\n".join(lines))]
+                out = "（沒有任務）"
+            else:
+                lines = ["你的任務："]
+                for r in rows:
+                    state = "啟用" if r.get("enabled") else "停用"
+                    lines.append(f"{r['id']}｜{state}｜{r.get('period')}s\n{r.get('url')}")
+                out = "\n\n".join(lines)
+            return [TextSendMessage(text=out)] if HAS_LINE else [out]
 
         if cmd == "/check" and len(parts) >= 2:
             target = parts[1].strip()
             if target.lower().startswith("http"):
                 url = target
             else:
-                # 任務 ID
                 doc = fs_get_task_by_id(chat_id, target)
                 if not doc:
-                    return [TextSendMessage(text="找不到該任務 ID")]
+                    msg = "找不到該任務 ID"
+                    return [TextSendMessage(text=msg)] if HAS_LINE else [msg]
                 url = doc.to_dict().get("url")
             res = probe(url)
             msgs = []
-            if res.get("image", LOGO) and res["image"] != LOGO:
+            if HAS_LINE and res.get("image", LOGO) and res["image"] != LOGO:
                 msgs.append(ImageSendMessage(original_content_url=res["image"], preview_image_url=res["image"]))
-            msgs.append(TextSendMessage(text=fmt_result_text(res)))
+            text_out = fmt_result_text(res)
+            msgs.append(TextSendMessage(text=text_out) if HAS_LINE else text_out)
             return msgs
 
         if cmd == "/probe" and len(parts) >= 2:
             url = parts[1].strip()
             res = probe(url)
-            return [TextSendMessage(text=json.dumps(res, ensure_ascii=False))]
+            out = json.dumps(res, ensure_ascii=False)
+            return [TextSendMessage(text=out)] if HAS_LINE else [out]
 
-        return [TextSendMessage(text=HELP)]
+        return [TextSendMessage(text=HELP)] if HAS_LINE else [HELP]
     except Exception as e:
         app.logger.error(f"handle_command error: {e}\n{traceback.format_exc()}")
-        return [TextSendMessage(text="指令處理發生錯誤，請稍後再試。")]
+        msg = "指令處理發生錯誤，請稍後再試。"
+        return [TextSendMessage(text=msg)] if HAS_LINE else [msg]
 
 # ============= Webhook / Scheduler / Diag =============
-
 @app.route("/webhook", methods=["POST"])
 def webhook():
+    if not (HAS_LINE and handler):
+        # 沒有 handler 也回 200，避免 LINE 重試連發
+        app.logger.warning("Webhook invoked but handler not ready")
+        return "OK", 200
     signature = request.headers.get("X-Line-Signature", "")
     body = request.get_data(as_text=True)
-    if not handler:
-        app.logger.warning("Webhook invoked but handler not ready")
-        abort(500)
     try:
         handler.handle(body, signature)
     except InvalidSignatureError:
@@ -531,12 +543,19 @@ def webhook():
         abort(400)
     return "OK"
 
-@handler.add(MessageEvent, message=TextMessage)
-def on_message(ev: MessageEvent):
-    text = ev.message.text.strip()
-    chat = source_id(ev)
-    msgs = handle_command(text, chat)
-    line_bot_api.reply_message(ev.reply_token, msgs)
+# 只有在 handler 存在時才掛 decorator，避免載入期報錯
+if HAS_LINE and handler:
+    @handler.add(MessageEvent, message=TextMessage)
+    def on_message(ev: MessageEvent):
+        text = ev.message.text.strip()
+        chat = source_id(ev)
+        msgs = handle_command(text, chat)
+        # SDK 需要 list[SendMessage]
+        if isinstance(msgs, list) and msgs and not isinstance(msgs[0], str):
+            line_bot_api.reply_message(ev.reply_token, msgs)
+        else:
+            # 理論上不會進來；保底
+            line_bot_api.reply_message(ev.reply_token, [TextSendMessage(text=str(msgs))])
 
 @app.route("/cron/tick", methods=["GET"])
 def cron_tick():
@@ -551,7 +570,6 @@ def cron_tick():
         now = datetime.now(timezone.utc)
 
         try:
-            # 只抓啟用中的；不排序避免索引問題，改在 Python 端做 limit
             docs = list(fs_client.collection(COL).where("enabled", "==", True).stream())
         except Exception as e:
             app.logger.error(f"[tick] list watchers failed: {e}")
@@ -561,7 +579,6 @@ def cron_tick():
 
         handled = 0
         for d in docs:
-            # 先檢查軟性截止與每次上限
             if (time.time() - start) > TICK_SOFT_DEADLINE_SEC:
                 resp["errors"].append("soft-deadline reached; remaining will run next tick")
                 break
@@ -583,7 +600,6 @@ def cron_tick():
                 app.logger.error(f"[tick] probe error for {url}: {e}")
                 res = {"ok": False, "msg": f"probe error: {e}", "sig": "NA", "url": url}
 
-            # 更新紀錄（即使失敗也往後排下一次，避免卡死）
             try:
                 fs_client.collection(COL).document(d.id).update({
                     "last_sig": res.get("sig", "NA"),
@@ -596,16 +612,15 @@ def cron_tick():
                 app.logger.error(f"[tick] update doc error: {e}")
                 resp["errors"].append(f"update error: {e}")
 
-            # 是否推播
             changed = (res.get("sig", "NA") != r.get("last_sig", ""))
             if ALWAYS_NOTIFY or changed:
                 try:
-                    text = fmt_result_text(res)
+                    text_out = fmt_result_text(res)
                     img = res.get("image", "")
                     chat_id = r.get("chat_id")
                     if img and img != LOGO:
                         send_image(chat_id, img)
-                    send_text(chat_id, text)
+                    send_text(chat_id, text_out)
                 except Exception as e:
                     app.logger.error(f"[tick] notify error: {e}")
                     resp["errors"].append(f"notify error: {e}")
