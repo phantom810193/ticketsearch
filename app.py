@@ -389,13 +389,20 @@ def extract_title_place_from_html(html: str) -> tuple[Optional[str], Optional[st
     return title, place, dt_text
 
 # ============= 票區與 live.map 解析 =============
-def extract_area_meta_from_000(html: str) -> Tuple[Dict[str, str], Dict[str, str]]:
-    """回傳 (區代碼->中文名, 區代碼->AMOUNT/狀態)。"""
+def extract_area_meta_from_000(html: str) -> Tuple[Dict[str, str], Dict[str, str], Dict[str, int]]:
+    """
+    從 UTK0201_000 抽出：
+      - name_map   : 區代碼 -> 中文名稱
+      - status_map : 區代碼 -> 狀態字（熱賣中/已售完/…）
+      - qty_map    : 區代碼 -> 表格「空位」欄的數字（若有）
+    """
     name_map: Dict[str, str] = {}
-    amount_map: Dict[str, str] = {}
+    status_map: Dict[str, str] = {}
+    qty_map: Dict[str, int] = {}
+
     soup = soup_parse(html)
 
-    # 1) <script> jsonData（最完整）
+    # (a) script jsonData
     for sc in soup.find_all("script"):
         s = sc.string or sc.text or ""
         m = re.search(r"jsonData\s*=\s*'(\[.*?\])'", s, flags=re.S)
@@ -410,31 +417,52 @@ def extract_area_meta_from_000(html: str) -> Tuple[Dict[str, str], Dict[str, str
                 if code and name:
                     name_map.setdefault(code, re.sub(r"\s+", "", name))
                 if code and amt:
-                    amount_map.setdefault(code, amt)
+                    status_map.setdefault(code, amt)
+                    nums = [int(x) for x in re.findall(r"\d+", amt) if int(x) < 1000]
+                    if nums:
+                        qty_map.setdefault(code, nums[-1])
         except Exception:
             pass
 
-    # 2) 超連結 fallback 補中文名
+    # (b) 表格列
     for a in soup.select('a[href*="PERFORMANCE_PRICE_AREA_ID="]'):
         href = a.get("href", "")
         m = re.search(r'PERFORMANCE_PRICE_AREA_ID=([A-Za-z0-9]+)', href)
         if not m:
             continue
         code = m.group(1)
-        if code in name_map:
-            continue
-        name = a.get_text(" ", strip=True) or a.get("title", "") or ""
-        tr = a.find_parent("tr")
-        if tr:
-            cells = [td.get_text(" ", strip=True) for td in tr.find_all("td")]
-            cands = [c for c in cells if re.search(r"(樓|區|包廂)", c) and not re.fullmatch(r"[\d,\.]+", c)]
-            if cands:
-                name = max(cands, key=len)
-        name = re.sub(r"\s+", "", name)
-        if name:
-            name_map.setdefault(code, name)
 
-    return name_map, amount_map
+        tr = a.find_parent("tr")
+        if not tr:
+            continue
+
+        tds = [td.get_text(" ", strip=True) for td in tr.find_all("td")]
+        if tds:
+            if code not in name_map:
+                cand = None
+                for t in tds:
+                    if re.search(r"(樓|區|包廂)", t):
+                        cand = t; break
+                if not cand:
+                    cand = tds[0]
+                name_map[code] = re.sub(r"\s+", "", cand)
+
+            status_cell = ""
+            for t in reversed(tds):
+                if ("已售完" in t) or ("熱賣" in t) or re.search(r"\b\d{1,3}\b", t):
+                    status_cell = t
+                    break
+            if status_cell:
+                if code not in status_map:
+                    if "已售完" in status_cell:
+                        status_map[code] = "已售完"
+                    elif "熱賣" in status_cell:
+                        status_map[code] = "熱賣中"
+                nums = [int(x) for x in re.findall(r"\d+", status_cell) if int(x) < 1000]
+                if nums and code not in qty_map:
+                    qty_map[code] = nums[-1]
+
+    return name_map, status_map, qty_map
 
 def _parse_livemap_text(txt: str) -> Tuple[Dict[str, int], int]:
     """只認 data-left / 關鍵字『剩餘|尚餘|可售|可購』或『(\d+) 張』；同一區取最大值。"""
@@ -599,25 +627,33 @@ def parse_UTK0201_000(url: str, sess: requests.Session) -> dict:
     out["date"]  = details_info.get("dt")    or api_info.get("dt")    or html_dt    or "（未取到日期）"
 
     # 票區中文名 + 狀態（AMOUNT）
-    area_name_map, area_amount_map = extract_area_meta_from_000(html)
+    area_name_map, area_status_map, area_qty_map = extract_area_meta_from_000(html)
     out["area_names"] = area_name_map
 
     # live.map 數字（僅取可信數字，且同區取最大值）
     sections_by_code, total = try_fetch_livemap_by_perf(perf_id, sess, html=html)
-    numeric_counts: Dict[str, int] = dict(sections_by_code)  # 代碼 -> 數字
+    numeric_counts: Dict[str, int] = dict(sections_by_code)
+    # 先把表格「空位」欄的數字補進來（live.map 沒有的才補）
+    for code, n in area_qty_map.items():
+        if isinstance(n, int) and n > 0 and code not in numeric_counts:
+            numeric_counts[code] = n
+
     selling_unknown_codes: List[str] = []  # 只知道「熱賣中」但沒數字
+    for code, status in area_status_map.items():
+        if (status and ("熱賣" in status or "可售" in status)) and not numeric_counts.get(code):
+            selling_unknown_codes.append(code)
 
     # 針對「熱賣中」但沒有數字的區：是否進第二步頁補抓？
     if FOLLOW_AREAS_PER_CHECK > 0 and perf_id and product_id and area_name_map:
-        need_follow = [code for code, amt in area_amount_map.items()
-                       if (amt and "熱賣" in amt) and (not numeric_counts.get(code))]
+        need_follow = [code for code, st in area_status_map.items()
+                       if (st and "熱賣" in st) and (code not in numeric_counts)]
         for code in need_follow[:FOLLOW_AREAS_PER_CHECK]:
             n = fetch_area_left_from_utk0101(url, perf_id, product_id, code, sess)
             if isinstance(n, int) and n > 0:
                 numeric_counts[code] = n
 
     # 尚無數字者，若 AMOUNT 顯示「熱賣中/可售」→ 列入 selling_unknown
-    for code, amt in area_amount_map.items():
+    for code, amt in area_status_map.items():
         if (amt and ("熱賣" in amt or "可售" in amt)) and not numeric_counts.get(code):
             selling_unknown_codes.append(code)
 
