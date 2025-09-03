@@ -1,36 +1,32 @@
-# 基底映像：體積小、支援 Python 3.11
+# Python base（體積小）
 FROM python:3.11-slim
 
-# 一些通用最佳化
-ENV PYTHONUNBUFFERED=1 \
-    PIP_NO_CACHE_DIR=1 \
-    POETRY_VIRTUALENVS_CREATE=false
+ENV PYTHONDONTWRITEBYTECODE=1 \
+    PYTHONUNBUFFERED=1
 
-# 必要系統套件（若你沒有用 Playwright/Chromium，這些也可保留）
+# 系統相依：grpcio 等常見套件需要的編譯工具；Chromium 依賴也一併裝好（即使你暫時不用）
 RUN apt-get update && apt-get install -y --no-install-recommends \
+    build-essential gcc curl ca-certificates \
     libnss3 libatk1.0-0 libatk-bridge2.0-0 libxkbcommon0 libdrm2 libxcomposite1 \
     libxdamage1 libxfixes3 libxrandr2 libgbm1 libasound2 fonts-noto-color-emoji \
-    curl ca-certificates \
- && rm -rf /var/lib/apt/lists/*
+    && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app
 
-# 先裝套件（可利用快取）
+# 先只送 requirements.txt，讓 pip 安裝可被快取
 COPY requirements.txt .
-RUN pip install --no-cache-dir -r requirements.txt
+RUN pip install --upgrade pip setuptools wheel \
+ && pip install --no-cache-dir -r requirements.txt
 
-# 如果 requirements 有 playwright，你才會想裝 chromium
-# 無論如何失敗都不讓建置中止（|| true）
-RUN python - <<'PY'\nimport importlib, os, sys\nsys.exit(1) if importlib.util.find_spec('playwright') else sys.exit(0)\nPY \\\n && python -m playwright install chromium || true
+# （選用）若真的要用 Playwright，再開這個 ARG
+ARG USE_PLAYWRIGHT=0
+RUN if [ "$USE_PLAYWRIGHT" = "1" ]; then \
+        pip install --no-cache-dir playwright && \
+        playwright install --with-deps chromium; \
+    fi
 
-# 複製專案
+# 再送其餘程式碼
 COPY . .
 
-# 預設埠（Cloud Run 會覆蓋為 $PORT）
-ENV PORT=8080 \
-    GUNICORN_TIMEOUT=120 \
-    GUNICORN_WORKERS=1 \
-    GUNICORN_THREADS=8
-
-# 使用 wsgi:application 作為入口；用 sh -c 才能展開 $PORT
-CMD ["sh", "-c", "exec gunicorn -b :${PORT:-8080} --timeout ${GUNICORN_TIMEOUT} --workers ${GUNICORN_WORKERS} --threads ${GUNICORN_THREADS} --access-logfile - --error-logfile - --log-level info wsgi:application"]
+# Cloud Run 入口
+CMD ["gunicorn", "-b", "0.0.0.0:8080", "app:app"]

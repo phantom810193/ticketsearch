@@ -1,18 +1,10 @@
 # Web
-Flask>=3.0,<4
-gunicorn>=21.2,<22
-requests>=2.31,<3
-beautifulsoup4>=4.12,<5
-lxml>=5.1,<6        # 給 BS4 用的 parser，速度快、相容性好
+Flask==3.0.3
+gunicorn==21.2.0
+requests==2.32.3
+beautifulsoup4==4.12.3
 
 # Google Cloud
-google-cloud-firestore>=2.14,<3
-google-cloud-tasks>=2.16,<3
-google-auth>=2.29,<3         # 額外標註，雖是相依但標出版本較穩
-google-api-core>=2.19,<3
-
-# 若你改用官方 SDK 發送 LINE 訊息，再打開下一行；目前用 requests 就不需要
-# line-bot-sdk>=3.11,<4
-
-# （可選）需要以 Playwright 抓頁面時才啟用；同時記得 Dockerfile 已安裝 chromium
-# playwright>=1.45,<2
+google-cloud-firestore==2.16.0
+google-cloud-tasks==2.16.3
+grpcio==1.62.2

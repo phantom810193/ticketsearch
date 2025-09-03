@@ -1,14 +1,4 @@
 .gcloudignore
 .git
 .gitignore
-__pycache__/
-*.pyc
-.venv
-.env
-node_modules/
-
-!Dockerfile
-!requirements.txt
-!cloudbuild.yaml
-!app.py
-!worker.py
+node_modules
