@@ -63,7 +63,7 @@ except Exception as e:
 COL = "watchers"
 
 UA = (
-    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit(537.36) "
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
     "(KHTML, like Gecko) Chrome/122.0 Safari/537.36"
 )
 
@@ -164,6 +164,11 @@ def _deep_pick_activity_info(data: Any) -> Dict[str, str]:
     walk(data)
     return {k: v for k, v in out.items() if v}
 
+def find_activity_image(html: str) -> Optional[str]:
+    """從整頁字串直接撈 ActivityImage 的宣傳圖（有時不在 <img> 或 meta 裡）。"""
+    m = re.search(r"https?://[^\"'<>]+/image/ActivityImage/[^\s\"'<>]+\.(?:jpg|jpeg|png)", html, flags=re.I)
+    return m.group(0) if m else None
+
 def fetch_game_info_from_api(perf_id: Optional[str], product_id: Optional[str], referer_url: str, sess: requests.Session) -> Dict[str, str]:
     headers = {
         "Origin": "https://orders.ibon.com.tw",
@@ -171,6 +176,7 @@ def fetch_game_info_from_api(perf_id: Optional[str], product_id: Optional[str], 
         "User-Agent": UA,
         "Accept": "application/json, text/plain, */*",
         "Content-Type": "application/json;charset=UTF-8",
+        "X-Requested-With": "XMLHttpRequest",
         "Accept-Language": "zh-TW,zh;q=0.9,en;q=0.6",
     }
     tries: List[Tuple[str, Dict[str, Optional[str]]]] = []
@@ -182,8 +188,9 @@ def fetch_game_info_from_api(perf_id: Optional[str], product_id: Optional[str], 
             ("POST", {"Performance_ID": perf_id, "Product_ID": product_id}),
             ("POST", {"PerformanceId": perf_id, "ProductId": product_id}),
         ]
-    tries.append(("GET", {}))
+    tries.append(("GET", {}))  # 無參也試一次
 
+    wanted: Dict[str, str] = {}
     for method, params in tries:
         try:
             if method == "GET":
@@ -192,13 +199,45 @@ def fetch_game_info_from_api(perf_id: Optional[str], product_id: Optional[str], 
                 r = sess.post(TICKET_API, json={k: v for k, v in (params or {}).items() if v}, headers=headers, timeout=12)
             if r.status_code != 200:
                 continue
-            info = _deep_pick_activity_info(r.json())
+            data = r.json()
+
+            info = _deep_pick_activity_info(data)
+
+            # 若回傳為清單，盡量找包含 perf/product id 的那筆
+            def match_obj(obj):
+                s = json.dumps(obj, ensure_ascii=False)
+                ok = True
+                if perf_id:
+                    ok = ok and (perf_id in s)
+                if product_id:
+                    ok = ok and (product_id in s)
+                return ok
+
+            if isinstance(data, list):
+                for it in data:
+                    if match_obj(it):
+                        info.update(_deep_pick_activity_info(it))
+                        break
+            elif isinstance(data, dict):
+                for v in data.values():
+                    if isinstance(v, list):
+                        for it in v:
+                            if match_obj(it):
+                                info.update(_deep_pick_activity_info(it))
+                                break
+
             if info:
-                return info
+                # 宣傳圖優先選 ActivityImage
+                if info.get("poster") and "ActivityImage" not in info["poster"]:
+                    promo = find_activity_image(json.dumps(data, ensure_ascii=False))
+                    if promo:
+                        info["poster"] = promo
+                wanted = info
+                break
         except Exception as e:
             app.logger.info(f"[api] fetch fail ({method} {params}): {e}")
             continue
-    return {}
+    return wanted
 
 # ============= ibon 解析 =============
 def pick_event_images_from_000(html: str, base_url: str) -> Tuple[str, Optional[str]]:
@@ -249,12 +288,31 @@ def pick_event_images_from_000(html: str, base_url: str) -> Tuple[str, Optional[
 def extract_area_name_map_from_000(html: str) -> dict:
     """
     從 000 頁面抽 {票區代碼 -> 區域中文名}。
-    支援 a[href*=PERFORMANCE_PRICE_AREA_ID]、同列 td，與 script/json/全文近鄰。
+    來源：
+      1) script 的 const jsonData = ' [...] '（最可靠）
+      2) a[href*=PERFORMANCE_PRICE_AREA_ID=...]
+      3) 頁面全文近鄰（B0… 附近含「樓/區/包廂」）
     """
     name_map: Dict[str, str] = {}
     soup = soup_parse(html)
 
-    # 1) a[href] 直接帶代碼
+    # (1) script jsonData
+    for sc in soup.find_all("script"):
+        s = sc.string or sc.text or ""
+        m = re.search(r"jsonData\s*=\s*'(\[.*?\])'", s, flags=re.S)
+        if not m:
+            continue
+        try:
+            arr = json.loads(m.group(1))
+            for it in arr:
+                code = (it.get("PERFORMANCE_PRICE_AREA_ID") or "").strip()
+                name = (it.get("NAME") or "").strip()
+                if code and name:
+                    name_map.setdefault(code, re.sub(r"\s+", "", name))
+        except Exception:
+            pass
+
+    # (2) a[href] 直接帶代碼
     for a in soup.select('a[href*="PERFORMANCE_PRICE_AREA_ID="]'):
         href = a.get("href", "")
         m = re.search(r'PERFORMANCE_PRICE_AREA_ID=([A-Za-z0-9]+)', href)
@@ -272,7 +330,7 @@ def extract_area_name_map_from_000(html: str) -> dict:
         if name:
             name_map.setdefault(code, name)
 
-    # 2) 全文近鄰（代碼附近）
+    # (3) 全文近鄰
     text = soup.get_text("\n", strip=True)
     for m in re.finditer(r"\b(B0[0-9A-Z]{6,10})\b", text):
         code = m.group(1)
@@ -285,28 +343,25 @@ def extract_area_name_map_from_000(html: str) -> dict:
         if m2:
             name_map.setdefault(code, re.sub(r"\s+", "", m2.group(1)))
 
-    # 3) script/json
-    for sc in soup.find_all("script"):
-        s = (sc.string or sc.text or "")
-        for m in re.finditer(r"(B0[0-9A-Z]{6,10})['\"\s:\-，,：]*(?:name|text|area|區名)?['\"\s:\-，,：]*([^\n\"',]{2,20})", s, flags=re.I):
-            code, name = m.group(1), re.sub(r"\s+", "", m.group(2))
-            if re.search(r"(樓|區|包廂)", name):
-                name_map.setdefault(code, name)
-
     return name_map
 
 def _parse_livemap_text(txt: str) -> Tuple[Dict[str, int], int]:
-    """解析 azureedge live.map，回傳 {票區代碼: 張數}, total。"""
+    """解析 azureedge live.map，回傳 {票區代碼: 張數}, total。避免把 PerfId 當成區代碼。"""
     sections: Dict[str, int] = {}
     total = 0
     for tag in _RE_AREA_TAG.findall(txt):
-        # 代碼（優先直接抓 B0…）
-        m_code = re.search(r"\b(B0[0-9A-Z]{6,10})\b", tag)
-        code = m_code.group(1) if m_code else None
-        if code is None:
-            m_href = re.search(r"javascript:Send\([^)]*'([A-Za-z0-9]+)'\s*,\s*'([A-Za-z0-9]+)'\s*,\s*'(\d+)'", tag, re.I)
-            if m_href and re.fullmatch(r"B0[0-9A-Z]{6,10}", m_href.group(2) or ""):
-                code = m_href.group(2)
+        # 1) 優先從 javascript:Send('PERF','AREA','qty') 取「第二個」參數 → AreaId
+        code = None
+        m = re.search(
+            r"javascript:Send\([^)]*'(?P<perf>B0[0-9A-Z]{6,10})'\s*,\s*'(?P<area>B0[0-9A-Z]{6,10})'\s*,\s*'(\d+)'",
+            tag, re.I)
+        if m:
+            code = m.group("area")
+        else:
+            # 2) 退而求其次：同一個 tag 內若有多個 B0…，通常最後一個是 AreaId
+            codes = re.findall(r"\b(B0[0-9A-Z]{6,10})\b", tag)
+            if codes:
+                code = codes[-1]
 
         # 數量
         qty = None
@@ -363,10 +418,7 @@ def try_fetch_livemap_by_perf(perf_id: str, sess: requests.Session, html: Option
 
 # --------- 輔助：從文字/script 粗略解析數量（做為 live.map 的備援） ---------
 def _parse_counts_from_text(full_text: str) -> Dict[str, int]:
-    """
-    從整頁純文字找 (B0... , 數字) 的配對；數字後面常見 '張'。
-    僅作為弱備援，不保證每頁都命中。
-    """
+    """從整頁純文字找 (B0... , 數字) 的配對；數字後面常見 '張'。"""
     counts: Dict[str, int] = {}
     for m in re.finditer(r"(B0[0-9A-Z]{6,10}).{0,40}?(\d{1,3})\s*張", full_text):
         code, qty = m.group(1), int(m.group(2))
@@ -438,14 +490,13 @@ def _try_dynamic_counts(event_url: str, timeout_sec: int = 20) -> Dict[str, int]
                 secs, total = _parse_livemap_text(live_map_text["txt"])
                 if total > 0:
                     counts.update(secs)
+                    ctx.close(); browser.close()
                     return counts
 
             # 否則用頁面文字備援
             html = page.content()
             soup = soup_parse(html)
-            c = _parse_counts_from_text(soup.get_text("\n", strip=True))
-            if not c:
-                c = _parse_counts_from_scripts(soup)
+            c = _parse_counts_from_text(soup.get_text("\n", strip=True)) or _parse_counts_from_scripts(soup)
             counts.update(c)
 
             ctx.close()
@@ -468,8 +519,11 @@ def parse_UTK0201_000(url: str, sess: requests.Session) -> dict:
     perf_id = (q.get("PERFORMANCE_ID") or [None])[0]
     product_id = (q.get("PRODUCT_ID") or [None])[0]
 
-    # 圖片
+    # 圖片：座位圖 + 主宣傳圖（若頁面字串找到 ActivityImage，優先用）
     poster, seatmap = pick_event_images_from_000(html, url)
+    promo = find_activity_image(html)
+    if promo:
+        poster = promo
     if seatmap: out["seatmap"] = seatmap
     out["image"] = poster or LOGO
 
