@@ -354,6 +354,7 @@ def extract_title_place_from_html(html: str) -> tuple[Optional[str], Optional[st
     place: Optional[str] = None
     dt_text: Optional[str] = None
 
+    # 取標題 / 場地
     for gt in soup.select('.grid-title'):
         lab = gt.get_text(" ", strip=True)
         sib = gt.find_next_sibling()
@@ -362,8 +363,10 @@ def extract_title_place_from_html(html: str) -> tuple[Optional[str], Optional[st
         content = sib.get_text(" ", strip=True)
         if not content:
             continue
-        if ("活動名稱" in lab or "演出名稱" in lab or "節目名稱" in lab或"場次名稱" in lab) and not title:
+
+        if any(k in lab for k in ("活動名稱", "演出名稱", "節目名稱", "場次名稱")) and not title:
             title = content
+
         if any(k in lab for k in ("活動地點", "地點", "場地")) and not place:
             place = re.sub(r"\s+", " ", content).strip()
 
