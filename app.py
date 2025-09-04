@@ -19,11 +19,15 @@ HAS_LINE = True
 try:
     from linebot import LineBotApi, WebhookHandler
     from linebot.exceptions import InvalidSignatureError
-    from linebot.models import MessageEvent, TextMessage, TextSendMessage, ImageSendMessage
+    from linebot.models import (
+        MessageEvent, TextMessage, TextSendMessage, ImageSendMessage,
+        FollowEvent, JoinEvent,  # ← 新增這行
+    )
 except Exception as e:
     HAS_LINE = False
     LineBotApi = WebhookHandler = InvalidSignatureError = None
     MessageEvent = TextMessage = TextSendMessage = ImageSendMessage = None
+    # 也可加上：FollowEvent = JoinEvent = None
     logging.warning(f"[init] line-bot-sdk not available: {e}")
 
 # --------- Firestore（可失敗不致命）---------
@@ -736,15 +740,19 @@ def probe(url: str) -> dict:
 
 # ============= LINE 指令 =============
 HELP = (
-    "我是票券監看機器人 🤖\n"
-    "指令：\n"
+    "親愛的用戶您好，歡迎來到巴拉圭の專屬搶票助手 🤗\n"
+    "我是您的票券監看機器人 🤖\n\n"
+    "您可以使用以下指令來進行操作： 👇\n\n"
     "/start 或 /help － 顯示這個說明\n"
-    "/watch <URL> [秒] － 開始監看（同網址不重複；秒數可更新；最小 15 秒）\n"
+    "/watch <URL> [秒] － 開始監看（最小 15 秒）\n"
     "/unwatch <任務ID> － 停用任務\n"
     "/list － 顯示啟用中任務（/list all 看全部、/list off 看停用）\n"
     "/check <URL|任務ID> － 立刻手動查詢該頁剩餘數\n"
     "/probe <URL> － 回傳診斷 JSON（除錯用）\n"
 )
+
+# 加好友或被邀進群時要回的歡迎訊息
+WELCOME_TEXT = HELP
 
 def source_id(ev):
     src = ev.source
@@ -835,8 +843,8 @@ def fmt_result_text(res: dict) -> str:
         lines.append(f"任務代碼：{res['task_id']}")
     lines += [
         f"🎫 {res.get('title','')}".strip(),
-        f"地點：{res.get('place','')}",
-        f"日期：{res.get('date','')}",
+        f"📍地點：{res.get('place','')}",
+        f"📅日期：{res.get('date','')}",
     ]
     if res.get("ok"):
         secs = res.get("sections", {})
@@ -990,6 +998,29 @@ def webhook():
     return "OK"
 
 if HAS_LINE and handler:
+
+    @handler.add(FollowEvent)
+    def on_follow(ev):
+        # 1 對 1 加好友
+        try:
+            line_bot_api.reply_message(
+                ev.reply_token,
+                [TextSendMessage(text=WELCOME_TEXT)]
+            )
+        except Exception as e:
+            app.logger.error(f"[follow] reply failed: {e}")
+
+    @handler.add(JoinEvent)
+    def on_join(ev):
+        # 被邀進群組 / 多人聊天室
+        try:
+            line_bot_api.reply_message(
+                ev.reply_token,
+                [TextSendMessage(text=WELCOME_TEXT)]
+            )
+        except Exception as e:
+            app.logger.error(f"[join] reply failed: {e}")
+
     @handler.add(MessageEvent, message=TextMessage)
     def on_message(ev):
         text = ev.message.text.strip()
