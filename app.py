@@ -21,13 +21,12 @@ try:
     from linebot.exceptions import InvalidSignatureError
     from linebot.models import (
         MessageEvent, TextMessage, TextSendMessage, ImageSendMessage,
-        FollowEvent, JoinEvent,  # ← 新增這行
+        FollowEvent, JoinEvent,
     )
 except Exception as e:
     HAS_LINE = False
     LineBotApi = WebhookHandler = InvalidSignatureError = None
     MessageEvent = TextMessage = TextSendMessage = ImageSendMessage = None
-    # 也可加上：FollowEvent = JoinEvent = None
     logging.warning(f"[init] line-bot-sdk not available: {e}")
 
 # --------- Firestore（可失敗不致命）---------
@@ -363,7 +362,7 @@ def extract_title_place_from_html(html: str) -> tuple[Optional[str], Optional[st
         content = sib.get_text(" ", strip=True)
         if not content:
             continue
-        if ("活動名稱" in lab or "演出名稱" in lab or "節目名稱" in lab or "場次名稱" in lab) and not title:
+        if ("活動名稱" in lab or "演出名稱" in lab or "節目名稱" in lab或"場次名稱" in lab) and not title:
             title = content
         if any(k in lab for k in ("活動地點", "地點", "場地")) and not place:
             place = re.sub(r"\s+", " ", content).strip()
@@ -637,14 +636,15 @@ def parse_UTK0201_000(url: str, sess: requests.Session) -> dict:
     out["area_names"] = area_name_map
 
     # live.map 數字（僅取可信數字，且同區取最大值）
-    sections_by_code, total = try_fetch_livemap_by_perf(perf_id, sess, html=html)
+    sections_by_code, _ = try_fetch_livemap_by_perf(perf_id, sess, html=html)
     numeric_counts: Dict[str, int] = dict(sections_by_code)
-    # 先把表格「空位」欄的數字補進來（live.map 沒有的才補）
+    # 表格「空位」數字補進來（live.map 沒有的才補）
     for code, n in area_qty_map.items():
         if isinstance(n, int) and n > 0 and code not in numeric_counts:
             numeric_counts[code] = n
 
-    selling_unknown_codes: List[str] = []  # 只知道「熱賣中」但沒數字
+    # 只知道「熱賣中/可售」但沒數字
+    selling_unknown_codes: List[str] = []
     for code, status in area_status_map.items():
         if (status and ("熱賣" in status or "可售" in status)) and not numeric_counts.get(code):
             selling_unknown_codes.append(code)
@@ -658,10 +658,11 @@ def parse_UTK0201_000(url: str, sess: requests.Session) -> dict:
             if isinstance(n, int) and n > 0:
                 numeric_counts[code] = n
 
-    # 尚無數字者，若 AMOUNT 顯示「熱賣中/可售」→ 列入 selling_unknown
-    for code, amt in area_status_map.items():
-        if (amt and ("熱賣" in amt or "可售" in amt)) and not numeric_counts.get(code):
-            selling_unknown_codes.append(code)
+    # 再次聚集 selling_unknown（確保覆蓋後仍為未知）
+    selling_unknown_codes = [
+        code for code, amt in area_status_map.items()
+        if (amt and ("熱賣" in amt or "可售" in amt)) and not numeric_counts.get(code)
+    ]
 
     # ==== 聚合輸出 ====
     # 把代碼映成人類名稱（同名區取最大值；不把「熱賣中(未知)」算進 total）
@@ -673,7 +674,6 @@ def parse_UTK0201_000(url: str, sess: requests.Session) -> dict:
 
     # 順序：依網站順序（SORT 或表格列序）
     def order_key(name: str) -> tuple:
-        # 反查代碼 → 若多個代碼同名，取其中最小 order
         codes = [c for c, nm in area_name_map.items() if nm == name]
         order_vals = [area_order_map.get(c, 99999) for c in codes] or [99999]
         return (min(order_vals), name)
@@ -683,12 +683,25 @@ def parse_UTK0201_000(url: str, sess: requests.Session) -> dict:
 
     total_num = sum(human_numeric.values())
 
+    # ---- 售完偵測：所有票區皆「已售完」，且沒有數字與「熱賣/可售」標記 ----
+    sold_out = False
+    if area_name_map:
+        any_hot = any(("熱賣" in s) or ("可售" in s) or ("可購" in s) for s in area_status_map.values())
+        any_num = any(v > 0 for v in numeric_counts.values())
+        if not any_hot and not any_num and area_status_map:
+            sold_out = all(("已售完" in area_status_map.get(code, "")) for code in area_name_map.keys())
+
     out["sections"] = human_numeric
     out["sections_order"] = ordered_names
     out["selling"] = selling_names
     out["total"] = total_num
+    out["soldout"] = bool(sold_out)
+
+    # 簽章：把售完狀態也納入，避免「售完 <-> 有票」時不觸發通知
+    sig_base = hash_state(human_numeric, selling_names)
+    out["sig"] = hashlib.md5((sig_base + ("|SO" if sold_out else "")).encode("utf-8")).hexdigest()
+
     out["ok"] = (total_num > 0) or bool(selling_names)
-    out["sig"] = hash_state(human_numeric, selling_names)
 
     if out["ok"]:
         lines = [f"🎫 {out['title']}",
@@ -710,7 +723,17 @@ def parse_UTK0201_000(url: str, sess: requests.Session) -> dict:
         out["msg"] = "\n".join(lines)
         return out
 
-    # 沒有可靠數字、也沒有熱賣中清單
+    # ---- 無數字、無熱賣：若判定為售完 → 回覆售完；否則保留原本說明 ----
+    if sold_out:
+        out["msg"] = (
+            f"🎫 {out['title']}\n"
+            f"📍地點：{out['place']}\n"
+            f"📅日期：{out['date']}\n\n"
+            f"🔴 全區已售完\n"
+            f"{url}"
+        )
+        return out
+
     out["msg"] = (
         f"🎫 {out['title']}\n"
         f"地點：{out['place']}\n"
@@ -751,8 +774,6 @@ HELP = (
     "/check <URL|任務ID> － 立刻手動查詢該頁剩餘數\n"
     "/probe <URL> － 回傳診斷 JSON（除錯用）\n"
 )
-
-# 加好友或被邀進群時要回的歡迎訊息
 WELCOME_TEXT = HELP
 
 def source_id(ev):
@@ -847,6 +868,12 @@ def fmt_result_text(res: dict) -> str:
         f"📍地點：{res.get('place','')}",
         f"📅日期：{res.get('date','')}",
     ]
+    # 若為售完狀態，優先輸出售完訊息
+    if res.get("soldout"):
+        lines.append("\n🔴 全區已售完")
+        lines.append(res.get("url", ""))
+        return "\n".join(lines)
+
     if res.get("ok"):
         secs = res.get("sections", {})
         order = res.get("sections_order") or []
@@ -875,7 +902,7 @@ def handle_command(text: str, chat_id: str):
         parts = text.strip().split()
         cmd = parts[0].lower()
         if cmd in ("/start", "/help"):
-            return [TextSendMessage(text=HELP)] if HAS_LINE else [fmt_result_text({"msg": HELP})]
+            return [TextSendMessage(text=HELP)] if HAS_LINE else [HELP]
 
         if cmd == "/watch" and len(parts) >= 2:
             url = parts[1].strip()
@@ -961,6 +988,7 @@ def handle_command(text: str, chat_id: str):
                 sent = set()
                 sm  = res.get("seatmap")
                 img = res.get("image")
+                # 先座位圖、後宣傳圖
                 if sm and _url_ok(sm):
                     msgs.append(ImageSendMessage(original_content_url=sm, preview_image_url=sm))
                     sent.add(sm)
@@ -1002,23 +1030,15 @@ if HAS_LINE and handler:
 
     @handler.add(FollowEvent)
     def on_follow(ev):
-        # 1 對 1 加好友
         try:
-            line_bot_api.reply_message(
-                ev.reply_token,
-                [TextSendMessage(text=WELCOME_TEXT)]
-            )
+            line_bot_api.reply_message(ev.reply_token, [TextSendMessage(text=WELCOME_TEXT)])
         except Exception as e:
             app.logger.error(f"[follow] reply failed: {e}")
 
     @handler.add(JoinEvent)
     def on_join(ev):
-        # 被邀進群組 / 多人聊天室
         try:
-            line_bot_api.reply_message(
-                ev.reply_token,
-                [TextSendMessage(text=WELCOME_TEXT)]
-            )
+            line_bot_api.reply_message(ev.reply_token, [TextSendMessage(text=WELCOME_TEXT)])
         except Exception as e:
             app.logger.error(f"[join] reply failed: {e}")
 
@@ -1090,20 +1110,15 @@ def cron_tick():
             changed = (res.get("sig", "NA") != r.get("last_sig", ""))
             if ALWAYS_NOTIFY or changed:
                 try:
-                    # 將任務代碼塞進文字
                     res["task_id"] = r.get("id")
-
                     chat_id = r.get("chat_id")
                     sent = set()
                     sm = res.get("seatmap")
                     img = res.get("image")
-
-                    # 先座位圖、再宣傳圖，並去重
                     if sm and _url_ok(sm):
                         send_image(chat_id, sm); sent.add(sm)
                     if img and _url_ok(img) and img not in sent:
                         send_image(chat_id, img)
-
                     send_text(chat_id, fmt_result_text(res))
                 except Exception as e:
                     app.logger.error(f"[tick] notify error: {e}")
