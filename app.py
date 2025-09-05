@@ -775,6 +775,7 @@ HELP = (
     "/list － 顯示啟用中任務（/list all 看全部、/list off 看停用）\n"
     "/check <URL|任務ID> － 立刻手動查詢該頁剩餘數\n"
     "/probe <URL> － 回傳診斷 JSON（除錯用）\n"
+    "ibon售票網站首頁連結如下:https://ticket.ibon.com.tw/Index/entertainment \n"
 )
 WELCOME_TEXT = HELP
 
