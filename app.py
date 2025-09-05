@@ -18,14 +18,14 @@ from flask import Flask, request, abort, jsonify
 HAS_LINE = True
 try:
     from linebot import LineBotApi, WebhookHandler
-    from linebot.exceptions import InvalidSignatureError, LineBotApiError
+    from linebot.exceptions import InvalidSignatureError
     from linebot.models import (
         MessageEvent, TextMessage, TextSendMessage, ImageSendMessage,
         FollowEvent, JoinEvent,
     )
 except Exception as e:
     HAS_LINE = False
-    LineBotApi = WebhookHandler = InvalidSignatureError = LineBotApiError = None
+    LineBotApi = WebhookHandler = InvalidSignatureError = None
     MessageEvent = TextMessage = TextSendMessage = ImageSendMessage = None
     logging.warning(f"[init] line-bot-sdk not available: {e}")
 
@@ -46,7 +46,7 @@ DEFAULT_PERIOD_SEC = int(os.getenv("DEFAULT_PERIOD_SEC", "60"))
 ALWAYS_NOTIFY = os.getenv("ALWAYS_NOTIFY", "0") == "1"
 FOLLOW_AREAS_PER_CHECK = int(os.getenv("FOLLOW_AREAS_PER_CHECK", "0"))  # 預設 0：不追票區第二步頁
 
-# 可選：手動覆蓋宣傳圖或 Details 連結
+# 可選：手動覆蓋宣傳圖或 Details 連結（通常不需要）
 PROMO_IMAGE_MAP: Dict[str, str] = {}
 PROMO_DETAILS_MAP: Dict[str, str] = {}
 try:
@@ -97,6 +97,7 @@ def soup_parse(html: str) -> BeautifulSoup:
         return BeautifulSoup(html, "html.parser")
 
 def hash_state(sections: Dict[str, int], selling: List[str]) -> str:
+    """將『有數字區』與『熱賣中區』一起做簽章，避免只看數字漏通知。"""
     items = sorted((k, int(v)) for k, v in sections.items())
     hot = sorted(selling)
     raw = json.dumps({"num": items, "hot": hot}, ensure_ascii=False, separators=(",", ":"))
@@ -148,7 +149,7 @@ def _url_ok(u: str) -> bool:
         return False
     try:
         r = requests.head(u, timeout=6, allow_redirects=True)
-        if r.status_code in (403, 405):
+        if r.status_code in (403, 405):  # 某些 CDN 禁 HEAD
             r = requests.get(u, stream=True, timeout=8)
         return 200 <= r.status_code < 400
     except Exception:
@@ -221,7 +222,7 @@ def fetch_game_info_from_api(perf_id: Optional[str], product_id: Optional[str], 
             ("POST", {"Performance_ID": perf_id, "Product_ID": product_id}),
             ("POST", {"PerformanceId": perf_id,  "ProductId":  product_id}),
         ]
-    tries.append(("GET", {}))
+    tries.append(("GET", {}))  # 無參數也試
 
     picked: Dict[str, str] = {}
     for method, params in tries:
@@ -477,7 +478,7 @@ def extract_area_meta_from_000(html: str) -> Tuple[Dict[str, str], Dict[str, str
     return name_map, status_map, qty_map, order_map
 
 def _parse_livemap_text(txt: str) -> Tuple[Dict[str, int], int]:
-    """只認 data-left / 關鍵字『剩餘|尚餘|可售|可購』或『(數字) 張』；同一區取最大值。"""
+    """只認 data-left / 關鍵字『剩餘|尚餘|可售|可購』或『(\d+) 張』；同一區取最大值。"""
     sections: Dict[str, int] = {}
     for tag in _RE_AREA_TAG.findall(txt):
         code = None
@@ -637,7 +638,7 @@ def parse_UTK0201_000(url: str, sess: requests.Session) -> dict:
     area_name_map, area_status_map, area_qty_map, area_order_map = extract_area_meta_from_000(html)
     out["area_names"] = area_name_map
 
-    # live.map 數字
+    # live.map 數字（僅取可信數字，且同區取最大值）
     sections_by_code, _ = try_fetch_livemap_by_perf(perf_id, sess, html=html)
     numeric_counts: Dict[str, int] = dict(sections_by_code)
     # 表格「空位」數字補進來（live.map 沒有的才補）
@@ -651,7 +652,7 @@ def parse_UTK0201_000(url: str, sess: requests.Session) -> dict:
         if (status and ("熱賣" in status or "可售" in status)) and not numeric_counts.get(code):
             selling_unknown_codes.append(code)
 
-    # 進第二步頁補抓？
+    # 針對「熱賣中」但沒有數字的區：是否進第二步頁補抓？
     if FOLLOW_AREAS_PER_CHECK > 0 and perf_id and product_id and area_name_map:
         need_follow = [code for code, st in area_status_map.items()
                        if (st and "熱賣" in st) and (code not in numeric_counts)]
@@ -660,7 +661,7 @@ def parse_UTK0201_000(url: str, sess: requests.Session) -> dict:
             if isinstance(n, int) and n > 0:
                 numeric_counts[code] = n
 
-    # 再聚集 selling_unknown
+    # 再次聚集 selling_unknown（確保覆蓋後仍為未知）
     selling_unknown_codes = [
         code for code, amt in area_status_map.items()
         if (amt and ("熱賣" in amt or "可售" in amt)) and not numeric_counts.get(code)
@@ -685,7 +686,7 @@ def parse_UTK0201_000(url: str, sess: requests.Session) -> dict:
 
     total_num = sum(human_numeric.values())
 
-    # ---- 售完偵測 ----
+    # ---- 售完偵測：所有票區皆「已售完」，且沒有數字與「熱賣/可售」標記 ----
     sold_out = False
     if area_name_map:
         any_hot = any(("熱賣" in s) or ("可售" in s) or ("可購" in s) for s in area_status_map.values())
@@ -699,7 +700,7 @@ def parse_UTK0201_000(url: str, sess: requests.Session) -> dict:
     out["total"] = total_num
     out["soldout"] = bool(sold_out)
 
-    # 簽章：把售完狀態也納入
+    # 簽章：把售完狀態也納入，避免「售完 <-> 有票」時不觸發通知
     sig_base = hash_state(human_numeric, selling_names)
     out["sig"] = hashlib.md5((sig_base + ("|SO" if sold_out else "")).encode("utf-8")).hexdigest()
 
@@ -725,7 +726,7 @@ def parse_UTK0201_000(url: str, sess: requests.Session) -> dict:
         out["msg"] = "\n".join(lines)
         return out
 
-    # 無數字、無熱賣：若判定為售完 → 回覆售完；否則保留原本說明
+    # ---- 無數字、無熱賣：若判定為售完 → 回覆售完；否則保留原本說明 ----
     if sold_out:
         out["msg"] = (
             f"🎫 {out['title']}\n"
@@ -775,7 +776,7 @@ HELP = (
     "/list － 顯示啟用中任務（/list all 看全部、/list off 看停用）\n"
     "/check <URL|任務ID> － 立刻手動查詢該頁剩餘數\n"
     "/probe <URL> － 回傳診斷 JSON（除錯用）\n"
-    "ibon售票網站首頁連結如下:https://ticket.ibon.com.tw/Index/entertainment \n"
+    "ibon售票網站首頁連結:https://ticket.ibon.com.tw/Index/entertainment \n"
 )
 WELCOME_TEXT = HELP
 
@@ -900,27 +901,6 @@ def fmt_result_text(res: dict) -> str:
     lines.append(res.get("url", ""))
     return "\n".join(lines)
 
-# ---- 安全回覆：reply 失敗時自動改 push ----
-def safe_reply(ev, msgs):
-    """優先 reply；若 reply_token 失效或逾時，改用 push 送到同一對話。"""
-    if not HAS_LINE or not line_bot_api:
-        return
-    if not isinstance(msgs, list):
-        msgs = [msgs]
-    try:
-        line_bot_api.reply_message(ev.reply_token, msgs)
-    except LineBotApiError as e:
-        if "Invalid reply token" in str(e) or getattr(e, "status_code", None) == 400:
-            try:
-                chat = source_id(ev)
-                line_bot_api.push_message(chat, msgs)
-                app.logger.info("[safe_reply] fallback to push ok")
-            except Exception as e2:
-                app.logger.error(f"[safe_reply] fallback push failed: {e2}")
-        else:
-            app.logger.error(f"[safe_reply] reply failed: {e}")
-            raise
-
 def handle_command(text: str, chat_id: str):
     try:
         parts = text.strip().split()
@@ -1012,6 +992,7 @@ def handle_command(text: str, chat_id: str):
                 sent = set()
                 sm  = res.get("seatmap")
                 img = res.get("image")
+                # 先座位圖、後宣傳圖
                 if sm and _url_ok(sm):
                     msgs.append(ImageSendMessage(original_content_url=sm, preview_image_url=sm))
                     sent.add(sm)
@@ -1054,37 +1035,26 @@ if HAS_LINE and handler:
     @handler.add(FollowEvent)
     def on_follow(ev):
         try:
-            safe_reply(ev, TextSendMessage(text=WELCOME_TEXT))
+            line_bot_api.reply_message(ev.reply_token, [TextSendMessage(text=WELCOME_TEXT)])
         except Exception as e:
             app.logger.error(f"[follow] reply failed: {e}")
 
     @handler.add(JoinEvent)
     def on_join(ev):
         try:
-            safe_reply(ev, TextSendMessage(text=WELCOME_TEXT))
+            line_bot_api.reply_message(ev.reply_token, [TextSendMessage(text=WELCOME_TEXT)])
         except Exception as e:
             app.logger.error(f"[join] reply failed: {e}")
 
     @handler.add(MessageEvent, message=TextMessage)
     def on_message(ev):
         text = ev.message.text.strip()
-        # 群組/多人聊天室：只有指令才回覆
-        src_type = getattr(ev.source, "type", "")
-        in_group = src_type in ("group", "room") or bool(getattr(ev.source, "group_id", None) or getattr(ev.source, "room_id", None))
-        if in_group and not (text.startswith("/") or text.startswith("／")):
-            return  # 不回覆一般訊息
-
         chat = source_id(ev)
         msgs = handle_command(text, chat)
-
-        # 用 safe_reply 避免 Invalid reply token
-        try:
-            if isinstance(msgs, list) and msgs and not isinstance(msgs[0], str):
-                safe_reply(ev, msgs)
-            else:
-                safe_reply(ev, TextSendMessage(text=str(msgs)))
-        except Exception as e:
-            app.logger.error(f"[on_message] safe_reply error: {e}")
+        if isinstance(msgs, list) and msgs and not isinstance(msgs[0], str):
+            line_bot_api.reply_message(ev.reply_token, msgs)
+        else:
+            line_bot_api.reply_message(ev.reply_token, [TextSendMessage(text=str(msgs))])
 
 @app.route("/cron/tick", methods=["GET"])
 def cron_tick():
