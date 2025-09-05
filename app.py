@@ -770,15 +770,25 @@ HELP = (
     "歡迎來到巴拉圭の專屬搶票助手 🤗\n"
     "我是您的票券監看機器人 🤖\n\n"
     "您可以使用以下指令來進行操作： 👇\n\n"
-    "/start 或 /help － 顯示這個說明\n"
-    "/watch <URL> [秒] － 開始監看（最小 15 秒）\n"
-    "/unwatch <任務ID> － 停用任務\n"
-    "/list － 顯示啟用中任務（/list all 看全部、/list off 看停用）\n"
-    "/check <URL|任務ID> － 立刻手動查詢該頁剩餘數\n"
-    "/probe <URL> － 回傳診斷 JSON（除錯用）\n"
-    "ibon售票網站首頁連結:https://ticket.ibon.com.tw/Index/entertainment \n"
+    "➊/start 或 /help － 顯示操作說明\n"
+    "➋/watch <URL> [秒] － 開始監看（最小 15 秒）\n"
+    "➌/unwatch <任務ID> － 停用任務\n"
+    "➍/list － 顯示啟用中任務（/list all 看全部、/list off 看停用）\n"
+    "➎/check <URL|任務ID> － 立刻手動查詢該頁剩餘數\n"
+    "➏/probe <URL> － 回傳診斷 JSON（除錯用）\n\n"
+
+    "➐ibon售票網站首頁連結:https://ticket.ibon.com.tw/Index/entertainment \n"
+    "將用戶想追蹤的ibon售票網站連結貼入<URL>欄位即可 \n"
+    "🤖任務ID會在用戶輸入/watch開始監看後生成一個六位數的代碼 🤖\n"
 )
 WELCOME_TEXT = HELP
+
+# === 全域只回覆指令：新增判斷（半形 / 全形斜線） ===
+CMD_PREFIX = ("/", "／")
+def is_command(text: Optional[str]) -> bool:
+    if not text:
+        return False
+    return text.strip().startswith(CMD_PREFIX)
 
 def source_id(ev):
     src = ev.source
@@ -1034,6 +1044,7 @@ if HAS_LINE and handler:
 
     @handler.add(FollowEvent)
     def on_follow(ev):
+        # 被加入好友時：回覆一次（等同 /start 內容）
         try:
             line_bot_api.reply_message(ev.reply_token, [TextSendMessage(text=WELCOME_TEXT)])
         except Exception as e:
@@ -1041,6 +1052,7 @@ if HAS_LINE and handler:
 
     @handler.add(JoinEvent)
     def on_join(ev):
+        # 被邀入群/聊天室時：回覆一次（等同 /start 內容）
         try:
             line_bot_api.reply_message(ev.reply_token, [TextSendMessage(text=WELCOME_TEXT)])
         except Exception as e:
@@ -1048,7 +1060,13 @@ if HAS_LINE and handler:
 
     @handler.add(MessageEvent, message=TextMessage)
     def on_message(ev):
-        text = ev.message.text.strip()
+        # 全域規則：只有「指令」（以 / 或 ／ 開頭）才回覆，其餘忽略
+        raw = getattr(ev.message, "text", "") or ""
+        text = raw.strip()
+        if not is_command(text):
+            app.logger.info(f"[IGNORED NON-COMMAND] chat={source_id(ev)} text={text!r}")
+            return
+
         chat = source_id(ev)
         msgs = handle_command(text, chat)
         if isinstance(msgs, list) and msgs and not isinstance(msgs[0], str):
