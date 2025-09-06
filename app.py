@@ -63,8 +63,8 @@ try:
     )
 except Exception as e:
     app.logger.warning(f"flask-cors not available: {e}")
-logging.basicConfig(level=os.getenv("LOG_LEVEL", "INFO"))
-app.logger.setLevel(logging.INFO)
+    logging.basicConfig(level=os.getenv("LOG_LEVEL", "INFO"))
+    app.logger.setLevel(logging.INFO)
 
 # ======== 環境變數 ========
 LINE_CHANNEL_ACCESS_TOKEN = os.getenv("LINE_CHANNEL_ACCESS_TOKEN", "")
