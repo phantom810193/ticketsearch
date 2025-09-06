@@ -1188,43 +1188,52 @@ if __name__ == "__main__":
     app.run(host="0.0.0.0", port=int(os.getenv("PORT", "8080")))
 
 def fetch_ibon_entertainments(limit=10, keyword=None):
-    """抓取 ibon 售票娛樂清單，回傳 [{title,url,image}, ...]"""
+    url = "https://ticket.ibon.com.tw/Index/entertainment"
     try:
-        url = "https://ticket.ibon.com.tw/Index/entertainment"
-        r = requests.get(url, timeout=12)
+        r = requests.get(url, timeout=12, headers={
+            "User-Agent": "Mozilla/5.0",
+            "Accept-Language": "zh-TW,zh;q=0.9,en;q=0.6",
+        })
         r.raise_for_status()
-        soup = BeautifulSoup(r.text, "lxml")
+        try:
+            soup = BeautifulSoup(r.text, "lxml")
+        except Exception:
+            soup = BeautifulSoup(r.text, "html.parser")
 
-        items = []
+        items, seen = [], set()
         for a in soup.select('a[href*="/ActivityInfo/Details/"]'):
             href = urljoin(url, (a.get("href") or "").strip())
+            if href in seen:
+                continue
+            seen.add(href)
             title = (a.get("title") or a.get_text(" ", strip=True) or "活動").strip()
+            if keyword and keyword not in title:
+                continue
             img = None
             img_tag = a.select_one("img")
             if img_tag and img_tag.get("src"):
                 img = urljoin(url, img_tag["src"])
-            if keyword and keyword not in title:
-                continue
             items.append({"title": title, "url": href, "image": img})
-
-        # 去重，只留前 limit 筆
-        out, seen = [], set()
-        for it in items:
-            if it["url"] in seen:
-                continue
-            seen.add(it["url"])
-            out.append(it)
-            if len(out) >= limit:
+            if len(items) >= max(1, int(limit)):
                 break
-        return out
+        return items
     except Exception as e:
-        logging.getLogger().error(f"[ent] fetch failed: {e}")
+        app.logger.error(f"[ent] fetch failed: {e}")
         return []
 
 @app.route("/liff/activities", methods=["GET"])
 def liff_activities():
-    acts = fetch_ibon_entertainments(limit=10, keyword=request.args.get("q") or None)
-    return jsonify(acts), 200
+    try:
+        limit = int(request.args.get("limit", "10"))
+    except Exception:
+        limit = 10
+    kw = request.args.get("q") or None
+    try:
+        acts = fetch_ibon_entertainments(limit=limit, keyword=kw)
+        return jsonify(acts), 200
+    except Exception as e:
+        app.logger.error(f"/liff/activities error: {e}")
+        return jsonify({"ok": False, "error": str(e)}), 500
 
 @app.route("/liff/", methods=["GET"])
 def liff_index():
