@@ -7,13 +7,12 @@ import uuid
 import hashlib
 import logging
 import traceback
+import requests
 from datetime import datetime, timezone, timedelta
 from typing import Dict, Tuple, Optional, Any, List
 from urllib.parse import urlparse, urlunparse, parse_qs, urlencode, urljoin
 from flask import send_from_directory
-
-import requests
-from flask import Flask, request, abort, jsonify
+from flask import jsonify, Flask, request, abort
 
 # --------- LINE SDK（可選）---------
 HAS_LINE = True
@@ -1185,6 +1184,45 @@ def http_check_once():
 
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=int(os.getenv("PORT", "8080")))
+
+def fetch_ibon_entertainments(limit=10, keyword=None):
+    """抓取 ibon 售票娛樂清單，回傳 [{title,url,image}, ...]"""
+    try:
+        url = "https://ticket.ibon.com.tw/Index/entertainment"
+        r = requests.get(url, timeout=12)
+        r.raise_for_status()
+        soup = BeautifulSoup(r.text, "lxml")
+
+        items = []
+        for a in soup.select('a[href*="/ActivityInfo/Details/"]'):
+            href = urljoin(url, (a.get("href") or "").strip())
+            title = (a.get("title") or a.get_text(" ", strip=True) or "活動").strip()
+            img = None
+            img_tag = a.select_one("img")
+            if img_tag and img_tag.get("src"):
+                img = urljoin(url, img_tag["src"])
+            if keyword and keyword not in title:
+                continue
+            items.append({"title": title, "url": href, "image": img})
+
+        # 去重，只留前 limit 筆
+        out, seen = [], set()
+        for it in items:
+            if it["url"] in seen:
+                continue
+            seen.add(it["url"])
+            out.append(it)
+            if len(out) >= limit:
+                break
+        return out
+    except Exception as e:
+        logging.getLogger().error(f"[ent] fetch failed: {e}")
+        return []
+
+@app.route("/liff/activities", methods=["GET"])
+def liff_activities():
+    acts = fetch_ibon_entertainments(limit=10, keyword=request.args.get("q") or None)
+    return jsonify(acts), 200
 
 @app.route("/liff/", methods=["GET"])
 def liff_index():
