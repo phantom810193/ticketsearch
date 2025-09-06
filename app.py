@@ -12,7 +12,6 @@ from typing import Dict, Tuple, Optional, Any, List
 from urllib.parse import urlparse, urlunparse, parse_qs, urlencode, urljoin
 
 import requests
-from urllib.parse import urljoin
 from flask import Flask, request, abort, jsonify
 
 # --------- LINE SDK（可選）---------
@@ -22,10 +21,7 @@ try:
     from linebot.exceptions import InvalidSignatureError
     from linebot.models import (
         MessageEvent, TextMessage, TextSendMessage, ImageSendMessage,
-        FollowEvent, JoinEvent, PostbackEvent,
-        QuickReply, QuickReplyButton, MessageAction, PostbackAction, URIAction,
-        FlexSendMessage, BubbleContainer, CarouselContainer, BoxComponent,
-        TextComponent, ButtonComponent, ImageComponent, SeparatorComponent
+        FollowEvent, JoinEvent,
     )
 except Exception as e:
     HAS_LINE = False
@@ -787,21 +783,6 @@ HELP = (
 )
 WELCOME_TEXT = HELP
 
-# ---------- Quick Reply（主選單） ----------
-def quick_reply_main():
-    if not HAS_LINE:
-        return None
-    try:
-        return QuickReply(items=[
-            QuickReplyButton(action=MessageAction(label="📖 說明", text="/help")),
-            QuickReplyButton(action=MessageAction(label="🧾 我的任務", text="/list")),
-            QuickReplyButton(action=MessageAction(label="🔍 選活動監看", text="/menu")),
-            QuickReplyButton(action=URIAction(label="ibon 活動頁", uri="https://ticket.ibon.com.tw/Index/entertainment")),
-        ])
-    except Exception:
-        return None
-
-
 # === 全域只回覆指令：新增判斷（半形 / 全形斜線） ===
 CMD_PREFIX = ("/", "／")
 def is_command(text: Optional[str]) -> bool:
@@ -930,75 +911,12 @@ def fmt_result_text(res: dict) -> str:
     lines.append(res.get("url", ""))
     return "\n".join(lines)
 
-
-# ---------- 抓取 ibon 娛樂頁清單 ----------
-def fetch_ibon_entertainments(limit: int = 10) -> list[dict]:
-    """回傳 [{title, url, image}]"""
-    try:
-        s = sess_default()
-        url = "https://ticket.ibon.com.tw/Index/entertainment"
-        r = s.get(url, timeout=12)
-        r.raise_for_status()
-        html = r.text
-        soup = soup_parse(html)
-
-        items = []
-        for a in soup.select('a[href*="/ActivityInfo/Details/"]'):
-            href = urljoin(url, a.get("href", "").strip())
-            title = (a.get("title") or a.get_text(" ", strip=True) or "活動").strip()
-            img = None
-            img_tag = a.select_one("img")
-            if img_tag and img_tag.get("src"):
-                img = urljoin(url, img_tag["src"])
-            items.append({"title": title, "url": href, "image": img})
-
-        # 去重與截斷
-        out, seen = [], set()
-        for it in items:
-            if it["url"] in seen:
-                continue
-            seen.add(it["url"])
-            out.append(it)
-            if len(out) >= limit:
-                break
-        return out
-    except Exception as e:
-        app.logger.error(f"[ent] fetch_ibon_entertainments failed: {e}")
-        return []
-
-
-
-# ---------- 產生 Flex 輪播：每卡兩按鈕（看介紹 / 立即監看） ----------
-def flex_activities_carousel(acts: list[dict], default_sec: int) -> FlexSendMessage:
-    if not HAS_LINE:
-        return None
-    bubbles = []
-    for it in acts:
-        title = (it.get("title") or "活動").strip()[:40]
-        url   = it.get("url")
-        img   = it.get("image") or LOGO
-
-        bubbles.append(BubbleContainer(
-            hero=ImageComponent(url=img, size="full", aspect_ratio="20:13", aspect_mode="cover"),
-            body=BoxComponent(layout="vertical", contents=[
-                TextComponent(text=title, weight="bold", wrap=True),
-                SeparatorComponent(margin="md"),
-                TextComponent(text="點下方按鈕操作", size="sm", color="#666666"),
-            ]),
-            footer=BoxComponent(layout="vertical", spacing="sm", contents=[
-                ButtonComponent(action=URIAction(label="🔗 看介紹", uri=url), style="link"),
-                ButtonComponent(action=PostbackAction(label="✅ 監看這頁", data=f"act=watch&sec={default_sec}&url={url}"), style="primary"),
-            ])
-        ))
-    return FlexSendMessage(alt_text="ibon 活動清單", contents=CarouselContainer(contents=bubbles))
-
-
 def handle_command(text: str, chat_id: str):
     try:
         parts = text.strip().split()
         cmd = parts[0].lower()
         if cmd in ("/start", "/help"):
-            return [TextSendMessage(text=HELP, quick_reply=quick_reply_main())] if HAS_LINE else [HELP]
+            return [TextSendMessage(text=HELP)] if HAS_LINE else [HELP]
 
         if cmd == "/watch" and len(parts) >= 2:
             url = parts[1].strip()
@@ -1101,7 +1019,7 @@ def handle_command(text: str, chat_id: str):
             out = json.dumps(res, ensure_ascii=False)
             return [TextSendMessage(text=out)] if HAS_LINE else [out]
 
-        return [TextSendMessage(text=HELP, quick_reply=quick_reply_main())] if HAS_LINE else [HELP]
+        return [TextSendMessage(text=HELP)] if HAS_LINE else [HELP]
     except Exception as e:
         app.logger.error(f"handle_command error: {e}\n{traceback.format_exc()}")
         msg = "指令處理發生錯誤，請稍後再試。"
@@ -1128,7 +1046,7 @@ if HAS_LINE and handler:
     def on_follow(ev):
         # 被加入好友時：回覆一次（等同 /start 內容）
         try:
-            line_bot_api.reply_message(ev.reply_token, [TextSendMessage(text=WELCOME_TEXT, quick_reply=quick_reply_main())])
+            line_bot_api.reply_message(ev.reply_token, [TextSendMessage(text=WELCOME_TEXT)])
         except Exception as e:
             app.logger.error(f"[follow] reply failed: {e}")
 
@@ -1136,7 +1054,7 @@ if HAS_LINE and handler:
     def on_join(ev):
         # 被邀入群/聊天室時：回覆一次（等同 /start 內容）
         try:
-            line_bot_api.reply_message(ev.reply_token, [TextSendMessage(text=WELCOME_TEXT, quick_reply=quick_reply_main())])
+            line_bot_api.reply_message(ev.reply_token, [TextSendMessage(text=WELCOME_TEXT)])
         except Exception as e:
             app.logger.error(f"[join] reply failed: {e}")
 
@@ -1155,43 +1073,6 @@ if HAS_LINE and handler:
             line_bot_api.reply_message(ev.reply_token, msgs)
         else:
             line_bot_api.reply_message(ev.reply_token, [TextSendMessage(text=str(msgs))])
-
-
-
-    @handler.add(PostbackEvent)
-    def on_postback(ev):
-        try:
-            data = getattr(ev.postback, "data", "") or ""
-            chat = source_id(ev)
-
-            kv = dict(x.split("=", 1) for x in data.split("&") if "=" in x)
-            act = (kv.get("act") or "").lower()
-
-            if act == "watch":
-                url = (kv.get("url") or "").strip()
-                try:
-                    sec = int(kv.get("sec") or str(DEFAULT_PERIOD_SEC))
-                except Exception:
-                    sec = DEFAULT_PERIOD_SEC
-
-                if not url.startswith("http"):
-                    line_bot_api.reply_message(ev.reply_token, [TextSendMessage(text="URL 不正確")])
-                    return
-
-                tid, created = fs_upsert_watch(chat, url, sec)
-                status = "啟用" if created else "更新"
-                msg = f"你的任務：\n{tid}｜{status}｜{sec}s\n{canonicalize_url(url)}"
-                line_bot_api.reply_message(ev.reply_token, [TextSendMessage(text=msg, quick_reply=quick_reply_main())])
-                return
-
-            # 其它 postback 行為可在這裡擴充
-            line_bot_api.reply_message(ev.reply_token, [TextSendMessage(text="已收到操作。")])
-        except Exception as e:
-            app.logger.error(f"[postback] error: {e}")
-            try:
-                line_bot_api.reply_message(ev.reply_token, [TextSendMessage(text="處理失敗，請稍後重試。")])
-            except Exception:
-                pass
 
 @app.route("/cron/tick", methods=["GET"])
 def cron_tick():
@@ -1303,12 +1184,3 @@ def http_check_once():
 
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=int(os.getenv("PORT", "8080")))
-
-@app.get("/liff/activities")
-def liff_activities():
-    try:
-        acts = fetch_ibon_entertainments(limit=10)
-        return JSONResponse(acts)
-    except Exception as e:
-        app.logger.error(f"[liff/activities] {e}")
-        return JSONResponse({"ok": False, "error": str(e)}, status_code=500)
