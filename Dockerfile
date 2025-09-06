@@ -5,6 +5,7 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1
 
 WORKDIR /app
+COPY liff ./liff
 
 # 安裝套件（requirements.txt 內若有 'playwright==1.45.0' 也 OK，版本相容）
 COPY requirements.txt .
