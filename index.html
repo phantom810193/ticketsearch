@@ -1,0 +1,103 @@
+<!doctype html>
+<html lang="zh-Hant">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>選活動監看</title>
+  <style>
+    body { font-family: system-ui, -apple-system, "Noto Sans TC", sans-serif; padding: 16px; }
+    h2 { margin: 0 0 12px; }
+    .toolbar { display: flex; gap: 8px; margin-bottom: 12px; }
+    input[type="number"] { width: 96px; padding: 6px 8px; }
+    #list .item { border: 1px solid #e5e7eb; border-radius: 12px; padding: 12px; margin: 8px 0; display: grid; grid-template-columns: 96px 1fr; gap: 12px; }
+    .thumb { width: 96px; height: 64px; object-fit: cover; border-radius: 8px; background: #f3f4f6; }
+    .title { font-weight: 700; margin-bottom: 6px; }
+    .btns { display: flex; gap: 8px; flex-wrap: wrap; }
+    button, .btn { padding: 8px 12px; border-radius: 8px; border: 0; cursor: pointer; background: #2563eb; color: #fff; }
+    .ghost { background: #fff; color: #111827; border: 1px solid #d1d5db; }
+    .hint { color: #6b7280; font-size: 12px; margin-top: 2px; }
+  </style>
+  <script src="https://static.line-scdn.net/liff/edge/2/sdk.js"></script>
+</head>
+<body>
+  <h2>選活動監看</h2>
+  <div class="toolbar">
+    <label>每次檢查秒數：
+      <input id="sec" type="number" value="60" min="15" step="15" />
+    </label>
+    <button id="refresh" class="ghost">重新載入</button>
+  </div>
+  <div id="list">Loading...</div>
+
+  <script>
+    const LIFF_ID = "REPLACE_WITH_YOUR_LIFF_ID";
+    const API = "/liff/activities"; // Your backend endpoint from app.py
+    const MIN_SEC = 15;
+
+    function ensureSec(v) {
+      let n = parseInt(v, 10);
+      if (isNaN(n) || n < MIN_SEC) n = MIN_SEC;
+      return n;
+    }
+
+    async function fetchActivities() {
+      const res = await fetch(API, { credentials: "include" });
+      if (!res.ok) throw new Error("activities api failed");
+      return await res.json();
+    }
+
+    function renderList(acts) {
+      const list = document.getElementById("list");
+      list.innerHTML = "";
+      acts.forEach(a => {
+        const div = document.createElement("div");
+        div.className = "item";
+        div.innerHTML = `
+          <img class="thumb" src="${a.image || ""}" alt="">
+          <div>
+            <div class="title">${a.title || "活動"}</div>
+            <div class="btns">
+              <a class="btn ghost" target="_blank" href="${a.url}">🔗 看介紹</a>
+              <button class="btn watch" data-url="${a.url}">✅ 監看</button>
+            </div>
+            <div class="hint">點「監看」會回傳 /watch 指令到聊天室</div>
+          </div>
+        `;
+        div.querySelector(".watch").onclick = async (e) => {
+          const url = e.target.getAttribute("data-url");
+          const sec = ensureSec(document.getElementById("sec").value);
+          await liff.sendMessages([{ type: "text", text: `/watch ${url} ${sec}` }]);
+          liff.closeWindow();
+        };
+        list.appendChild(div);
+      });
+    }
+
+    async function boot() {
+      try {
+        await liff.init({ liffId: LIFF_ID });
+        if (!liff.isInClient()) {
+          document.getElementById("list").innerHTML = "請從 LINE 內開啟此頁";
+          return;
+        }
+        document.getElementById("refresh").onclick = main;
+        await main();
+      } catch (e) {
+        document.getElementById("list").innerText = "LIFF 初始化失敗：" + e.message;
+      }
+    }
+
+    async function main() {
+      document.getElementById("list").innerText = "Loading...";
+      try {
+        const data = await fetchActivities();
+        renderList(data);
+      } catch (e) {
+        document.getElementById("list").innerText = "載入失敗，請稍後再試。";
+      }
+    }
+
+    boot();
+  </script>
+</body>
+</html>
