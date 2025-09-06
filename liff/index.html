@@ -4,99 +4,115 @@
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1" />
   <title>選活動監看</title>
+  <script src="https://static.line-scdn.net/liff/edge/versions/2.23.1/sdk.js"></script>
   <style>
-    body { font-family: system-ui, -apple-system, "Noto Sans TC", sans-serif; padding: 16px; }
-    h2 { margin: 0 0 12px; }
-    .toolbar { display: flex; gap: 8px; margin-bottom: 12px; }
-    input[type="number"] { width: 96px; padding: 6px 8px; }
-    #list .item { border: 1px solid #e5e7eb; border-radius: 12px; padding: 12px; margin: 8px 0; display: grid; grid-template-columns: 96px 1fr; gap: 12px; }
-    .thumb { width: 96px; height: 64px; object-fit: cover; border-radius: 8px; background: #f3f4f6; }
-    .title { font-weight: 700; margin-bottom: 6px; }
-    .btns { display: flex; gap: 8px; flex-wrap: wrap; }
-    button, .btn { padding: 8px 12px; border-radius: 8px; border: 0; cursor: pointer; background: #2563eb; color: #fff; }
-    .ghost { background: #fff; color: #111827; border: 1px solid #d1d5db; }
-    .hint { color: #6b7280; font-size: 12px; margin-top: 2px; }
+    body{font-family:system-ui,-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,"Noto Sans TC",sans-serif;margin:16px}
+    .row{display:flex;gap:12px;align-items:center;margin:8px 0}
+    .grid{display:block}
+    .card{border:1px solid #eee;border-radius:12px;padding:12px;margin:10px 0}
+    .title{font-weight:700;margin-bottom:6px}
+    button{padding:8px 12px;border-radius:10px;border:1px solid #ddd;cursor:pointer}
+    .hint{color:#888;font-size:14px;margin-top:8px}
+    input[type=number]{width:90px;padding:6px 8px}
+    a{color:#0b73ff;text-decoration:none}
   </style>
-  <script src="https://static.line-scdn.net/liff/edge/2/sdk.js"></script>
 </head>
 <body>
   <h2>選活動監看</h2>
-  <div class="toolbar">
-    <label>每次檢查秒數：
-      <input id="sec" type="number" value="60" min="15" step="15" />
-    </label>
-    <button id="refresh" class="ghost">重新載入</button>
+
+  <div class="row">
+    <label>每次檢查秒數：</label>
+    <input id="sec" type="number" min="15" step="5" value="60" />
+    <button id="reload">重新載入</button>
   </div>
-  <div id="list">Loading...</div>
+  <div id="out" class="hint"></div>
+
+  <div id="list" class="grid"></div>
 
   <script>
-    const LIFF_ID = "2008066018-EMmpzmKo";
-    const API = "/liff/activities"; // Your backend endpoint from app.py
-    const MIN_SEC = 15;
+    // === 換成你的資料 ===
+    var LIFF_ID = "2008066018-EMmpzmKo";
+    var API = "/liff/activities";
+    var MIN_SEC = 15;
 
     function ensureSec(v) {
-      let n = parseInt(v, 10);
+      var n = parseInt(v, 10);
       if (isNaN(n) || n < MIN_SEC) n = MIN_SEC;
       return n;
     }
 
-    async function fetchActivities() {
-      const res = await fetch(API, { credentials: "include" });
-      if (!res.ok) throw new Error("activities api failed");
-      return await res.json();
-    }
-
-    function renderList(acts) {
-      const list = document.getElementById("list");
-      list.innerHTML = "";
-      acts.forEach(a => {
-        const div = document.createElement("div");
-        div.className = "item";
-        div.innerHTML = `
-          <img class="thumb" src="${a.image || ""}" alt="">
-          <div>
-            <div class="title">${a.title || "活動"}</div>
-            <div class="btns">
-              <a class="btn ghost" target="_blank" href="${a.url}">🔗 看介紹</a>
-              <button class="btn watch" data-url="${a.url}">✅ 監看</button>
-            </div>
-            <div class="hint">點「監看」會回傳 /watch 指令到聊天室</div>
-          </div>
-        `;
-        div.querySelector(".watch").onclick = async (e) => {
-          const url = e.target.getAttribute("data-url");
-          const sec = ensureSec(document.getElementById("sec").value);
-          await liff.sendMessages([{ type: "text", text: `/watch ${url} ${sec}` }]);
-          liff.closeWindow();
-        };
-        list.appendChild(div);
+    function fetchActs() {
+      return fetch(API, { credentials: "include" }).then(function(res) {
+        if (!res.ok) throw new Error("HTTP " + res.status);
+        return res.json();
       });
     }
 
-    async function boot() {
-      try {
-        await liff.init({ liffId: LIFF_ID });
+    function el(tag, cls, html) {
+      var d = document.createElement(tag);
+      if (cls) d.className = cls;
+      if (html != null) d.innerHTML = html;
+      return d;
+    }
+
+    function render(acts) {
+      var elList = document.getElementById("list");
+      elList.innerHTML = "";
+      if (!Array.isArray(acts) || acts.length === 0) {
+        elList.appendChild(el("div", "hint", "目前抓不到活動清單，請稍後再試。"));
+        return;
+      }
+      var sec = ensureSec(document.getElementById("sec").value);
+      acts.forEach(function(it, i) {
+        var title = (it.title || ("活動 " + (i + 1)));
+        var url = it.url;
+
+        var card = el("div", "card", "");
+        card.appendChild(el("div", "title", (String(i+1).padStart(2,"0")) + ". " + title));
+
+        var row = el("div", "row", "");
+        var link = el("a", null, "活動頁面");
+        link.href = url;
+        link.target = "_blank";
+        row.appendChild(link);
+
+        var btn = el("button", null, "✅ 監看");
+        btn.onclick = function() {
+          var s = ensureSec(document.getElementById("sec").value);
+          var text = "/watch " + url + " " + s;
+          liff.sendMessages([{ type: "text", text: text }]).then(function() {
+            alert("已送出監看指令到聊天室！");
+          }).catch(function(e) {
+            alert("送訊息失敗：" + e);
+          });
+        };
+        row.appendChild(btn);
+
+        card.appendChild(row);
+        elList.appendChild(card);
+      });
+    }
+
+    function boot() {
+      var out = document.getElementById("out");
+      liff.init({ liffId: LIFF_ID }).then(function() {
         if (!liff.isInClient()) {
-          document.getElementById("list").innerHTML = "請從 LINE 內開啟此頁";
-          return;
+          out.textContent = "提示：請從 LINE 內開啟此頁以便直接把指令送回聊天室。";
+        } else {
+          out.textContent = "";
         }
-        document.getElementById("refresh").onclick = main;
-        await main();
-      } catch (e) {
-        document.getElementById("list").innerText = "LIFF 初始化失敗：" + e.message;
-      }
+        return fetchActs().then(render).catch(function(e){
+          document.getElementById("list").innerHTML =
+            "<div class='hint'>讀取活動清單失敗，請確認後端 /liff/activities 是否可用。</div>";
+          console.error(e);
+        });
+      }).catch(function(e) {
+        out.textContent = "LIFF 初始化失敗，請確認 LIFF ID 與 Endpoint URL 設定。";
+        console.error(e);
+      });
     }
 
-    async function main() {
-      document.getElementById("list").innerText = "Loading...";
-      try {
-        const data = await fetchActivities();
-        renderList(data);
-      } catch (e) {
-        document.getElementById("list").innerText = "載入失敗，請稍後再試。";
-      }
-    }
-
+    document.getElementById("reload").onclick = boot;
     boot();
   </script>
 </body>
