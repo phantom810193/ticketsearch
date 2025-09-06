@@ -12,6 +12,7 @@ from typing import Dict, Tuple, Optional, Any, List
 from urllib.parse import urlparse, urlunparse, parse_qs, urlencode, urljoin
 
 import requests
+from urllib.parse import urljoin
 from flask import Flask, request, abort, jsonify
 
 # --------- LINE SDK（可選）---------
@@ -1302,3 +1303,12 @@ def http_check_once():
 
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=int(os.getenv("PORT", "8080")))
+
+@app.get("/liff/activities")
+def liff_activities():
+    try:
+        acts = fetch_ibon_entertainments(limit=10)
+        return JSONResponse(acts)
+    except Exception as e:
+        app.logger.error(f"[liff/activities] {e}")
+        return JSONResponse({"ok": False, "error": str(e)}, status_code=500)
