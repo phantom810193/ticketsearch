@@ -13,8 +13,6 @@ from typing import Dict, Tuple, Optional, Any, List
 from urllib.parse import urlparse, urlunparse, parse_qs, urlencode, urljoin
 from flask import send_from_directory
 from flask import jsonify, Flask, request, abort
-from flask_cors import CORS
-CORS(app, resources={r"/liff/*": {"origins": "*"}}, supports_credentials=True)
 
 # --------- LINE SDK（可選）---------
 HAS_LINE = True
@@ -37,7 +35,34 @@ from google.cloud import firestore
 # HTML 解析
 from bs4 import BeautifulSoup
 
+# ===== Flask & CORS =====
 app = Flask(__name__)
+
+# 建議：白名單（可多個網域）
+# 1) 一定要包含 LIFF 的網域： https://liff.line.me
+# 2) 再加入你 Cloud Run 的完整網址（請改成你的實際網址）
+ALLOWED_ORIGINS = [
+    "https://liff.line.me",
+    "https://ticketsearch-419460755270.asia-east1.run.app",  # ← 換成你的
+]
+
+try:
+    from flask_cors import CORS
+    # 只開 /liff/* 路徑（/liff/activities、/liff/ 等）
+    CORS(
+        app,
+        resources={
+            r"/liff/*": {
+                "origins": ALLOWED_ORIGINS,
+                # 可視需要補上允許的方法/標頭（預設就夠用）
+                # "methods": ["GET", "OPTIONS"],
+                # "allow_headers": ["Content-Type"],
+            }
+        },
+        supports_credentials=True,  # 你前端 fetch 有帶 credentials 時需要
+    )
+except Exception as e:
+    app.logger.warning(f"flask-cors not available: {e}")
 logging.basicConfig(level=os.getenv("LOG_LEVEL", "INFO"))
 app.logger.setLevel(logging.INFO)
 
