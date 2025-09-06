@@ -1,120 +1,156 @@
-<!doctype html>
+<!-- liff.html -->
+<!DOCTYPE html>
 <html lang="zh-Hant">
 <head>
-  <meta charset="utf-8" />
-  <meta name="viewport" content="width=device-width, initial-scale=1" />
-  <title>選活動監看</title>
-  <script src="https://static.line-scdn.net/liff/edge/versions/2.23.1/sdk.js"></script>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <title>票數偵測 LIFF</title>
   <style>
-    body{font-family:system-ui,-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,"Noto Sans TC",sans-serif;margin:16px}
-    .row{display:flex;gap:12px;align-items:center;margin:8px 0}
-    .grid{display:block}
-    .card{border:1px solid #eee;border-radius:12px;padding:12px;margin:10px 0}
-    .title{font-weight:700;margin-bottom:6px}
-    button{padding:8px 12px;border-radius:10px;border:1px solid #ddd;cursor:pointer}
-    .hint{color:#888;font-size:14px;margin-top:8px}
-    input[type=number]{width:90px;padding:6px 8px}
-    a{color:#0b73ff;text-decoration:none}
+    body { font-family: -apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,Helvetica,Arial,"Noto Sans TC",sans-serif; margin:16px; }
+    .row { display:flex; gap:12px; align-items:center; margin-top:8px; flex-wrap:wrap; }
+    .card { border:1px solid #ddd; border-radius:12px; padding:12px; margin:10px 0; }
+    .title { font-weight:700; }
+    .hint { color:#666; }
+    button { padding:8px 12px; border-radius:10px; border:1px solid #ccc; cursor:pointer; }
+    input { padding:6px 8px; border-radius:8px; border:1px solid #ccc; width:90px; }
+    #out { margin-bottom:8px; color:#999; }
   </style>
+  <script src="https://static.line-scdn.net/liff/edge/2/sdk.js"></script>
 </head>
 <body>
-  <h2>選活動監看</h2>
-
   <div class="row">
-    <label>每次檢查秒數：</label>
-    <input id="sec" type="number" min="15" step="5" value="60" />
-    <button id="reload">重新載入</button>
+    監看秒數：<input id="sec" type="number" min="15" step="1" value="30" />
+    <button id="reload">重新整理清單</button>
   </div>
-  <div id="out" class="hint"></div>
+  <div id="out" class="hint">初始化中…</div>
+  <div id="list"></div>
 
-  <div id="list" class="grid"></div>
+<script>
+/** ====== 請改這三個常數 ====== */
+const LIFF_ID = "你的-LIFF-ID";
+const API     = "https://你的服務域名/liff/activities"; // 後端活動清單 API
+const MIN_SEC = 15;
+/** ================================= */
 
-  <script>
-    // === 換成你的資料 ===
-    const LIFF_ID = "2008066018-EMmpzmKo";
-    const API = "https://ticketsearch-419460755270.asia-east1.run.app/liff/activities";
-    const MIN_SEC = 15;
-  </script>
+function ensureSec(v) {
+  var n = parseInt(v, 10);
+  if (isNaN(n) || n < MIN_SEC) n = MIN_SEC;
+  return n;
+}
 
-    function ensureSec(v) {
-      var n = parseInt(v, 10);
-      if (isNaN(n) || n < MIN_SEC) n = MIN_SEC;
-      return n;
+function fetchActs() {
+  return fetch(API, { credentials: "include" })
+    .then(function(res) {
+      if (!res.ok) throw new Error("HTTP " + res.status);
+      return res.json();
+    });
+}
+
+function el(tag, cls, html) {
+  var d = document.createElement(tag);
+  if (cls) d.className = cls;
+  if (html != null) d.innerHTML = html;
+  return d;
+}
+
+function render(acts) {
+  var elList = document.getElementById("list");
+  elList.innerHTML = "";
+
+  if (!Array.isArray(acts) || acts.length === 0) {
+    elList.appendChild(el("div", "hint", "目前抓不到活動清單，請稍後再試。"));
+    return;
+  }
+
+  var sec = ensureSec(document.getElementById("sec").value);
+
+  acts.forEach(function(it, i) {
+    var title = (it.title || ("活動 " + (i + 1)));
+    var url = it.url || "";
+
+    var card = el("div", "card", "");
+    card.appendChild(el("div", "title", (String(i+1).padStart(2,"0")) + ". " + title));
+
+    var row = el("div", "row", "");
+
+    var link = el("a", null, "活動頁面");
+    if (url) {
+      link.href = url;
+      link.target = "_blank";
+    } else {
+      link.className = "hint";
+      link.href = "javascript:void(0)";
+      link.innerHTML = "（無有效連結）";
     }
+    row.appendChild(link);
 
-    function fetchActs() {
-      return fetch(API, { credentials: "include" }).then(function(res) {
-        if (!res.ok) throw new Error("HTTP " + res.status);
-        return res.json();
-      });
-    }
+    var btn = el("button", null, "✅ 監看");
+    btn.onclick = async function() {
+      var s = ensureSec(document.getElementById("sec").value);
+      var text = "/watch " + url + " " + s;
 
-    function el(tag, cls, html) {
-      var d = document.createElement(tag);
-      if (cls) d.className = cls;
-      if (html != null) d.innerHTML = html;
-      return d;
-    }
-
-    function render(acts) {
-      var elList = document.getElementById("list");
-      elList.innerHTML = "";
-      if (!Array.isArray(acts) || acts.length === 0) {
-        elList.appendChild(el("div", "hint", "目前抓不到活動清單，請稍後再試。"));
+      // 若沒有 URL，僅送 /watch（或直接擋下）
+      if (!url) {
+        alert("此活動沒有可用的 URL，無法監看。");
         return;
       }
-      var sec = ensureSec(document.getElementById("sec").value);
-      acts.forEach(function(it, i) {
-        var title = (it.title || ("活動 " + (i + 1)));
-        var url = it.url;
 
-        var card = el("div", "card", "");
-        card.appendChild(el("div", "title", (String(i+1).padStart(2,"0")) + ". " + title));
+      btn.disabled = true;
+      btn.textContent = "送出中…";
 
-        var row = el("div", "row", "");
-        var link = el("a", null, "活動頁面");
-        link.href = url;
-        link.target = "_blank";
-        row.appendChild(link);
-
-        var btn = el("button", null, "✅ 監看");
-        btn.onclick = function() {
-          var s = ensureSec(document.getElementById("sec").value);
-          var text = "/watch " + url + " " + s;
-          liff.sendMessages([{ type: "text", text: text }]).then(function() {
-            alert("已送出監看指令到聊天室！");
-          }).catch(function(e) {
-            alert("送訊息失敗：" + e);
-          });
-        };
-        row.appendChild(btn);
-
-        card.appendChild(row);
-        elList.appendChild(card);
-      });
-    }
-
-    function boot() {
-      var out = document.getElementById("out");
-      liff.init({ liffId: LIFF_ID }).then(function() {
+      try {
         if (!liff.isInClient()) {
-          out.textContent = "提示：請從 LINE 內開啟此頁以便直接把指令送回聊天室。";
-        } else {
-          out.textContent = "";
+          // 不在 LINE 內 → 提示並 fallback
+          alert("提示：目前不是從 LINE 內開啟，將僅開啟活動頁面。");
+          window.open(url, "_blank");
+          return;
         }
-        return fetchActs().then(render).catch(function(e){
-          document.getElementById("list").innerHTML =
-            "<div class='hint'>讀取活動清單失敗，請確認後端 /liff/activities 是否可用。</div>";
-          console.error(e);
-        });
-      }).catch(function(e) {
-        out.textContent = "LIFF 初始化失敗，請確認 LIFF ID 與 Endpoint URL 設定。";
+        await liff.sendMessages([{ type: "text", text }]);
+        // 成功後自動開啟活動頁（可改 external:true 用外部瀏覽器）
+        await liff.openWindow({ url, external: false });
+      } catch (e) {
+        alert("送訊息或開啟頁面失敗：" + e);
         console.error(e);
-      });
+      } finally {
+        btn.disabled = false;
+        btn.textContent = "✅ 監看";
+      }
+    };
+
+    row.appendChild(btn);
+    card.appendChild(row);
+    elList.appendChild(card);
+  });
+}
+
+async function boot() {
+  var out = document.getElementById("out");
+  out.textContent = "LIFF 初始化中…";
+
+  try {
+    await liff.init({ liffId: LIFF_ID });
+
+    if (!liff.isInClient()) {
+      out.textContent = "提示：請從 LINE 內開啟此頁，以便直接把指令送回聊天室。";
+    } else {
+      out.textContent = "";
     }
 
-    document.getElementById("reload").onclick = boot;
-    boot();
-  </script>
+    const acts = await fetchActs();
+    render(acts);
+  } catch (e) {
+    document.getElementById("list").innerHTML = `
+      <div class="card">
+        <div class="title">讀取活動清單失敗</div>
+        <div class="hint">請確認後端 <code>/liff/activities</code> 是否可用、CORS 設定是否正確。</div>
+      </div>`;
+    out.textContent = "LIFF 初始化失敗或 API 取用失敗。";
+    console.error(e);
+  }
+}
+
+document.getElementById("reload").onclick = boot;
+boot();
+</script>
 </body>
 </html>
