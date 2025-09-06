@@ -13,6 +13,8 @@ from typing import Dict, Tuple, Optional, Any, List
 from urllib.parse import urlparse, urlunparse, parse_qs, urlencode, urljoin
 from flask import send_from_directory
 from flask import jsonify, Flask, request, abort
+from flask_cors import CORS
+CORS(app, resources={r"/liff/*": {"origins": "*"}}, supports_credentials=True)
 
 # --------- LINE SDK（可選）---------
 HAS_LINE = True

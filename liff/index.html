@@ -1,21 +1,21 @@
-<!-- liff.html -->
-<!DOCTYPE html>
+<!-- liff/index.html -->
+<!doctype html>
 <html lang="zh-Hant">
 <head>
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width,initial-scale=1" />
   <title>票數偵測 LIFF</title>
+  <script src="https://static.line-scdn.net/liff/edge/versions/2.23.1/sdk.js"></script>
   <style>
-    body { font-family: -apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,Helvetica,Arial,"Noto Sans TC",sans-serif; margin:16px; }
+    body { font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,Helvetica,Arial,"Noto Sans TC",sans-serif; margin:16px; }
     .row { display:flex; gap:12px; align-items:center; margin-top:8px; flex-wrap:wrap; }
     .card { border:1px solid #ddd; border-radius:12px; padding:12px; margin:10px 0; }
     .title { font-weight:700; }
     .hint { color:#666; }
     button { padding:8px 12px; border-radius:10px; border:1px solid #ccc; cursor:pointer; }
     input { padding:6px 8px; border-radius:8px; border:1px solid #ccc; width:90px; }
-    #out { margin-bottom:8px; color:#999; }
+    #out { margin:8px 0; color:#999; }
   </style>
-  <script src="https://static.line-scdn.net/liff/edge/2/sdk.js"></script>
 </head>
 <body>
   <div class="row">
@@ -26,58 +26,55 @@
   <div id="list"></div>
 
 <script>
-/** ====== 請改這三個常數 ====== */
-const LIFF_ID = "你的-LIFF-ID";
-const API     = "https://你的服務域名/liff/activities"; // 後端活動清單 API
-const MIN_SEC = 15;
-/** ================================= */
+/** ====== 你的設定（使用完整網域） ====== */
+var LIFF_ID = "2008066018-EMmpzmKo";  // 你的 LIFF ID
+var API     = "https://ticketsearch-419460755270.asia-east1.run.app/liff/activities"; // ← 改成你的完整網址
+var MIN_SEC = 15;
+/** ===================================== */
 
-function ensureSec(v) {
+function ensureSec(v){
   var n = parseInt(v, 10);
   if (isNaN(n) || n < MIN_SEC) n = MIN_SEC;
   return n;
 }
 
-function fetchActs() {
-  return fetch(API, { credentials: "include" })
-    .then(function(res) {
-      if (!res.ok) throw new Error("HTTP " + res.status);
-      return res.json();
-    });
+function fetchActs(){
+  // 用完整網域時，建議帶上 credentials，後端需允許 CORS
+  return fetch(API, { credentials: "include", mode: "cors" }).then(function(res){
+    if (!res.ok) throw new Error("HTTP " + res.status);
+    return res.json();
+  });
 }
 
-function el(tag, cls, html) {
+function el(tag, cls, html){
   var d = document.createElement(tag);
   if (cls) d.className = cls;
   if (html != null) d.innerHTML = html;
   return d;
 }
 
-function render(acts) {
+function render(acts){
   var elList = document.getElementById("list");
   elList.innerHTML = "";
 
-  if (!Array.isArray(acts) || acts.length === 0) {
+  if (!Array.isArray(acts) || acts.length === 0){
     elList.appendChild(el("div", "hint", "目前抓不到活動清單，請稍後再試。"));
     return;
   }
 
-  var sec = ensureSec(document.getElementById("sec").value);
-
-  acts.forEach(function(it, i) {
-    var title = (it.title || ("活動 " + (i + 1)));
-    var url = it.url || "";
+  acts.forEach(function(it, i){
+    var title = it.title || ("活動 " + (i + 1));
+    var url   = it.url || "";
 
     var card = el("div", "card", "");
-    card.appendChild(el("div", "title", (String(i+1).padStart(2,"0")) + ". " + title));
+    card.appendChild(el("div", "title", String(i+1).padStart(2,"0") + ". " + title));
 
-    var row = el("div", "row", "");
-
+    var row  = el("div", "row", "");
     var link = el("a", null, "活動頁面");
-    if (url) {
+    if (url){
       link.href = url;
       link.target = "_blank";
-    } else {
+    }else{
       link.className = "hint";
       link.href = "javascript:void(0)";
       link.innerHTML = "（無有效連結）";
@@ -85,36 +82,27 @@ function render(acts) {
     row.appendChild(link);
 
     var btn = el("button", null, "✅ 監看");
-    btn.onclick = async function() {
+    btn.onclick = function(){
+      if (!url){ alert("此活動沒有可用的 URL，無法監看。"); return; }
       var s = ensureSec(document.getElementById("sec").value);
       var text = "/watch " + url + " " + s;
 
-      // 若沒有 URL，僅送 /watch（或直接擋下）
-      if (!url) {
-        alert("此活動沒有可用的 URL，無法監看。");
+      btn.disabled = true; btn.textContent = "送出中…";
+      var finish = function(){ btn.disabled = false; btn.textContent = "✅ 監看"; };
+
+      if (!liff.isInClient()){
+        alert("提示：目前不是從 LINE 內開啟，將僅開啟活動頁面。");
+        window.open(url, "_blank");
+        finish();
         return;
       }
-
-      btn.disabled = true;
-      btn.textContent = "送出中…";
-
-      try {
-        if (!liff.isInClient()) {
-          // 不在 LINE 內 → 提示並 fallback
-          alert("提示：目前不是從 LINE 內開啟，將僅開啟活動頁面。");
-          window.open(url, "_blank");
-          return;
-        }
-        await liff.sendMessages([{ type: "text", text }]);
-        // 成功後自動開啟活動頁（可改 external:true 用外部瀏覽器）
-        await liff.openWindow({ url, external: false });
-      } catch (e) {
+      liff.sendMessages([{ type:"text", text:text }]).then(function(){
+        alert("已送出監看指令到聊天室！");
+        return liff.openWindow({ url: url, external: false });
+      }).catch(function(e){
         alert("送訊息或開啟頁面失敗：" + e);
         console.error(e);
-      } finally {
-        btn.disabled = false;
-        btn.textContent = "✅ 監看";
-      }
+      }).finally(finish);
     };
 
     row.appendChild(btn);
@@ -123,30 +111,31 @@ function render(acts) {
   });
 }
 
-async function boot() {
+function showApiError(){
+  var elList = document.getElementById("list");
+  elList.innerHTML =
+    "<div class='card'><div class='title'>讀取活動清單失敗</div>" +
+    "<div class='hint'>請確認後端 " + API + " 是否 200 OK，並開啟 CORS。</div></div>";
+}
+
+function boot(){
   var out = document.getElementById("out");
   out.textContent = "LIFF 初始化中…";
 
-  try {
-    await liff.init({ liffId: LIFF_ID });
-
-    if (!liff.isInClient()) {
+  liff.init({ liffId: LIFF_ID }).then(function(){
+    if (!liff.isInClient()){
       out.textContent = "提示：請從 LINE 內開啟此頁，以便直接把指令送回聊天室。";
-    } else {
+    }else{
       out.textContent = "";
     }
-
-    const acts = await fetchActs();
-    render(acts);
-  } catch (e) {
-    document.getElementById("list").innerHTML = `
-      <div class="card">
-        <div class="title">讀取活動清單失敗</div>
-        <div class="hint">請確認後端 <code>/liff/activities</code> 是否可用、CORS 設定是否正確。</div>
-      </div>`;
-    out.textContent = "LIFF 初始化失敗或 API 取用失敗。";
+    return fetchActs().then(render).catch(function(e){
+      console.error(e); showApiError();
+    });
+  }).catch(function(e){
     console.error(e);
-  }
+    out.textContent = "LIFF 初始化失敗或 API 取用失敗。";
+    showApiError();
+  });
 }
 
 document.getElementById("reload").onclick = boot;

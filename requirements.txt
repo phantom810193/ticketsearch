@@ -5,6 +5,7 @@ requests==2.32.3
 beautifulsoup4==4.12.3
 lxml>=5.3,<6
 line-bot-sdk>=3.11,<4
+flask-cors
 
 # Google Cloud
 google-cloud-firestore==2.16.0
