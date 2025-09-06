@@ -10,6 +10,7 @@ import traceback
 from datetime import datetime, timezone, timedelta
 from typing import Dict, Tuple, Optional, Any, List
 from urllib.parse import urlparse, urlunparse, parse_qs, urlencode, urljoin
+from flask import send_from_directory
 
 import requests
 from flask import Flask, request, abort, jsonify
@@ -1184,3 +1185,7 @@ def http_check_once():
 
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=int(os.getenv("PORT", "8080")))
+
+@app.route("/liff/", methods=["GET"])
+def liff_index():
+    return send_from_directory("liff", "index.html")
