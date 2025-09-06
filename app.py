@@ -14,6 +14,114 @@ from urllib.parse import urlparse, urlunparse, parse_qs, urlencode, urljoin
 from flask import send_from_directory
 from flask import jsonify, Flask, request, abort
 
+IBON_API = "https://ticketapi.ibon.com.tw/api/ActivityInfo/GetIndexData"
+IBON_BASE = "https://ticket.ibon.com.tw/"
+
+# 簡單快取（5 分鐘）
+_cache = {"ts": 0, "data": []}
+_CACHE_TTL = 300  # 秒
+
+_CONCERT_WORDS = ("演唱會", "演場會", "音樂會", "演唱", "演出", "LIVE", "Live")
+
+def _looks_like_concert(title: str) -> bool:
+    t = title or ""
+    return any(w.lower() in t.lower() for w in _CONCERT_WORDS)
+
+def _normalize_item(row):
+    """
+    將 ibon API 的活動項目轉為 {title,url,image}
+    兼容不同欄位名稱。
+    """
+    title = row.get("Title") or row.get("ActivityTitle") or row.get("Name") or "活動"
+    img = (row.get("ImgUrl") or row.get("ImageUrl") or row.get("Image") or "").strip() or None
+
+    # 可能直接給 Url，也可能只有 ActivityId/Id
+    url = (row.get("Url") or row.get("LinkUrl") or "").strip()
+    if not url:
+        act_id = row.get("ActivityId") or row.get("Id") or row.get("ID")
+        if act_id:
+            url = urljoin(IBON_BASE, f"/ActivityInfo/Details/{act_id}")
+
+    # 統一為絕對網址
+    if url and not url.lower().startswith("http"):
+        url = urljoin(IBON_BASE, url)
+
+    # 有些圖片給相對路徑
+    if img and not img.lower().startswith("http"):
+        img = urljoin(IBON_BASE, img)
+
+    return {"title": title.strip(), "url": url, "image": img}
+
+def fetch_ibon_list_via_api(limit=10, keyword=None, only_concert=False):
+    """
+    直接打 ibon 官方 API 抽取活動清單。
+    回傳：[{title, url, image}, ...]
+    """
+    global _cache
+    now = time.time()
+    if now - _cache["ts"] < _CACHE_TTL and _cache["data"]:
+        rows = _cache["data"]
+    else:
+        headers = {
+            "User-Agent": "Mozilla/5.0",
+            "Accept": "application/json, text/plain, */*",
+            "Origin": "https://ticket.ibon.com.tw",
+            "Referer": "https://ticket.ibon.com.tw/Index/entertainment",
+        }
+        # 多數情況用 POST；若 GET 也能回資料，可改成 requests.get(...)
+        try:
+            resp = requests.post(IBON_API, headers=headers, timeout=12, json={})
+            resp.raise_for_status()
+            data = resp.json()
+        except Exception as e:
+            logging.getLogger().error(f"[ibon api] request failed: {e}")
+            return []
+
+        # 解析可能的包裝層
+        # 常見層級：{ "Data": { <多個區塊> } } 或 { "data": [...] } 等
+        blobs = []
+        root = data.get("Data") or data.get("data") or data
+        if isinstance(root, dict):
+            # 收集所有陣列欄位（包含 "ActivityList", "Items" 等）
+            for v in root.values():
+                if isinstance(v, list):
+                    blobs.extend(v)
+                elif isinstance(v, dict) and isinstance(v.get("ActivityList"), list):
+                    blobs.extend(v["ActivityList"])
+        elif isinstance(root, list):
+            blobs = root
+
+        # 最後再保底：如果還是 dict，找出所有內層 list
+        if not blobs and isinstance(data, dict):
+            for v in data.values():
+                if isinstance(v, list):
+                    blobs.extend(v)
+
+        rows = []
+        for r in blobs:
+            try:
+                item = _normalize_item(r)
+                if not item.get("url"):
+                    continue
+                rows.append(item)
+            except Exception:
+                continue
+
+        _cache = {"ts": now, "data": rows}
+
+    # 關鍵字/只要演唱會的過濾
+    out = []
+    kw = (keyword or "").strip()
+    for it in rows:
+        if kw and kw not in it["title"]:
+            continue
+        if only_concert and not _looks_like_concert(it["title"]):
+            continue
+        out.append(it)
+        if len(out) >= max(1, int(limit)):
+            break
+    return out
+
 # --------- LINE SDK（可選）---------
 HAS_LINE = True
 try:
@@ -47,7 +155,7 @@ ALLOWED_ORIGINS = [
 ]
 
 try:
-    from flask_cors import CORS
+    from flask_cors import CORS  # type: ignore
     # 只開 /liff/* 路徑（/liff/activities、/liff/ 等）
     CORS(
         app,
