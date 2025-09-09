@@ -30,15 +30,25 @@ def _looks_like_concert(title: str) -> bool:
 def _normalize_item(row):
     """
     將 ibon API 的活動項目轉為 {title,url,image}
-    兼容不同欄位名稱。
+    兼容不同欄位名稱（含 ActivityInfoId / Link 等）。
     """
-    title = row.get("Title") or row.get("ActivityTitle") or row.get("Name") or "活動"
-    img = (row.get("ImgUrl") or row.get("ImageUrl") or row.get("Image") or "").strip() or None
+    # title
+    title = (row.get("Title") or row.get("ActivityTitle") or row.get("GameName")
+             or row.get("Name") or row.get("Subject") or "活動")
 
-    # 可能直接給 Url，也可能只有 ActivityId/Id
-    url = (row.get("Url") or row.get("LinkUrl") or "").strip()
+    # image
+    img = (row.get("ImgUrl") or row.get("ImageUrl") or row.get("Image")
+           or row.get("PicUrl") or row.get("PictureUrl") or "").strip() or None
+
+    # url / id
+    url = (row.get("Url") or row.get("URL") or row.get("LinkUrl")
+           or row.get("LinkURL") or row.get("Link") or "").strip()
+
     if not url:
-        act_id = row.get("ActivityId") or row.get("Id") or row.get("ID")
+        act_id = (row.get("ActivityInfoId") or row.get("ActivityInfoID")
+                  or row.get("ActivityId") or row.get("ActivityID")
+                  or row.get("GameId") or row.get("GameID")
+                  or row.get("Id") or row.get("ID"))
         if act_id:
             url = urljoin(IBON_BASE, f"/ActivityInfo/Details/{act_id}")
 
@@ -50,7 +60,7 @@ def _normalize_item(row):
     if img and not img.lower().startswith("http"):
         img = urljoin(IBON_BASE, img)
 
-    return {"title": title.strip(), "url": url, "image": img}
+    return {"title": str(title).strip(), "url": url, "image": img}
 
 def fetch_ibon_list_via_api(limit=10, keyword=None, only_concert=False):
     """
@@ -1316,7 +1326,7 @@ def http_check_once():
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=int(os.getenv("PORT", "8080")))
 
-def fetch_ibon_entertainments(limit=10, keyword=None):
+def fetch_ibon_entertainments(limit=10, keyword=None, only_concert=False):
     url = "https://ticket.ibon.com.tw/Index/entertainment"
     try:
         r = requests.get(url, timeout=12, headers={
@@ -1331,40 +1341,38 @@ def fetch_ibon_entertainments(limit=10, keyword=None):
 
         items, seen = [], set()
 
-        # === (A) 抓一般區域的活動連結 ===
+        def _push(href, title, img):
+            if href in seen:
+                return False
+            if keyword and keyword not in title:
+                return False
+            if only_concert and not _looks_like_concert(title):
+                return False
+            seen.add(href)
+            items.append({"title": title, "url": href, "image": img})
+            return len(items) >= max(1, int(limit))
+
+        # (A) 一般區塊
         for a in soup.select('a[href*="/ActivityInfo/Details/"]'):
             href = urljoin(url, (a.get("href") or "").strip())
-            if href in seen:
-                continue
-            seen.add(href)
             title = (a.get("title") or a.get_text(" ", strip=True) or "活動").strip()
-            if keyword and keyword not in title:
-                continue
             img = None
             img_tag = a.select_one("img")
             if img_tag and img_tag.get("src"):
                 img = urljoin(url, img_tag["src"])
-            items.append({"title": title, "url": href, "image": img})
-            if len(items) >= max(1, int(limit)):
-                break
+            if _push(href, title, img):
+                return items
 
-        # === (B) 抓「輪播區域」的活動連結 ===
-        # 輪播的結構通常在 class="swiper-slide" 或 "carousel" 裡
+        # (B) 輪播區（若 HTML 有 render 出來）
         for slide in soup.select('.swiper-slide a[href*="/ActivityInfo/Details/"]'):
             href = urljoin(url, (slide.get("href") or "").strip())
-            if href in seen:
-                continue
-            seen.add(href)
             title = (slide.get("title") or slide.get_text(" ", strip=True) or "活動").strip()
-            if keyword and keyword not in title:
-                continue
             img = None
             img_tag = slide.select_one("img")
             if img_tag and img_tag.get("src"):
                 img = urljoin(url, img_tag["src"])
-            items.append({"title": title, "url": href, "image": img})
-            if len(items) >= max(1, int(limit)):
-                break
+            if _push(href, title, img):
+                return items
 
         return items
     except Exception as e:
@@ -1380,8 +1388,8 @@ def _truthy(v: Optional[str]) -> bool:
 
 def fetch_ibon_carousel_from_api(limit=10, keyword=None, only_concert=False):
     """
-    透過 ibon 首頁 API 只抓「輪播/廣告/焦點」區塊的活動清單。
-    會優先挑出鍵名包含 banner/carousel/advertising/slider/swiper/focus 的 list。
+    透過 ibon 首頁 API 抓「輪播/廣告/焦點」清單；
+    若抓不到，會把整份 JSON 內所有 list 都嘗試正規化。
     回傳：[{title, url, image}, ...]
     """
     url = IBON_API
@@ -1393,7 +1401,6 @@ def fetch_ibon_carousel_from_api(limit=10, keyword=None, only_concert=False):
     }
 
     def _iter_lists(obj, path=""):
-        # 遞迴尋找所有 list，保留路徑方便判斷是否為輪播區
         if isinstance(obj, list):
             yield (path, obj)
         elif isinstance(obj, dict):
@@ -1403,34 +1410,47 @@ def fetch_ibon_carousel_from_api(limit=10, keyword=None, only_concert=False):
 
     def _looks_like_carousel(path: str) -> bool:
         p = path.lower()
-        keys = ("banner", "carousel", "advertising", "advertisement", "adlist", "ad_list",
-                "slider", "swiper", "focus", "marquee")
+        keys = (
+            "banner", "carousel", "advertising", "advertisement", "adlist", "ad_list",
+            "slider", "swiper", "focus", "marquee", "head", "top", "mainbanner",
+            "bannerlist", "indexad", "main_ad"
+        )
         return any(k in p for k in keys)
 
-    try:
-        resp = requests.post(url, headers=headers, timeout=12, json={})
-        resp.raise_for_status()
-        data = resp.json()
-    except Exception as e:
-        app.logger.error(f"[carousel-api] request failed: {e}")
+    # 先 POST，失敗再 GET 當後備
+    data = None
+    for method in ("POST", "GET"):
+        try:
+            if method == "POST":
+                resp = requests.post(url, headers=headers, timeout=12, json={})
+            else:
+                resp = requests.get(url, headers=headers, timeout=12)
+            resp.raise_for_status()
+            data = resp.json()
+            break
+        except Exception as e:
+            app.logger.error(f"[carousel-api] {method} failed: {e}")
+    if data is None:
         return []
 
-    # 把所有 list 依「像不像輪播」區分
     car_lists, other_lists = [], []
     for path, arr in _iter_lists(data):
         if not isinstance(arr, list) or not arr:
             continue
         (car_lists if _looks_like_carousel(path) else other_lists).append((path, arr))
 
-    # 轉標準結構 + 去重
-    seen_urls: set[str] = set()
-    items: list[dict] = []
+    seen_urls: set = set()
+    items: List[Dict[str, Any]] = []
 
     def _append_from_list(arr):
         nonlocal items, seen_urls
         for r in arr:
+            # 有時候元素是巢狀 dict（如 {"Activity": {...}}）
+            cand = r
+            if isinstance(r, dict) and len(r) == 1 and isinstance(next(iter(r.values())), dict):
+                cand = next(iter(r.values()))
             try:
-                it = _normalize_item(r)
+                it = _normalize_item(cand if isinstance(cand, dict) else r)
                 if not it.get("url"):
                     continue
                 if keyword and keyword not in it["title"]:
@@ -1448,42 +1468,79 @@ def fetch_ibon_carousel_from_api(limit=10, keyword=None, only_concert=False):
                 continue
         return False
 
-    # 先吃輪播，再補一般
+    # 先吃疑似輪播
     for _, arr in car_lists:
         if _append_from_list(arr):
             break
+
+    # 不足再吃其他清單
     if len(items) < limit:
         for _, arr in other_lists:
             if _append_from_list(arr):
                 break
+
+    # 還是抓不到：最後從整份 JSON 字串找 /ActivityInfo/Details/<id>
+    if len(items) < 1:
+        try:
+            s = json.dumps(data, ensure_ascii=False)
+            for m in re.finditer(r'/ActivityInfo/Details/(\d+)', s):
+                url2 = urljoin(IBON_BASE, m.group(0))
+                if url2 in seen_urls:
+                    continue
+                items.append({"title": "活動", "url": url2, "image": None})
+                seen_urls.add(url2)
+                if len(items) >= limit:
+                    break
+        except Exception:
+            pass
 
     return items[:limit]
 
 # ====== 替換：/liff/activities 以多來源 fallback（優先輪播） ======
 @app.route("/liff/activities", methods=["GET"])
 def liff_activities():
-    # 參數：?limit=10&onlyConcert=1&q=關鍵字
+    # 參數：?limit=10&onlyConcert=1&q=關鍵字&debug=1
     try:
         limit = int(request.args.get("limit", "10"))
     except Exception:
         limit = 10
-
     kw = request.args.get("q") or None
     only_concert = _truthy(request.args.get("onlyConcert"))
+    want_debug = _truthy(request.args.get("debug"))
+
+    dbg = {"steps": []}
 
     try:
-        # 1) 先用 API 撈輪播（banner/carousel/advertising/swiper/focus）
+        # 1) API 輪播
         acts = fetch_ibon_carousel_from_api(limit=limit, keyword=kw, only_concert=only_concert)
+        dbg["steps"].append({"phase": "carousel_api", "count": len(acts)})
 
-        # 2) 若輪播空 → 退回全站首頁 API 泛抓
+        # 2) API 泛抓
         if not acts:
             acts = fetch_ibon_list_via_api(limit=limit, keyword=kw, only_concert=only_concert)
+            dbg["steps"].append({"phase": "api_generic", "count": len(acts)})
 
-        # 3) 還是空 → 用 HTML 解析保底
+        # 3) HTML 保底
         if not acts:
-            acts = fetch_ibon_entertainments(limit=limit, keyword=kw)
+            acts = fetch_ibon_entertainments(limit=limit, keyword=kw, only_concert=only_concert)
+            dbg["steps"].append({"phase": "html_fallback", "count": len(acts)})
+
+        if want_debug:
+            return jsonify({
+                "ok": True,
+                "count": len(acts),
+                "preview": acts[:2],
+                "trace": dbg["steps"],
+            }), 200
 
         return jsonify(acts[:limit]), 200
+
+    except Exception as e:
+        app.logger.error(f"/liff/activities error: {e}")
+        if want_debug:
+            dbg["error"] = str(e)
+            return jsonify({"ok": False, **dbg}), 200
+        return jsonify({"ok": False, "error": str(e)}), 500
 
     except Exception as e:
         app.logger.error(f"/liff/activities error: {e}")
