@@ -1326,55 +1326,81 @@ def http_check_once():
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=int(os.getenv("PORT", "8080")))
 
-def fetch_ibon_entertainments(limit=10, keyword=None, only_concert=False):
+def fetch_ibon_entertainments(limit=10, keyword=None):
     url = "https://ticket.ibon.com.tw/Index/entertainment"
+    api_url = "https://ticketapi.ibon.com.tw/api/ActivityInfo/GetIndexData"
+    items, seen = [], set()
+
+    # --- Step 1: 先打 API 拿活動 ID 與標題 ---
+    api_rows = []
+    try:
+        r_api = requests.post(api_url, timeout=12, headers={
+            "User-Agent": "Mozilla/5.0",
+            "Accept": "application/json, text/plain, */*",
+            "Origin": "https://ticket.ibon.com.tw",
+            "Referer": url,
+        }, json={})
+        r_api.raise_for_status()
+        data = r_api.json()
+
+        root = data.get("Data") or data.get("data") or data
+        if isinstance(root, dict):
+            for v in root.values():
+                if isinstance(v, list):
+                    api_rows.extend(v)
+                elif isinstance(v, dict) and isinstance(v.get("ActivityList"), list):
+                    api_rows.extend(v["ActivityList"])
+        elif isinstance(root, list):
+            api_rows = root
+    except Exception as e:
+        app.logger.error(f"[ibon api] failed: {e}")
+
+    # API 項目整理
+    api_items = {}
+    for r in api_rows:
+        title = r.get("Title") or r.get("ActivityTitle") or r.get("Name") or "活動"
+        act_id = r.get("ActivityId") or r.get("Id") or r.get("ID")
+        if not act_id:
+            continue
+        href = f"https://ticket.ibon.com.tw/ActivityInfo/Details/{act_id}"
+        api_items[title.strip()] = {
+            "title": title.strip(),
+            "url": href,
+            "image": None,
+        }
+
+    # --- Step 2: 抓首頁 HTML 輪播圖片 ---
     try:
         r = requests.get(url, timeout=12, headers={
             "User-Agent": "Mozilla/5.0",
             "Accept-Language": "zh-TW,zh;q=0.9,en;q=0.6",
         })
         r.raise_for_status()
-        try:
-            soup = BeautifulSoup(r.text, "lxml")
-        except Exception:
-            soup = BeautifulSoup(r.text, "html.parser")
+        soup = BeautifulSoup(r.text, "lxml")
 
-        items, seen = [], set()
+        for img in soup.select(".owl-item img[alt][src]"):
+            title = img.get("alt", "").strip()
+            src = img.get("src")
+            if not title or not src:
+                continue
+            if title in api_items:
+                api_items[title]["image"] = src
+    except Exception as e:
+        app.logger.error(f"[ibon html] failed: {e}")
 
-        def _push(href, title, img):
-            if href in seen:
-                return False
-            if keyword and keyword not in title:
-                return False
-            if only_concert and not _looks_like_concert(title):
-                return False
-            seen.add(href)
-            items.append({"title": title, "url": href, "image": img})
-            return len(items) >= max(1, int(limit))
-
-        # (A) 一般區塊
-        for a in soup.select('a[href*="/ActivityInfo/Details/"]'):
-            href = urljoin(url, (a.get("href") or "").strip())
-            title = (a.get("title") or a.get_text(" ", strip=True) or "活動").strip()
-            img = None
-            img_tag = a.select_one("img")
-            if img_tag and img_tag.get("src"):
-                img = urljoin(url, img_tag["src"])
-            if _push(href, title, img):
-                return items
-
-        # (B) 輪播區（若 HTML 有 render 出來）
-        for slide in soup.select('.swiper-slide a[href*="/ActivityInfo/Details/"]'):
-            href = urljoin(url, (slide.get("href") or "").strip())
-            title = (slide.get("title") or slide.get_text(" ", strip=True) or "活動").strip()
-            img = None
-            img_tag = slide.select_one("img")
-            if img_tag and img_tag.get("src"):
-                img = urljoin(url, img_tag["src"])
-            if _push(href, title, img):
-                return items
-
+    # --- Step 3: 過濾 & 限制數量 ---
+    try:
+        for it in api_items.values():
+            if keyword and keyword not in it["title"]:
+                continue
+            if it["url"] in seen:
+                continue
+            seen.add(it["url"])
+            items.append(it)
+            if len(items) >= max(1, int(limit)):
+                break
         return items
+
     except Exception as e:
         app.logger.error(f"[ent] fetch failed: {e}")
         return []
