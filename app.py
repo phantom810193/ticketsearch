@@ -1397,18 +1397,19 @@ def fetch_ibon_carousel_from_api(limit=10, keyword=None, only_concert=False):
 
     data = None
     # 先 POST，不行再 GET
-    for method in ("POST", "GET"):
-        try:
-            if method == "POST":
-                r = s.post(IBON_API, json={}, headers=headers, timeout=12)
-            else:
-                r = s.get(IBON_API, headers=headers, timeout=12)
-            if r.status_code == 200:
-                data = r.json()
-                break
-            app.logger.info(f"[carousel-api] {method} http={r.status_code}")
-        except Exception as e:
-            app.logger.error(f"[carousel-api] {method} failed: {e}")
+    for attempt in range(3):
+        for method in ("POST", "GET"):
+            try:
+                r = s.post(IBON_API, json={}, headers=headers, timeout=12) if method=="POST" \
+                    else s.get(IBON_API, headers=headers, timeout=12)
+                if r.status_code == 200:
+                    data = r.json()
+                    break
+                app.logger.info(f"[carousel-api] attempt={attempt+1} {method} http={r.status_code}")
+            except Exception as e:
+                app.logger.error(f"[carousel-api] attempt={attempt+1} {method} failed: {e}")
+        if data is not None:
+            break
 
     def _iter_lists(obj, path=""):
         if isinstance(obj, list):
