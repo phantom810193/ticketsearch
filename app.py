@@ -1326,7 +1326,7 @@ def http_check_once():
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=int(os.getenv("PORT", "8080")))
 
-def fetch_ibon_entertainments(limit=10, keyword=None):
+def fetch_ibon_entertainments(limit=10, keyword=None, only_concert=False):
     url = "https://ticket.ibon.com.tw/Index/entertainment"
     api_url = "https://ticketapi.ibon.com.tw/api/ActivityInfo/GetIndexData"
     items, seen = [], set()
