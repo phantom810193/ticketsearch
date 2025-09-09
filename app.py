@@ -1,4 +1,5 @@
-# -*- coding: utf-8 -*-
+# Create the consolidated app.py file with all suggested fixes and fallbacks
+app_py = r'''# -*- coding: utf-8 -*-
 import os
 import re
 import json
@@ -14,6 +15,7 @@ from urllib.parse import urlparse, urlunparse, parse_qs, urlencode, urljoin
 from flask import send_from_directory
 from flask import jsonify, Flask, request, abort
 
+# -------------------- ibon constants --------------------
 IBON_API = "https://ticketapi.ibon.com.tw/api/ActivityInfo/GetIndexData"
 IBON_BASE = "https://ticket.ibon.com.tw/"
 
@@ -153,10 +155,11 @@ from google.cloud import firestore
 # ===== Flask & CORS =====
 app = Flask(__name__)
 
-# 建議：白名單（可多個網域）
+# 建議：白名單（可多個網域；把實際 Cloud Run 網域補上）
 ALLOWED_ORIGINS = [
     "https://liff.line.me",
-    "https://ticketsearch-419460755270.asia-east1.run.app",  # ← 換成你的
+    # 將下面替換成你的實際 Cloud Run 網域（服務頁會顯示）。
+    os.getenv("PUBLIC_ORIGIN", "").strip() or "https://ticketsearch-470701.asia-east1.run.app",
 ]
 
 try:
@@ -276,6 +279,11 @@ def sess_default() -> requests.Session:
         "Accept-Language": "zh-TW,zh;q=0.9,en;q=0.6",
         "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
         "Connection": "close",
+        # 補一些更像瀏覽器的 header（部分 CDN 會參考）
+        "Sec-Fetch-Site": "same-origin",
+        "Sec-Fetch-Mode": "navigate",
+        "Sec-Fetch-Dest": "document",
+        "Upgrade-Insecure-Requests": "1",
     })
     return s
 
@@ -891,9 +899,8 @@ HELP = (
     "➍/list － 顯示啟用中任務（/list all 看全部、/list off 看停用）\n"
     "➎/check <URL|任務ID> － 立刻手動查詢該頁剩餘數\n"
     "➏/probe <URL> － 回傳診斷 JSON（除錯用）\n\n"
-    "➐ibon售票網站首頁連結:https://ticket.ibon.com.tw/Index/entertainment \n"
-    "將用戶想追蹤的ibon售票網站連結貼入<URL>欄位即可 \n"
-    "🤖任務ID會在用戶輸入/watch開始監看後生成一個六位數的代碼 🤖\n"
+    "➐ ibon 售票首頁：https://ticket.ibon.com.tw/Index/entertainment\n"
+    "貼上欲追蹤連結到 <URL> 即可。\n"
 )
 WELCOME_TEXT = HELP
 
@@ -1292,81 +1299,131 @@ def http_check_once():
 
 # ====== Entertainment helpers & LIFF API ======
 
-def fetch_ibon_entertainments(limit=10, keyword=None, only_concert=False):
-    url = "https://ticket.ibon.com.tw/Index/entertainment"
-    items, seen = [], set()
+def _truthy(v: Optional[str]) -> bool:
+    if v is None:
+        return False
+    return str(v).strip().lower() in {"1","true","t","yes","y","on"}
 
-    s = requests.Session()
-    s.headers.update({
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36",
-        "Accept-Language": "zh-TW,zh;q=0.9,en;q=0.6",
-    })
+def _extract_carousel_html_hard(html: str, limit=10, keyword=None, only_concert=False):
+    """
+    只靠正則把 <img ... alt=... src=...> 與 Details/<id> 抓出來，
+    不依賴任何 CSS class / 解析器（避免再踩結構變動）。
+    回傳: [{title, url, image}, ...]
+    """
+    items = []
+    seen = set()
 
-    try:
-        r = s.get(url, timeout=12)
-        r.raise_for_status()
-        soup = BeautifulSoup(r.text, "lxml")
+    # 盡量涵蓋常見輪播/卡片容器；若失敗則用整頁掃描
+    blocks = re.split(r'(?is)<div[^>]+class="[^"]*(?:item|owl-item|swiper-slide|card)[^"]*"', html)
+    if len(blocks) <= 1:
+        blocks = [html]
 
-        cards = soup.select(".owl-item .item") or []
-        for card in cards:
-            # 標題：先拿 a[title]，再退回 img[alt]
-            a = card.select_one(".title a[title]")
-            title = (a.get("title").strip() if a and a.get("title") else "") or \
-                    (card.find("img").get("alt").strip() if card.find("img") and card.find("img").get("alt") else "")
-            if not title:
-                continue
+    def pick_img(block: str) -> Optional[str]:
+        # img: src / data-src / data-original / data-lazy
+        m = re.search(r'(?is)<img[^>]+(?:src|data-src|data-original|data-lazy)\s*=\s*["\']([^"\']+)["\']', block)
+        if m: return m.group(1).strip()
+        # <source srcset>
+        m = re.search(r'(?is)<source[^>]+srcset\s*=\s*["\']([^"\']+)["\']', block)
+        if m: return m.group(1).split()[0].strip()
+        return None
 
-            # 圖片：src > data-src > data-original
-            img = None
-            img_tag = card.find("img")
-            if img_tag:
-                for key in ("src", "data-src", "data-original"):
-                    v = img_tag.get(key)
-                    if v and v.strip():
-                        img = urljoin(IBON_BASE, v.strip())
-                        break
+    def pick_title(block: str) -> Optional[str]:
+        for pat in [
+            r'(?is)<a[^>]+title\s*=\s*["\']([^"\']{2,})["\']',
+            r'(?is)<img[^>]+alt\s*=\s*["\']([^"\']{2,})["\']',
+            r'(?is)<h[1-4][^>]*>\s*([^<]{2,})\s*</h[1-4]>',
+            r'(?is)<strong[^>]*>\s*([^<]{2,})\s*</strong>',
+        ]:
+            m = re.search(pat, block)
+            if m and m.group(1).strip():
+                return re.sub(r'\s+', ' ', m.group(1)).strip()
+        return None
 
-            # 先用 SearchResult 作為保底連結
-            href = f"https://ticket.ibon.com.tw/SearchResult?keyword={title}"
+    def pick_url(block: str, title: str) -> str:
+        m = re.search(r'(?i)(?:https?://ticket\.ibon\.com\.tw)?/ActivityInfo/Details/(\d+)', block)
+        if m:
+            return urljoin(IBON_BASE, m.group(0))
+        m = re.search(r'(?is)<a[^>]+href\s*=\s*["\']([^"\']+)["\']', block)
+        if m:
+            href = urljoin(IBON_BASE, m.group(1))
+            if "/ActivityInfo/Details/" in href:
+                return href
+        return f"https://ticket.ibon.com.tw/SearchResult?keyword={title}"
 
-            # 嘗試從卡片內找到 Details 連結（有些會塞在 data-* 或 script 內）
-            # 1) 內層 a[href*='ActivityInfo/Details']
-            a2 = card.select_one('a[href*="ActivityInfo/Details"]')
-            if a2 and a2.get("href"):
-                href = urljoin(IBON_BASE, a2["href"])
+    for b in blocks:
+        title = pick_title(b)
+        if not title:
+            continue
+        if keyword and keyword not in title:
+            continue
+        if only_concert and not _looks_like_concert(title):
+            continue
 
-            # 2) 文字中撿 /ActivityInfo/Details/<id>
-            text_blob = card.decode()
-            m = re.search(r'(?:https?://ticket\.ibon\.com\.tw)?/ActivityInfo/Details/(\d+)', text_blob)
-            if m:
-                href = urljoin(IBON_BASE, m.group(0))
+        img = pick_img(b)
+        if img:
+            img = urljoin(IBON_BASE, img)
 
-            # 過濾
+        href = pick_url(b, title)
+
+        if href in seen:
+            continue
+        seen.add(href)
+        items.append({"title": title, "url": href, "image": img})
+
+        if len(items) >= max(1, int(limit)):
+            break
+
+    # 還是沒有？最後掃整頁所有 <img alt> 當作 fallback
+    if not items:
+        for m in re.finditer(r'(?is)<img[^>]+alt\s*=\s*["\']([^"\']{2,})["\'][^>]*>', html):
+            title = re.sub(r'\s+', ' ', m.group(1)).strip()
             if keyword and keyword not in title:
                 continue
             if only_concert and not _looks_like_concert(title):
                 continue
+            # 整頁找對應 details
+            mm = re.search(r'(?i)(?:https?://ticket\.ibon\.com\.tw)?/ActivityInfo/Details/(\d+)', html)
+            href = urljoin(IBON_BASE, mm.group(0)) if mm else f"https://ticket.ibon.com.tw/SearchResult?keyword={title}"
             if href in seen:
                 continue
-
-            items.append({"title": title, "url": href, "image": img})
-            seen.add(href)
+            # 嘗試近鄰找圖片
+            snippet = html[max(0, m.start()-200): m.end()+200]
+            ms = re.search(r'(?:src|data-src|data-original|data-lazy)\s*=\s*["\']([^"\']+)["\']', snippet)
+            src = urljoin(IBON_BASE, ms.group(1)) if ms else None
+            items.append({"title": title, "url": href, "image": src})
             if len(items) >= max(1, int(limit)):
                 break
 
-        return items
+    return items
 
+def fetch_ibon_entertainments(limit=10, keyword=None, only_concert=False):
+    url = "https://ticket.ibon.com.tw/Index/entertainment"
+    s = requests.Session()
+    s.headers.update({
+        "User-Agent": UA,
+        "Accept-Language": "zh-TW,zh;q=0.9,en;q=0.6",
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+        "Referer": "https://ticket.ibon.com.tw/",
+        "Connection": "close",
+        "Sec-Fetch-Site": "same-origin",
+        "Sec-Fetch-Mode": "navigate",
+        "Sec-Fetch-Dest": "document",
+        "Upgrade-Insecure-Requests": "1",
+    })
+    try:
+        r = s.get(url, timeout=12)
+        r.raise_for_status()
+        # 直接用硬解法，不走 CSS selector
+        return _extract_carousel_html_hard(r.text, limit=limit, keyword=keyword, only_concert=only_concert)
     except Exception as e:
         app.logger.error(f"[ibon html] failed: {e}")
         return []
 
-def _truthy(v: Optional[str]) -> bool:
-    if v is None:
-        return False
-    s = str(v).strip().lower()
-    return s in ("1", "true", "t", "yes", "y")
-
 def fetch_ibon_carousel_from_api(limit=10, keyword=None, only_concert=False):
+    """
+    透過 ibon 首頁 API 抓「輪播/廣告/焦點」清單；抓不到就 HTML 兜底。
+    回傳：[{title, url, image}, ...]
+    """
     url = IBON_API
 
     # 先用 session 暖 Cookie
@@ -1388,7 +1445,7 @@ def fetch_ibon_carousel_from_api(limit=10, keyword=None, only_concert=False):
         "Content-Type": "application/json;charset=UTF-8",
     }
 
-    # 先試 API (POST -> GET)；失敗就放棄，不卡住
+    # 先試 API (POST -> GET)；失敗就轉 HTML 兜底
     data = None
     for attempt in range(2):
         for method in ("POST", "GET"):
@@ -1442,7 +1499,9 @@ def fetch_ibon_carousel_from_api(limit=10, keyword=None, only_concert=False):
 
     def _looks_like_carousel(path: str) -> bool:
         p = path.lower()
-        keys = ("banner", "carousel", "advertis", "ad_list", "slider", "swiper", "focus", "main")
+        keys = (
+            "banner", "carousel", "advertis", "ad_list", "slider", "swiper", "focus", "main"
+        )
         return any(k in p for k in keys)
 
     # 若 API 有回來，試著挑清單
@@ -1472,12 +1531,11 @@ def fetch_ibon_carousel_from_api(limit=10, keyword=None, only_concert=False):
             except Exception:
                 pass
 
-    # ▲▲ 即使 API 成功也可能抓不到；無論如何：再跑一次 HTML 兜底（regex 版）
+    # 無論 API 成功與否：再跑一次 HTML 兜底（保證給前端一些東西）
     if len(items) < limit:
         try:
             r_html = s.get("https://ticket.ibon.com.tw/Index/entertainment", timeout=12)
             r_html.raise_for_status()
-            # 先用「純 regex」的硬解法
             more = _extract_carousel_html_hard(r_html.text, limit=limit, keyword=keyword, only_concert=only_concert)
             for it in more:
                 if it["url"] not in seen_urls:
@@ -1489,81 +1547,6 @@ def fetch_ibon_carousel_from_api(limit=10, keyword=None, only_concert=False):
             app.logger.error(f"[carousel-html] failed: {e}")
 
     return items[:limit]
-
-def _extract_carousel_html_hard(html: str, limit=10, keyword=None, only_concert=False):
-    """
-    只靠正則把 <img ... alt=... src=...> 與 Details/<id> 抓出來，
-    不依賴任何 CSS class / 解析器（避免再踩 lxml 缺、Angular 結構變動）。
-    回傳: [{title, url, image}, ...]
-    """
-    items = []
-    seen = set()
-
-    # 1) 先抓所有卡片區塊（盡量縮小範圍，但就算抓到整頁也沒關係）
-    #    這裡以 <div class="item">... 或 <div class="owl-item">... 為線索，但不強制
-    blocks = re.split(r'(?i)<div[^>]+class="[^"]*(?:item|owl-item)[^"]*"', html)
-    if len(blocks) <= 1:
-        blocks = [html]  # 退路：整頁掃
-
-    def _pick_img(block):
-        # 支援 src / data-src / data-original
-        m = re.search(r'(?is)<img[^>]+(?:src|data-src|data-original)\s*=\s*["\']([^"\']+)["\'][^>]*>', block)
-        return m.group(1).strip() if m else None
-
-    def _pick_title(block):
-        # 先 a[title] → 再 img[alt] → 再 h3/strong 文字
-        m = re.search(r'(?is)<a[^>]+title\s*=\s*["\']([^"\']+)["\']', block)
-        if m and m.group(1).strip():
-            return m.group(1).strip()
-        m = re.search(r'(?is)<img[^>]+alt\s*=\s*["\']([^"\']+)["\']', block)
-        if m and m.group(1).strip():
-            return m.group(1).strip()
-        m = re.search(r'(?is)<h3[^>]*>\s*([^<]{2,})\s*</h3>', block)
-        if m and m.group(1).strip():
-            return m.group(1).strip()
-        m = re.search(r'(?is)<strong[^>]*>\s*([^<]{2,})\s*</strong>', block)
-        if m and m.group(1).strip():
-            return m.group(1).strip()
-        return None
-
-    def _pick_url(block, title):
-        # 優先抓 Details 連結；沒有就用搜尋連結保底
-        m = re.search(r'(?i)(?:https?://ticket\.ibon\.com\.tw)?/ActivityInfo/Details/(\d+)', block)
-        if m:
-            return urljoin(IBON_BASE, m.group(0))
-        # 也掃一下 a[href]
-        m = re.search(r'(?is)<a[^>]+href\s*=\s*["\']([^"\']+)["\']', block)
-        if m:
-            href = urljoin(IBON_BASE, m.group(1))
-            if "/ActivityInfo/Details/" in href:
-                return href
-        # 最後保底：用搜尋
-        return f"https://ticket.ibon.com.tw/SearchResult?keyword={title}"
-
-    for b in blocks:
-        title = _pick_title(b)
-        if not title:
-            continue
-        if keyword and keyword not in title:
-            continue
-        if only_concert and not _looks_like_concert(title):
-            continue
-
-        img = _pick_img(b)
-        if img:
-            img = urljoin(IBON_BASE, img)
-
-        href = _pick_url(b, title)
-
-        if href in seen:
-            continue
-        seen.add(href)
-        items.append({"title": title, "url": href, "image": img})
-
-        if len(items) >= max(1, int(limit)):
-            break
-
-    return items
 
 # ====== 替換：/liff/activities 以多來源 fallback（優先輪播） ======
 @app.route("/liff/activities", methods=["GET"])
@@ -1580,16 +1563,16 @@ def liff_activities():
     dbg = {"steps": []}
 
     try:
-        # 1) API 輪播
+        # 1) API 輪播（內建 HTML 兜底）
         acts = fetch_ibon_carousel_from_api(limit=limit, keyword=kw, only_concert=only_concert)
         dbg["steps"].append({"phase": "carousel_api", "count": len(acts)})
 
-        # 2) API 泛抓
+        # 2) API 泛抓（正式 JSON 結構）
         if not acts:
             acts = fetch_ibon_list_via_api(limit=limit, keyword=kw, only_concert=only_concert)
             dbg["steps"].append({"phase": "api_generic", "count": len(acts)})
 
-        # 3) HTML 保底
+        # 3) 純 HTML 保底（硬解）
         if not acts:
             acts = fetch_ibon_entertainments(limit=limit, keyword=kw, only_concert=only_concert)
             dbg["steps"].append({"phase": "html_fallback", "count": len(acts)})
@@ -1618,7 +1601,7 @@ def liff_activities_debug():
     except Exception:
         limit = 10
     kw = request.args.get("q") or None
-    only_concert = (str(request.args.get("onlyConcert","")).lower() in ("1","true","t","yes","y"))
+    only_concert = _truthy(request.args.get("onlyConcert"))
 
     trace = []
 
@@ -1632,7 +1615,9 @@ def liff_activities_debug():
     if acts2:
         return jsonify({"ok": True, "count": len(acts2), "items": acts2, "trace": trace}), 200
 
-    return jsonify({"ok": True, "count": 0, "items": [], "trace": trace}), 200
+    acts3 = fetch_ibon_entertainments(limit=limit, keyword=kw, only_concert=only_concert)
+    trace.append({"phase": "html_fallback", "count": len(acts3)})
+    return jsonify({"ok": True, "count": len(acts3), "items": acts3, "trace": trace}), 200
 
 @app.route("/liff/", methods=["GET"])
 def liff_index():
@@ -1640,3 +1625,6 @@ def liff_index():
 
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=int(os.getenv("PORT", "8080")))
+'''
+with open('/mnt/data/app.py', 'w', encoding='utf-8') as f:
+    f.write(app_py)
