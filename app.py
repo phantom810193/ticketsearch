@@ -1626,5 +1626,3 @@ def liff_index():
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=int(os.getenv("PORT", "8080")))
 '''
-with open('/mnt/data/app.py', 'w', encoding='utf-8') as f:
-    f.write(app_py)
