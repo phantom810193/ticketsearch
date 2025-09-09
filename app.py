@@ -27,6 +27,9 @@ def _looks_like_concert(title: str) -> bool:
     t = title or ""
     return any(w.lower() in t.lower() for w in _CONCERT_WORDS)
 
+# -------- HTML 解析 --------
+from bs4 import BeautifulSoup
+
 def _normalize_item(row):
     """
     將 ibon API 的活動項目轉為 {title,url,image}
@@ -62,6 +65,7 @@ def _normalize_item(row):
 
     return {"title": str(title).strip(), "url": url, "image": img}
 
+# --------- 直接打 API 拉清單 ---------
 def fetch_ibon_list_via_api(limit=10, keyword=None, only_concert=False):
     """
     直接打 ibon 官方 API 抽取活動清單。
@@ -78,7 +82,6 @@ def fetch_ibon_list_via_api(limit=10, keyword=None, only_concert=False):
             "Origin": "https://ticket.ibon.com.tw",
             "Referer": "https://ticket.ibon.com.tw/Index/entertainment",
         }
-        # 多數情況用 POST；若 GET 也能回資料，可改成 requests.get(...)
         try:
             resp = requests.post(IBON_API, headers=headers, timeout=12, json={})
             resp.raise_for_status()
@@ -88,11 +91,9 @@ def fetch_ibon_list_via_api(limit=10, keyword=None, only_concert=False):
             return []
 
         # 解析可能的包裝層
-        # 常見層級：{ "Data": { <多個區塊> } } 或 { "data": [...] } 等
         blobs = []
         root = data.get("Data") or data.get("data") or data
         if isinstance(root, dict):
-            # 收集所有陣列欄位（包含 "ActivityList", "Items" 等）
             for v in root.values():
                 if isinstance(v, list):
                     blobs.extend(v)
@@ -101,7 +102,6 @@ def fetch_ibon_list_via_api(limit=10, keyword=None, only_concert=False):
         elif isinstance(root, list):
             blobs = root
 
-        # 最後再保底：如果還是 dict，找出所有內層 list
         if not blobs and isinstance(data, dict):
             for v in data.values():
                 if isinstance(v, list):
@@ -119,7 +119,7 @@ def fetch_ibon_list_via_api(limit=10, keyword=None, only_concert=False):
 
         _cache = {"ts": now, "data": rows}
 
-    # 關鍵字/只要演唱會的過濾
+    # 過濾
     out = []
     kw = (keyword or "").strip()
     for it in rows:
@@ -150,15 +150,10 @@ except Exception as e:
 # --------- Firestore（可失敗不致命）---------
 from google.cloud import firestore
 
-# HTML 解析
-from bs4 import BeautifulSoup
-
 # ===== Flask & CORS =====
 app = Flask(__name__)
 
 # 建議：白名單（可多個網域）
-# 1) 一定要包含 LIFF 的網域： https://liff.line.me
-# 2) 再加入你 Cloud Run 的完整網址（請改成你的實際網址）
 ALLOWED_ORIGINS = [
     "https://liff.line.me",
     "https://ticketsearch-419460755270.asia-east1.run.app",  # ← 換成你的
@@ -166,7 +161,6 @@ ALLOWED_ORIGINS = [
 
 try:
     from flask_cors import CORS  # type: ignore
-    # 只開 /liff/* 路徑（/liff/activities、/liff/ 等）
     CORS(
         app,
         resources={
@@ -186,7 +180,7 @@ LINE_CHANNEL_ACCESS_TOKEN = os.getenv("LINE_CHANNEL_ACCESS_TOKEN", "")
 LINE_CHANNEL_SECRET = os.getenv("LINE_CHANNEL_SECRET", "")
 DEFAULT_PERIOD_SEC = int(os.getenv("DEFAULT_PERIOD_SEC", "60"))
 ALWAYS_NOTIFY = os.getenv("ALWAYS_NOTIFY", "0") == "1"
-FOLLOW_AREAS_PER_CHECK = int(os.getenv("FOLLOW_AREAS_PER_CHECK", "0"))  # 預設 0：不追票區第二步頁
+FOLLOW_AREAS_PER_CHECK = int(os.getenv("FOLLOW_AREAS_PER_CHECK", "0"))
 
 # 可選：手動覆蓋宣傳圖或 Details 連結（通常不需要）
 PROMO_IMAGE_MAP: Dict[str, str] = {}
@@ -239,7 +233,6 @@ def soup_parse(html: str) -> BeautifulSoup:
         return BeautifulSoup(html, "html.parser")
 
 def hash_state(sections: Dict[str, int], selling: List[str]) -> str:
-    """將『有數字區』與『熱賣中區』一起做簽章，避免只看數字漏通知。"""
     items = sorted((k, int(v)) for k, v in sections.items())
     hot = sorted(selling)
     raw = json.dumps({"num": items, "hot": hot}, ensure_ascii=False, separators=(",", ":"))
@@ -451,8 +444,8 @@ def fetch_from_ticket_details(details_url: str, sess: requests.Session) -> Dict[
             if t: out["title"] = t
 
         tx = soup.get_text(" ", strip=True)
-        m = re.search(r'(\d{4}/\d{2}/\d{2})\s*(?:\([\u4e00-\u9fff]\))?\s*(\d{2}:\d{2})', tx)
-        if m: out["dt"] = f"{m.group(1)} {m.group(2)}"
+        m = re.search(r'(\d{4}/\d{2}/\d{2})\s*(?:([\u4e00-\u9fff]))?\s*(\d{2}:\d{2})', tx)
+        if m: out["dt"] = f"{m.group(1)} {m.group(3)}"
 
     except Exception as e:
         app.logger.info(f"[details] fetch fail: {e}")
@@ -496,7 +489,6 @@ def extract_title_place_from_html(html: str) -> tuple[Optional[str], Optional[st
     place: Optional[str] = None
     dt_text: Optional[str] = None
 
-    # 取標題 / 場地
     for gt in soup.select('.grid-title'):
         lab = gt.get_text(" ", strip=True)
         sib = gt.find_next_sibling()
@@ -537,13 +529,6 @@ def extract_title_place_from_html(html: str) -> tuple[Optional[str], Optional[st
 
 # ============= 票區與 live.map 解析 =============
 def extract_area_meta_from_000(html: str) -> Tuple[Dict[str, str], Dict[str, str], Dict[str, int], Dict[str, int]]:
-    """
-    從 UTK0201_000 抽出：
-      - name_map   : 區代碼 -> 中文名稱
-      - status_map : 區代碼 -> 狀態字（熱賣中/已售完/…）
-      - qty_map    : 區代碼 -> 表格「空位」欄的數字（若有）
-      - order_map  : 區代碼 -> 顯示順序（jsonData SORT；否則表格列順）
-    """
     name_map: Dict[str, str] = {}
     status_map: Dict[str, str] = {}
     qty_map: Dict[str, int] = {}
@@ -585,7 +570,7 @@ def extract_area_meta_from_000(html: str) -> Tuple[Dict[str, str], Dict[str, str
             continue
         code = m.group(1)
         row_idx += 1
-        order_map.setdefault(code, 10000 + row_idx)  # 沒 SORT 就用表格序
+        order_map.setdefault(code, 10000 + row_idx)
 
         tr = a.find_parent("tr")
         if not tr:
@@ -620,15 +605,14 @@ def extract_area_meta_from_000(html: str) -> Tuple[Dict[str, str], Dict[str, str
     return name_map, status_map, qty_map, order_map
 
 def _parse_livemap_text(txt: str) -> Tuple[Dict[str, int], int]:
-    """只認 data-left / 關鍵字『剩餘|尚餘|可售|可購』或『(\d+) 張』；同一區取最大值。"""
     sections: Dict[str, int] = {}
     for tag in _RE_AREA_TAG.findall(txt):
         code = None
         m = re.search(
-            r"javascript:Send\([^)]*'(?P<perf>B0[0-9A-Z]{6,10})'\s*,\s*'(?P<area>B0[0-9A-Z]{6,10})'",
+            r"javascript:Send\([^)]*'(?:B0[0-9A-Z]{6,10})'\s*,\s*'(B0[0-9A-Z]{6,10})'",
             tag, re.I
         )
-        if m: code = m.group("area")
+        if m: code = m.group(1)
         if not code:
             m = re.search(r'(?:data-(?:area|area-id|price-area-id))=["\'](B0[0-9A-Z]{6,10})["\']', tag, re.I)
             if m: code = m.group(1)
@@ -731,7 +715,6 @@ def parse_UTK0201_000(url: str, sess: requests.Session) -> dict:
         out["msg"] = f"讀取失敗（HTTP {r.status_code}）"
         return out
     html = r.text
-    soup = soup_parse(html)
 
     q = parse_qs(urlparse(url).query)
     perf_id = (q.get("PERFORMANCE_ID") or [None])[0]
@@ -780,21 +763,18 @@ def parse_UTK0201_000(url: str, sess: requests.Session) -> dict:
     area_name_map, area_status_map, area_qty_map, area_order_map = extract_area_meta_from_000(html)
     out["area_names"] = area_name_map
 
-    # live.map 數字（僅取可信數字，且同區取最大值）
+    # live.map 數字（僅取可信數字，且同一區取最大值）
     sections_by_code, _ = try_fetch_livemap_by_perf(perf_id, sess, html=html)
     numeric_counts: Dict[str, int] = dict(sections_by_code)
-    # 表格「空位」數字補進來（live.map 沒有的才補）
     for code, n in area_qty_map.items():
         if isinstance(n, int) and n > 0 and code not in numeric_counts:
             numeric_counts[code] = n
 
-    # 只知道「熱賣中/可售」但沒數字
     selling_unknown_codes: List[str] = []
     for code, status in area_status_map.items():
         if (status and ("熱賣" in status or "可售" in status)) and not numeric_counts.get(code):
             selling_unknown_codes.append(code)
 
-    # 針對「熱賣中」但沒有數字的區：是否進第二步頁補抓？
     if FOLLOW_AREAS_PER_CHECK > 0 and perf_id and product_id and area_name_map:
         need_follow = [code for code, st in area_status_map.items()
                        if (st and "熱賣" in st) and (code not in numeric_counts)]
@@ -803,21 +783,17 @@ def parse_UTK0201_000(url: str, sess: requests.Session) -> dict:
             if isinstance(n, int) and n > 0:
                 numeric_counts[code] = n
 
-    # 再次聚集 selling_unknown（確保覆蓋後仍為未知）
     selling_unknown_codes = [
         code for code, amt in area_status_map.items()
         if (amt and ("熱賣" in amt or "可售" in amt)) and not numeric_counts.get(code)
     ]
 
-    # ==== 聚合輸出 ====
-    # 把代碼映成人類名稱（同名區取最大值；不把「熱賣中(未知)」算進 total）
     human_numeric: Dict[str, int] = {}
     for code, n in numeric_counts.items():
         name = area_name_map.get(code, code)
         v = int(n)
         human_numeric[name] = max(human_numeric.get(name, 0), v)
 
-    # 順序：依網站順序（SORT 或表格列序）
     def order_key(name: str) -> tuple:
         codes = [c for c, nm in area_name_map.items() if nm == name]
         order_vals = [area_order_map.get(c, 99999) for c in codes] or [99999]
@@ -828,7 +804,6 @@ def parse_UTK0201_000(url: str, sess: requests.Session) -> dict:
 
     total_num = sum(human_numeric.values())
 
-    # ---- 售完偵測：所有票區皆「已售完」，且沒有數字與「熱賣/可售」標記 ----
     sold_out = False
     if area_name_map:
         any_hot = any(("熱賣" in s) or ("可售" in s) or ("可購" in s) for s in area_status_map.values())
@@ -842,7 +817,6 @@ def parse_UTK0201_000(url: str, sess: requests.Session) -> dict:
     out["total"] = total_num
     out["soldout"] = bool(sold_out)
 
-    # 簽章：把售完狀態也納入，避免「售完 <-> 有票」時不觸發通知
     sig_base = hash_state(human_numeric, selling_names)
     out["sig"] = hashlib.md5((sig_base + ("|SO" if sold_out else "")).encode("utf-8")).hexdigest()
 
@@ -868,7 +842,6 @@ def parse_UTK0201_000(url: str, sess: requests.Session) -> dict:
         out["msg"] = "\n".join(lines)
         return out
 
-    # ---- 無數字、無熱賣：若判定為售完 → 回覆售完；否則保留原本說明 ----
     if sold_out:
         out["msg"] = (
             f"🎫 {out['title']}\n"
@@ -924,7 +897,6 @@ HELP = (
 )
 WELCOME_TEXT = HELP
 
-# === 全域只回覆指令：新增判斷（半形 / 全形斜線） ===
 CMD_PREFIX = ("/", "／")
 def is_command(text: Optional[str]) -> bool:
     if not text:
@@ -1023,7 +995,6 @@ def fmt_result_text(res: dict) -> str:
         f"📍地點：{res.get('place','')}",
         f"📅日期：{res.get('date','')}",
     ]
-    # 若為售完狀態，優先輸出售完訊息
     if res.get("soldout"):
         lines.append("\n🔴 全區已售完")
         lines.append(res.get("url", ""))
@@ -1143,7 +1114,6 @@ def handle_command(text: str, chat_id: str):
                 sent = set()
                 sm  = res.get("seatmap")
                 img = res.get("image")
-                # 先座位圖、後宣傳圖
                 if sm and _url_ok(sm):
                     msgs.append(ImageSendMessage(original_content_url=sm, preview_image_url=sm))
                     sent.add(sm)
@@ -1185,7 +1155,6 @@ if HAS_LINE and handler:
 
     @handler.add(FollowEvent)
     def on_follow(ev):
-        # 被加入好友時：回覆一次（等同 /start 內容）
         try:
             line_bot_api.reply_message(ev.reply_token, [TextSendMessage(text=WELCOME_TEXT)])
         except Exception as e:
@@ -1193,7 +1162,6 @@ if HAS_LINE and handler:
 
     @handler.add(JoinEvent)
     def on_join(ev):
-        # 被邀入群/聊天室時：回覆一次（等同 /start 內容）
         try:
             line_bot_api.reply_message(ev.reply_token, [TextSendMessage(text=WELCOME_TEXT)])
         except Exception as e:
@@ -1201,7 +1169,6 @@ if HAS_LINE and handler:
 
     @handler.add(MessageEvent, message=TextMessage)
     def on_message(ev):
-        # 全域規則：只有「指令」（以 / 或 ／ 開頭）才回覆，其餘忽略
         raw = getattr(ev.message, "text", "") or ""
         text = raw.strip()
         if not is_command(text):
@@ -1323,8 +1290,7 @@ def http_check_once():
     res = probe(url)
     return jsonify(res), 200
 
-if __name__ == "__main__":
-    app.run(host="0.0.0.0", port=int(os.getenv("PORT", "8080")))
+# ====== Entertainment helpers & LIFF API ======
 
 def fetch_ibon_entertainments(limit=10, keyword=None, only_concert=False):
     url = "https://ticket.ibon.com.tw/Index/entertainment"
@@ -1410,7 +1376,6 @@ def fetch_ibon_entertainments(limit=10, keyword=None, only_concert=False):
         app.logger.error(f"[ent] fetch failed: {e}")
         return []
 
-# ====== 新增：布林參數解析 + 專抓輪播的 API 解析器 ======
 def _truthy(v: Optional[str]) -> bool:
     if v is None:
         return False
@@ -1420,7 +1385,8 @@ def _truthy(v: Optional[str]) -> bool:
 def fetch_ibon_carousel_from_api(limit=10, keyword=None, only_concert=False):
     """
     透過 ibon 首頁 API 抓「輪播/廣告/焦點」清單；
-    若抓不到，會把整份 JSON 內所有 list 都嘗試正規化。
+    若抓不到，會把整份 JSON 內所有 list 都嘗試正規化；
+    最後再以 HTML 輪播作為保底。
     回傳：[{title, url, image}, ...]
     """
     url = IBON_API
@@ -1461,14 +1427,6 @@ def fetch_ibon_carousel_from_api(limit=10, keyword=None, only_concert=False):
             break
         except Exception as e:
             app.logger.error(f"[carousel-api] {method} failed: {e}")
-    if data is None:
-        return []
-
-    car_lists, other_lists = [], []
-    for path, arr in _iter_lists(data):
-        if not isinstance(arr, list) or not arr:
-            continue
-        (car_lists if _looks_like_carousel(path) else other_lists).append((path, arr))
 
     seen_urls: set = set()
     items: List[Dict[str, Any]] = []
@@ -1476,7 +1434,6 @@ def fetch_ibon_carousel_from_api(limit=10, keyword=None, only_concert=False):
     def _append_from_list(arr):
         nonlocal items, seen_urls
         for r in arr:
-            # 有時候元素是巢狀 dict（如 {"Activity": {...}}）
             cand = r
             if isinstance(r, dict) and len(r) == 1 and isinstance(next(iter(r.values())), dict):
                 cand = next(iter(r.values()))
@@ -1499,31 +1456,71 @@ def fetch_ibon_carousel_from_api(limit=10, keyword=None, only_concert=False):
                 continue
         return False
 
-    # 先吃疑似輪播
-    for _, arr in car_lists:
-        if _append_from_list(arr):
-            break
+    # 從 API JSON 標示為輪播的 list 優先抓
+    if data is not None:
+        car_lists, other_lists = [], []
+        for path, arr in _iter_lists(data):
+            if not isinstance(arr, list) or not arr:
+                continue
+            (car_lists if _looks_like_carousel(path) else other_lists).append((path, arr))
 
-    # 不足再吃其他清單
-    if len(items) < limit:
-        for _, arr in other_lists:
+        for _, arr in car_lists:
             if _append_from_list(arr):
                 break
 
-    # 還是抓不到：最後從整份 JSON 字串找 /ActivityInfo/Details/<id>
+        if len(items) < limit:
+            for _, arr in other_lists:
+                if _append_from_list(arr):
+                    break
+
+        # 還是抓不到：從 JSON 字串找 /ActivityInfo/Details/<id>
+        if len(items) < 1:
+            try:
+                s = json.dumps(data, ensure_ascii=False)
+                for m in re.finditer(r'/ActivityInfo/Details/(\d+)', s):
+                    url2 = urljoin(IBON_BASE, m.group(0))
+                    if url2 in seen_urls:
+                        continue
+                    items.append({"title": "活動", "url": url2, "image": None})
+                    seen_urls.add(url2)
+                    if len(items) >= limit:
+                        break
+            except Exception:
+                pass
+
+    # 如果 API 完全沒有 → 從 HTML 輪播抓
     if len(items) < 1:
         try:
-            s = json.dumps(data, ensure_ascii=False)
-            for m in re.finditer(r'/ActivityInfo/Details/(\d+)', s):
-                url2 = urljoin(IBON_BASE, m.group(0))
-                if url2 in seen_urls:
+            r = requests.get("https://ticket.ibon.com.tw/Index/entertainment", timeout=12, headers={
+                "User-Agent": "Mozilla/5.0",
+                "Accept-Language": "zh-TW,zh;q=0.9,en;q=0.6",
+            })
+            r.raise_for_status()
+            soup = BeautifulSoup(r.text, "lxml")
+
+            for img in soup.select(".owl-item img[alt][src]"):
+                title = img.get("alt", "").strip()
+                src = img.get("src")
+                if not title or not src:
                     continue
-                items.append({"title": "活動", "url": url2, "image": None})
-                seen_urls.add(url2)
+                if keyword and keyword not in title:
+                    continue
+                if only_concert and not _looks_like_concert(title):
+                    continue
+
+                href = f"https://ticket.ibon.com.tw/SearchResult?keyword={title}"
+                if href in seen_urls:
+                    continue
+                items.append({
+                    "title": title,
+                    "url": href,
+                    "image": src,
+                })
+                seen_urls.add(href)
                 if len(items) >= limit:
                     break
-        except Exception:
-            pass
+        except Exception as e:
+            app.logger.error(f"[carousel-html] failed: {e}")
 
     return items[:limit]
 
@@ -1573,10 +1570,9 @@ def liff_activities():
             return jsonify({"ok": False, **dbg}), 200
         return jsonify({"ok": False, "error": str(e)}), 500
 
-    except Exception as e:
-        app.logger.error(f"/liff/activities error: {e}")
-        return jsonify({"ok": False, "error": str(e)}), 500
-
 @app.route("/liff/", methods=["GET"])
 def liff_index():
     return send_from_directory("liff", "index.html")
+
+if __name__ == "__main__":
+    app.run(host="0.0.0.0", port=int(os.getenv("PORT", "8080")))
