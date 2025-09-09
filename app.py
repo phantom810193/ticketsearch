@@ -1331,8 +1331,8 @@ def fetch_ibon_entertainments(limit=10, keyword=None, only_concert=False):
     api_url = "https://ticketapi.ibon.com.tw/api/ActivityInfo/GetIndexData"
     items, seen = [], set()
 
-    # --- Step 1: 先打 API 拿活動 ID 與標題 ---
-    api_rows = []
+    # --- Step 1: API 拿活動清單 (有 ID → 可拼網址) ---
+    api_items = {}
     try:
         r_api = requests.post(api_url, timeout=12, headers={
             "User-Agent": "Mozilla/5.0",
@@ -1342,34 +1342,30 @@ def fetch_ibon_entertainments(limit=10, keyword=None, only_concert=False):
         }, json={})
         r_api.raise_for_status()
         data = r_api.json()
-
         root = data.get("Data") or data.get("data") or data
+        blobs = []
         if isinstance(root, dict):
             for v in root.values():
                 if isinstance(v, list):
-                    api_rows.extend(v)
-                elif isinstance(v, dict) and isinstance(v.get("ActivityList"), list):
-                    api_rows.extend(v["ActivityList"])
+                    blobs.extend(v)
         elif isinstance(root, list):
-            api_rows = root
+            blobs = root
+
+        for r in blobs:
+            title = r.get("Title") or r.get("ActivityTitle") or r.get("Name") or "活動"
+            act_id = r.get("ActivityId") or r.get("Id") or r.get("ID")
+            if not act_id:
+                continue
+            href = f"https://ticket.ibon.com.tw/ActivityInfo/Details/{act_id}"
+            api_items[title.strip()] = {
+                "title": title.strip(),
+                "url": href,
+                "image": None,
+            }
     except Exception as e:
         app.logger.error(f"[ibon api] failed: {e}")
 
-    # API 項目整理
-    api_items = {}
-    for r in api_rows:
-        title = r.get("Title") or r.get("ActivityTitle") or r.get("Name") or "活動"
-        act_id = r.get("ActivityId") or r.get("Id") or r.get("ID")
-        if not act_id:
-            continue
-        href = f"https://ticket.ibon.com.tw/ActivityInfo/Details/{act_id}"
-        api_items[title.strip()] = {
-            "title": title.strip(),
-            "url": href,
-            "image": None,
-        }
-
-    # --- Step 2: 抓首頁 HTML 輪播圖片 ---
+    # --- Step 2: 從首頁 HTML 補圖片 (如果 API 沒給) ---
     try:
         r = requests.get(url, timeout=12, headers={
             "User-Agent": "Mozilla/5.0",
@@ -1385,6 +1381,14 @@ def fetch_ibon_entertainments(limit=10, keyword=None, only_concert=False):
                 continue
             if title in api_items:
                 api_items[title]["image"] = src
+            else:
+                # 如果 API 沒有 → 補搜尋網址
+                href = f"https://ticket.ibon.com.tw/SearchResult?keyword={title}"
+                api_items[title] = {
+                    "title": title,
+                    "url": href,
+                    "image": src,
+                }
     except Exception as e:
         app.logger.error(f"[ibon html] failed: {e}")
 
@@ -1393,6 +1397,8 @@ def fetch_ibon_entertainments(limit=10, keyword=None, only_concert=False):
         for it in api_items.values():
             if keyword and keyword not in it["title"]:
                 continue
+            if only_concert and not _looks_like_concert(it["title"]):
+                continue
             if it["url"] in seen:
                 continue
             seen.add(it["url"])
@@ -1400,7 +1406,6 @@ def fetch_ibon_entertainments(limit=10, keyword=None, only_concert=False):
             if len(items) >= max(1, int(limit)):
                 break
         return items
-
     except Exception as e:
         app.logger.error(f"[ent] fetch failed: {e}")
         return []
