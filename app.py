@@ -190,20 +190,15 @@ from google.cloud import firestore
 app = Flask(__name__)
 
 # 建議：白名單（可多個網域）
-ALLOWED_ORIGINS = [
-    "https://liff.line.me",
-    "https://ticketsearch-419460755270.asia-east1.run.app",  # ← 換成你的
-]
+# 建議：白名單用環境變數，逗號分隔
+_ALLOWED_ORIGINS_ENV = os.getenv("ALLOWED_ORIGINS", "https://liff.line.me")
+ALLOWED_ORIGINS = [o.strip() for o in _ALLOWED_ORIGINS_ENV.split(",") if o.strip()]
 
 try:
     from flask_cors import CORS  # type: ignore
     CORS(
         app,
-        resources={
-            r"/liff/*": {
-                "origins": ALLOWED_ORIGINS,
-            }
-        },
+        resources={r"/liff/*": {"origins": ALLOWED_ORIGINS}},
         supports_credentials=True,
     )
 except Exception as e:
@@ -1334,25 +1329,24 @@ def fetch_ibon_entertainments(limit=10, keyword=None, only_concert=False):
 
     s = requests.Session()
     s.headers.update({
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36",
+        "User-Agent": UA,
         "Accept-Language": "zh-TW,zh;q=0.9,en;q=0.6",
     })
 
     try:
         r = s.get(url, timeout=12)
         r.raise_for_status()
-        soup = BeautifulSoup(r.text, "lxml")
+        html = r.text
+        soup = BeautifulSoup(html, "lxml")
 
         cards = soup.select(".owl-item .item") or []
         for card in cards:
-            # 標題：先拿 a[title]，再退回 img[alt]
             a = card.select_one(".title a[title]")
             title = (a.get("title").strip() if a and a.get("title") else "") or \
                     (card.find("img").get("alt").strip() if card.find("img") and card.find("img").get("alt") else "")
             if not title:
                 continue
 
-            # 圖片：src > data-src > data-original
             img = None
             img_tag = card.find("img")
             if img_tag:
@@ -1362,22 +1356,17 @@ def fetch_ibon_entertainments(limit=10, keyword=None, only_concert=False):
                         img = urljoin(IBON_BASE, v.strip())
                         break
 
-            # 先用 SearchResult 作為保底連結
             href = f"https://ticket.ibon.com.tw/SearchResult?keyword={title}"
 
-            # 嘗試從卡片內找到 Details 連結（有些會塞在 data-* 或 script 內）
-            # 1) 內層 a[href*='ActivityInfo/Details']
             a2 = card.select_one('a[href*="ActivityInfo/Details"]')
             if a2 and a2.get("href"):
                 href = urljoin(IBON_BASE, a2["href"])
 
-            # 2) 文字中撿 /ActivityInfo/Details/<id>
             text_blob = card.decode()
             m = re.search(r'(?:https?://ticket\.ibon\.com\.tw)?/ActivityInfo/Details/(\d+)', text_blob)
             if m:
                 href = urljoin(IBON_BASE, m.group(0))
 
-            # 過濾
             if keyword and keyword not in title:
                 continue
             if only_concert and not _looks_like_concert(title):
@@ -1389,6 +1378,16 @@ def fetch_ibon_entertainments(limit=10, keyword=None, only_concert=False):
             seen.add(href)
             if len(items) >= max(1, int(limit)):
                 break
+
+        # 🔻 若 Soup 版本抓不到，改用純 regex 再掃一次（硬兜底）
+        if not items:
+            more = _extract_carousel_html_hard(html, limit=limit, keyword=keyword, only_concert=only_concert)
+            for it in more:
+                if it["url"] not in seen:
+                    items.append(it)
+                    seen.add(it["url"])
+                if len(items) >= limit:
+                    break
 
         return items
 
