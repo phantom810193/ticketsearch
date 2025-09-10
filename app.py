@@ -90,6 +90,7 @@ def fetch_ibon_list_via_api(limit=10, keyword=None, only_concert=False):
     """
     直接打 ibon 官方 API 抽取活動清單（泛抓）。
     有 5xx 時開啟斷路器，讓後續請求優先走 HTML 兜底，避免一直噴 500。
+    永遠回傳 list。
     """
     global _cache
     now = time.time()
@@ -115,11 +116,15 @@ def fetch_ibon_list_via_api(limit=10, keyword=None, only_concert=False):
         base_rows = []
         for attempt in range(3):
             try:
-                r = s.post(IBON_API, headers={
-                    "Origin": "https://ticket.ibon.com.tw",
-                    "Referer": "https://ticket.ibon.com.tw/Index/entertainment",
-                    "Content-Type": "application/json;charset=UTF-8",
-                }, json={}, timeout=10)
+                r = s.post(
+                    IBON_API,
+                    headers={
+                        "Origin": "https://ticket.ibon.com.tw",
+                        "Referer": "https://ticket.ibon.com.tw/Index/entertainment",
+                        "Content-Type": "application/json;charset=UTF-8",
+                    },
+                    json={}, timeout=10
+                )
                 if r.status_code == 200:
                     data = r.json()
                     blobs = []
@@ -137,9 +142,9 @@ def fetch_ibon_list_via_api(limit=10, keyword=None, only_concert=False):
                             if isinstance(v, list):
                                 blobs.extend(v)
 
-                    for r0 in blobs:
+                    for r0 in blobs or []:
                         try:
-                            item = _normalize_item(r0)
+                            item = _normalize_item(r0 if isinstance(r0, dict) else {})
                             if item.get("url"):
                                 base_rows.append(item)
                         except Exception:
@@ -158,10 +163,10 @@ def fetch_ibon_list_via_api(limit=10, keyword=None, only_concert=False):
 
         _cache = {"ts": now, "data": base_rows}
 
-    # 過濾 + 截斷
+    # 過濾 + 截斷（這個 return 要在迴圈外！）
     out = []
     kw = (keyword or "").strip()
-    for it in base_rows:
+    for it in base_rows or []:
         if kw and kw not in it["title"]:
             continue
         if only_concert and not _looks_like_concert(it["title"]):
@@ -169,8 +174,7 @@ def fetch_ibon_list_via_api(limit=10, keyword=None, only_concert=False):
         out.append(it)
         if len(out) >= max(1, int(limit)):
             break
-        return out if isinstance(out, list) else []
-
+    return out
 
 # --------- LINE SDK（可選）---------
 HAS_LINE = True
@@ -1332,14 +1336,8 @@ def fetch_ibon_ent_html_hard(limit=10, keyword=None, only_concert=False):
     超寬鬆 HTML 兜底：
     * 直接在整頁以 regex 撈 img[alt] 當作標題
     * 優先撿 /ActivityInfo/Details/<id>；沒有就給 SearchResult?keyword=標題
+    永遠回傳 list。
     """
-# --- backward-compat alias (舊名 → 新實作) ---
-def fetch_ibon_entertainments(limit=10, keyword=None, only_concert=False):
-    """
-    舊版本程式呼叫的名稱。為了相容，把它導向新版的硬解析實作。
-    """
-    return fetch_ibon_ent_html_hard(limit=limit, keyword=keyword, only_concert=only_concert)
-
     url = "https://ticket.ibon.com.tw/Index/entertainment"
     s = requests.Session()
     s.headers.update({
@@ -1354,8 +1352,7 @@ def fetch_ibon_entertainments(limit=10, keyword=None, only_concert=False):
         r.raise_for_status()
         html = r.text
 
-        # 1) 以 <img ... alt="xxx" ...> 列出所有潛在標題
-        #    允許 src / data-src / data-original / data-lazy 作為圖片
+        # 1) 以 <img ... alt="xxx" ...> 列出所有潛在標題（支援 src/data-src/data-original/data-lazy）
         patt = re.compile(
             r'(?is)<img[^>]*\balt\s*=\s*"([^"]{2,})"[^>]*?(?:\bsrc|\bdata-src|\bdata-original|\bdata-lazy)\s*=\s*"([^"]+)"[^>]*>'
         )
@@ -1365,13 +1362,13 @@ def fetch_ibon_entertainments(limit=10, keyword=None, only_concert=False):
             src = urljoin(IBON_BASE, m.group(2).strip())
             candidates.append((title, src))
 
-        # 2) 預先把整頁出現過的 Details id 收集起來
+        # 2) 收集整頁所有 Details/<id>
         details_urls = []
         for m in re.finditer(r'(?i)(?:https?://ticket\.ibon\.com\.tw)?/ActivityInfo/Details/(\d+)', html):
             details_urls.append(urljoin(IBON_BASE, m.group(0)))
 
         def pick_details_for(title: str) -> str:
-            # 先找與 title 相近的區塊附近是否出現 Details；不強制，找不到就走搜尋
+            # 找不到可靠 mapping 就回搜尋連結
             return f"https://ticket.ibon.com.tw/SearchResult?keyword={title}"
 
         # 3) 彙整
@@ -1389,7 +1386,7 @@ def fetch_ibon_entertainments(limit=10, keyword=None, only_concert=False):
             if len(items) >= max(1, int(limit)):
                 break
 
-        # 4) 如果還不夠，再直接把任何 Details/<id> 變成「活動、無圖」補足
+        # 4) 不夠就把裸的 Details/<id> 補上（無圖）
         if len(items) < limit and details_urls:
             for u in details_urls:
                 if any(it["url"] == u for it in items):
@@ -1399,10 +1396,13 @@ def fetch_ibon_entertainments(limit=10, keyword=None, only_concert=False):
                     break
 
         return items
-
     except Exception as e:
         app.logger.error(f"[html_hard] failed: {e}")
         return []
+
+# --- backward-compat alias（舊名→新實作；一定要放在函式「外面」） ---
+def fetch_ibon_entertainments(limit=10, keyword=None, only_concert=False):
+    return fetch_ibon_ent_html_hard(limit=limit, keyword=keyword, only_concert=only_concert)
 
 def _truthy(v: Optional[str]) -> bool:
     if v is None:
@@ -1453,12 +1453,11 @@ def fetch_ibon_carousel_from_api(limit=10, keyword=None, only_concert=False):
         _API_BREAK_UNTIL = time.time() + 1800
         return []
 
-    # —— 以下沿用你原本的 _normalize_item 與過濾邏輯 ——
     items, seen = [], set()
 
     def _append_from_list(arr):
         nonlocal items, seen
-        for r in arr:
+        for r in arr or []:
             try:
                 it = _normalize_item(r if isinstance(r, dict) else {})
                 if not it.get("url"):
@@ -1485,13 +1484,11 @@ def fetch_ibon_carousel_from_api(limit=10, keyword=None, only_concert=False):
                 p = f"{path}.{k}" if path else str(k)
                 yield from _iter_lists(v, p)
 
-    # 優先看有沒有像輪播的 key
     car_lists, other_lists = [], []
     for path, arr in _iter_lists(data):
-        if not isinstance(arr, list) or not arr:
-            continue
-        (car_lists if any(k in path.lower() for k in ("banner", "carousel", "ad", "focus", "slider", "swiper"))
-         else other_lists).append((path, arr))
+        if isinstance(arr, list) and arr:
+            (car_lists if any(k in path.lower() for k in ("banner","carousel","ad","focus","slider","swiper"))
+             else other_lists).append((path, arr))
     for _, arr in car_lists:
         if _append_from_list(arr):
             break
@@ -1500,8 +1497,7 @@ def fetch_ibon_carousel_from_api(limit=10, keyword=None, only_concert=False):
             if _append_from_list(arr):
                 break
 
-        # 確保回傳 list
-    return (items[:limit]) if items else []
+    return items[:limit] if items else []
 
 def _extract_carousel_html_hard(html: str, limit=10, keyword=None, only_concert=False):
     """
@@ -1581,6 +1577,7 @@ def _extract_carousel_html_hard(html: str, limit=10, keyword=None, only_concert=
 # ====== 替換：/liff/activities 以多來源 fallback（優先輪播） ======
 @app.route("/liff/activities", methods=["GET"])
 def liff_activities():
+    trace = []
     try:
         try:
             limit = int(request.args.get("limit", "10"))
@@ -1590,9 +1587,7 @@ def liff_activities():
         only_concert = _truthy(request.args.get("onlyConcert"))
         want_debug = _truthy(request.args.get("debug"))
 
-        trace = []
-
-        # 1) API 輪播（包含 API 與 HTML 兜底的混合策略）
+        # 1) 輪播（API + HTML 兜底）
         acts = fetch_ibon_carousel_from_api(limit=limit, keyword=kw, only_concert=only_concert)
         trace.append({"phase": "api_carousel_mixed", "count": len(acts or [])})
 
@@ -1606,8 +1601,7 @@ def liff_activities():
             acts = fetch_ibon_entertainments(limit=limit, keyword=kw, only_concert=only_concert)
             trace.append({"phase": "html_fallback", "count": len(acts or [])})
 
-        # 防 None
-        acts = acts or []
+        acts = acts or []  # 防 None
 
         if want_debug:
             return jsonify({"ok": True, "count": len(acts), "preview": acts[:2], "trace": trace}), 200
@@ -1616,10 +1610,9 @@ def liff_activities():
 
     except Exception as e:
         app.logger.error(f"/liff/activities error: {e}\n{traceback.format_exc()}")
-        # 錯誤時也保持結構一致
         want_debug = _truthy(request.args.get("debug"))
         if want_debug:
-            return jsonify({"ok": False, "error": str(e), "trace": []}), 200
+            return jsonify({"ok": False, "error": str(e), "trace": trace}), 200
         return jsonify({"ok": False, "error": str(e)}), 500
 
 @app.route("/liff/activities_debug", methods=["GET"])
