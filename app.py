@@ -352,6 +352,37 @@ def find_details_url_candidates_from_html(html: str, base: str) -> List[str]:
         urls.add(urljoin("https://ticket.ibon.com.tw", m.group(0)))
     return list(urls)
 
+def _extract_details_any(html: str) -> List[str]:
+    """盡可能把 /ActivityInfo/Details/<id> 都撿出來（避免只靠固定版型）。"""
+    urls: List[str] = []
+
+    # 1) 直接正則掃全頁
+    for m in re.finditer(r'(?i)(?:https?://ticket\.ibon\.com\.tw)?/ActivityInfo/Details/(\d+)', html):
+        urls.append(urljoin(IBON_BASE, m.group(0)))
+
+    # 2) 拿 a[href]（有時候 href 是相對路徑）
+    try:
+        soup = soup_parse(html)
+        for a in soup.select('a[href*="ActivityInfo/Details"]'):
+            href = (a.get("href") or "").strip()
+            if href:
+                urls.append(urljoin(IBON_BASE, href))
+    except Exception:
+        pass
+
+    # 3) script 內 JSON/字串
+    for m in re.finditer(r'ActivityInfoId"\s*:\s*(\d+)|ActivityId"\s*:\s*(\d+)', html):
+        gid = next(g for g in m.groups() if g)
+        urls.append(f"https://ticket.ibon.com.tw/ActivityInfo/Details/{gid}")
+
+    # 去重
+    seen, out = set(), []
+    for u in urls:
+        if u not in seen:
+            seen.add(u)
+            out.append(u)
+    return out
+
 # ---------- 活動資訊與圖片（API/Details） ----------
 def _deep_pick_activity_info(data: Any) -> Dict[str, str]:
     out: Dict[str, Optional[str]] = {"title": None, "place": None, "dt": None, "poster": None}
@@ -1333,10 +1364,11 @@ def http_check_once():
 
 def fetch_ibon_ent_html_hard(limit=10, keyword=None, only_concert=False):
     """
-    超寬鬆 HTML 兜底：
-    * 直接在整頁以 regex 撈 img[alt] 當作標題
-    * 優先撿 /ActivityInfo/Details/<id>；沒有就給 SearchResult?keyword=標題
-    永遠回傳 list。
+    超寬鬆 HTML 兜底版本：
+    - 先抓到所有 /ActivityInfo/Details/<id>
+    - 盡量從近鄰元素、img alt、title、strong/h3 取標題
+    - 標題拿不到時，用「活動」；圖片拿不到時給 None
+    - 永遠回傳 list
     """
     url = "https://ticket.ibon.com.tw/Index/entertainment"
     s = requests.Session()
@@ -1346,56 +1378,131 @@ def fetch_ibon_ent_html_hard(limit=10, keyword=None, only_concert=False):
         "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
         "Connection": "close",
     })
-    items, seen = [], set()
+    items: List[Dict[str, Any]] = []
+    seen: set = set()
+
     try:
-        r = s.get(url, timeout=12)
+        r = s.get(url, timeout=15)
         r.raise_for_status()
         html = r.text
+        soup = soup_parse(html)
 
-        # 1) 以 <img ... alt="xxx" ...> 列出所有潛在標題（支援 src/data-src/data-original/data-lazy）
-        patt = re.compile(
-            r'(?is)<img[^>]*\balt\s*=\s*"([^"]{2,})"[^>]*?(?:\bsrc|\bdata-src|\bdata-original|\bdata-lazy)\s*=\s*"([^"]+)"[^>]*>'
-        )
-        candidates = []
-        for m in patt.finditer(html):
-            title = m.group(1).strip()
-            src = urljoin(IBON_BASE, m.group(2).strip())
-            candidates.append((title, src))
+        # 先把所有 Details 連結撿出來
+        all_details = _extract_details_any(html)
 
-        # 2) 收集整頁所有 Details/<id>
-        details_urls = []
-        for m in re.finditer(r'(?i)(?:https?://ticket\.ibon\.com\.tw)?/ActivityInfo/Details/(\d+)', html):
-            details_urls.append(urljoin(IBON_BASE, m.group(0)))
+        def _pick_title_from_node(node) -> Optional[str]:
+            # 1) node 本身的 title 屬性
+            t = (node.get("title") or "").strip() if hasattr(node, "get") else ""
+            if t: return t
+            # 2) 近鄰的 img[alt]
+            img = None
+            try:
+                img = node.find("img") if hasattr(node, "find") else None
+            except Exception:
+                img = None
+            if img and (img.get("alt") or "").strip():
+                return img.get("alt").strip()
+            # 3) 近鄰的 strong/h3/span 文字
+            for sel in ("strong", "h3", ".title", ".txt", "span"):
+                try:
+                    cand = node.select_one(sel) if hasattr(node, "select_one") else None
+                    if cand:
+                        txt = cand.get_text(" ", strip=True)
+                        if txt and len(txt) >= 2:
+                            return txt
+                except Exception:
+                    pass
+            # 4) a 本身文字
+            try:
+                tx = node.get_text(" ", strip=True) if hasattr(node, "get_text") else ""
+                if tx and len(tx) >= 2:
+                    return tx
+            except Exception:
+                pass
+            return None
 
-        def pick_details_for(title: str) -> str:
-            # 找不到可靠 mapping 就回搜尋連結
-            return f"https://ticket.ibon.com.tw/SearchResult?keyword={title}"
+        # 先嘗試用 DOM 找「卡片」
+        try:
+            card_nodes = soup.select('.owl-item, .item, .swiper-slide, .card, .banner, .list, a[href*="ActivityInfo/Details"]')
+        except Exception:
+            card_nodes = []
 
-        # 3) 彙整
-        for title, img in candidates:
+        for nd in card_nodes:
+            try:
+                # 試從卡片內找 Details
+                href = None
+                atag = nd.select_one('a[href*="ActivityInfo/Details"]')
+                if atag and atag.get("href"):
+                    href = urljoin(IBON_BASE, atag["href"].strip())
+                # 沒有就跳過
+                if not href:
+                    continue
+                if href in seen:
+                    continue
+
+                title = _pick_title_from_node(nd) or "活動"
+                if keyword and keyword not in title:
+                    continue
+                if only_concert and not _looks_like_concert(title):
+                    continue
+
+                # 圖片：src / data-src / data-original
+                img_url = None
+                img = nd.find("img")
+                if img:
+                    for k in ("src", "data-src", "data-original", "data-lazy"):
+                        v = (img.get(k) or "").strip()
+                        if v:
+                            img_url = urljoin(IBON_BASE, v)
+                            break
+
+                items.append({"title": title, "url": href, "image": img_url})
+                seen.add(href)
+                if len(items) >= max(1, int(limit)):
+                    return items
+            except Exception:
+                continue
+
+        # 如果上面的卡片法抓不到，退而求其次：用所有 Details 列表配對標題
+        for href in all_details:
+            if href in seen:
+                continue
+            # 在 HTML 內找這個 href 出現附近的文字當標題
+            title = None
+            try:
+                # 取出 href 周邊 300 字元尋找候選文字
+                m = re.search(re.escape(href), html)
+                if m:
+                    start = max(0, m.start() - 300)
+                    end   = min(len(html), m.end() + 300)
+                    blob  = html[start:end]
+                    # title 屬性
+                    mt = re.search(r'title\s*=\s*"([^"]{2,})"', blob)
+                    if mt: title = mt.group(1).strip()
+                    # strong/h3
+                    if not title:
+                        mt = re.search(r'(?is)<(?:strong|h3)[^>]*>\s*([^<]{2,})\s*</(?:strong|h3)>', blob)
+                        if mt: title = mt.group(1).strip()
+                    # img alt
+                    if not title:
+                        mt = re.search(r'(?is)<img[^>]*\balt\s*=\s*"([^"]{2,})"', blob)
+                        if mt: title = mt.group(1).strip()
+            except Exception:
+                pass
+
+            title = title or "活動"
             if keyword and keyword not in title:
                 continue
             if only_concert and not _looks_like_concert(title):
                 continue
-            href = pick_details_for(title)
-            key = (title, href)
-            if key in seen:
-                continue
-            seen.add(key)
-            items.append({"title": title, "url": href, "image": img})
+
+            items.append({"title": title, "url": href, "image": None})
+            seen.add(href)
             if len(items) >= max(1, int(limit)):
                 break
 
-        # 4) 不夠就把裸的 Details/<id> 補上（無圖）
-        if len(items) < limit and details_urls:
-            for u in details_urls:
-                if any(it["url"] == u for it in items):
-                    continue
-                items.append({"title": "活動", "url": u, "image": None})
-                if len(items) >= limit:
-                    break
-
         return items
+
     except Exception as e:
         app.logger.error(f"[html_hard] failed: {e}")
         return []
