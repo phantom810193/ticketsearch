@@ -241,7 +241,10 @@ def grab_ibon_carousel_urls():
         raw_links = page.evaluate(script)
         browser.close()
         # 只留活動詳細頁
-        return sorted({u for u in raw_links if "/ActivityInfo/Details/" in u})
+        urls = sorted({u for u in raw_links if "/ActivityInfo/Details/" in u})
+        return urls
+
+
 
 @app.get("/ibon/carousel")
 def ibon_carousel():
@@ -1767,9 +1770,8 @@ def liff_activities():
         return jsonify(acts[:limit]), 200
 
     except Exception as e:
-        app.logger.error(f"/liff/activities error: {e}\n{traceback.format_exc()}")
-        want_debug = _truthy(request.args.get("debug"))
-        if want_debug:
+        app.logger.error(f"/liff/activities error: {e}")
+        if _truthy(request.args.get("debug")):
             return jsonify({"ok": False, "error": str(e), "trace": trace}), 200
         return jsonify({"ok": False, "error": str(e)}), 500
 
