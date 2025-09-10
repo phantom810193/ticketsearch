@@ -13,6 +13,7 @@ from typing import Dict, Tuple, Optional, Any, List
 from urllib.parse import urlparse, urlunparse, parse_qs, urlencode, urljoin
 from flask import send_from_directory
 from flask import jsonify, Flask, request, abort
+from playwright.sync_api import sync_playwright
 
 # ==== ibon API circuit breaker ====
 _IBON_BREAK_OPEN_UNTIL = 0.0  # timestamp，> now 代表 API 暫停使用
@@ -196,6 +197,56 @@ from google.cloud import firestore
 
 # ===== Flask & CORS =====
 app = Flask(__name__)
+
+def grab_ibon_carousel_urls():
+    with sync_playwright() as p:
+        browser = p.chromium.launch(headless=True)
+        ctx = browser.new_context(locale="zh-TW")
+        page = ctx.new_page()
+        page.goto("https://ticket.ibon.com.tw/Index/entertainment", wait_until="networkidle")
+
+        script = r"""
+        () => {
+          const links = new Set();
+          const keep = u => { if (!u) return; links.add(new URL(u, location.href).href); };
+
+          const _open = window.open; window.open = (u)=>{ keep(u); return null; };
+          const _assign = location.assign.bind(location); location.assign = u => { keep(u); };
+          const _replace = location.replace.bind(location); location.replace = u => { keep(u); };
+          let hrefDesc;
+          try {
+            hrefDesc = Object.getOwnPropertyDescriptor(Location.prototype, 'href');
+            if (hrefDesc?.set) {
+              Object.defineProperty(Location.prototype, 'href', {
+                configurable:true, enumerable:hrefDesc.enumerable,
+                get: hrefDesc.get, set(u){ keep(u); }
+              });
+            }
+          } catch(e){}
+          const _push = history.pushState; history.pushState = (s,t,u)=>{ keep(u); };
+          const _repl = history.replaceState; history.replaceState = (s,t,u)=>{ keep(u); };
+
+          const click = el => el.dispatchEvent(new MouseEvent('click', {bubbles:true, cancelable:true}));
+          document.querySelectorAll('.item.ng-star-inserted, .item.ng-star-inserted a, .item.ng-star-inserted img')
+            .forEach(el => { try { click(el); } catch(e){} });
+
+          // 還原
+          window.open = _open; location.assign = _assign; location.replace = _replace;
+          if (hrefDesc) Object.defineProperty(Location.prototype, 'href', hrefDesc);
+          history.pushState = _push; history.replaceState = _repl;
+
+          return Array.from(links);
+        }
+        """
+        raw_links = page.evaluate(script)
+        browser.close()
+        # 只留活動詳細頁
+        return sorted({u for u in raw_links if "/ActivityInfo/Details/" in u})
+
+@app.get("/ibon/carousel")
+def ibon_carousel():
+    urls = grab_ibon_carousel_urls()
+    return jsonify({"count": len(urls), "urls": urls})
 
 # 建議：白名單（可多個網域）
 # 建議：白名單用環境變數，逗號分隔
