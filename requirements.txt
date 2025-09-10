@@ -13,4 +13,4 @@ google-cloud-tasks==2.16.3
 grpcio>=1.74,<1.76
 
 # Playwright 只在 Linux/Mac 安裝（Docker/Cloud Run 會裝，Windows 本機不裝）
-playwright==1.45.0 ; sys_platform != "win32"
+playwright==1.47.2 ; sys_platform != "win32"
