@@ -14,6 +14,23 @@ from urllib.parse import urlparse, urlunparse, parse_qs, urlencode, urljoin
 from flask import send_from_directory
 from flask import jsonify, Flask, request, abort
 
+# ==== ibon API circuit breaker ====
+_IBON_BREAK_OPEN_UNTIL = 0.0  # timestamp，> now 代表 API 暫停使用
+_IBON_BREAK_COOLDOWN = int(os.getenv("IBON_API_COOLDOWN_SEC", "300"))  # 500 後冷卻秒數（預設 5 分鐘）
+_IBON_API_DISABLED = os.getenv("IBON_API_DISABLE", "0") == "1"  # 緊急開關：1 => 永遠不用 API
+
+def _breaker_open_now() -> bool:
+    return (time.time() < _IBON_BREAK_OPEN_UNTIL) or _IBON_API_DISABLED
+
+def _open_breaker():
+    global _IBON_BREAK_OPEN_UNTIL
+    _IBON_BREAK_OPEN_UNTIL = time.time() + _IBON_BREAK_COOLDOWN
+
+def _sleep_backoff(attempt: int):
+    # 0.4s, 0.8s, 1.6s 上限 2s，加一點抖動
+    d = min(2.0, 0.4 * (2 ** attempt)) + (0.05 * attempt)
+    time.sleep(d)
+
 IBON_API = "https://ticketapi.ibon.com.tw/api/ActivityInfo/GetIndexData"
 IBON_BASE = "https://ticket.ibon.com.tw/"
 
@@ -68,61 +85,80 @@ def _normalize_item(row):
 # --------- 直接打 API 拉清單 ---------
 def fetch_ibon_list_via_api(limit=10, keyword=None, only_concert=False):
     """
-    直接打 ibon 官方 API 抽取活動清單。
-    回傳：[{title, url, image}, ...]
+    直接打 ibon 官方 API 抽取活動清單（泛抓）。
+    有 5xx 時開啟斷路器，讓後續請求優先走 HTML 兜底，避免一直噴 500。
     """
     global _cache
     now = time.time()
     if now - _cache["ts"] < _CACHE_TTL and _cache["data"]:
-        rows = _cache["data"]
+        base_rows = _cache["data"]
     else:
-        headers = {
-            "User-Agent": "Mozilla/5.0",
+        if _breaker_open_now():
+            return []  # 斷路器期間直接跳過 API
+
+        s = requests.Session()
+        s.headers.update({
+            "User-Agent": UA,
+            "Accept-Language": "zh-TW,zh;q=0.9,en;q=0.6",
             "Accept": "application/json, text/plain, */*",
-            "Origin": "https://ticket.ibon.com.tw",
-            "Referer": "https://ticket.ibon.com.tw/Index/entertainment",
-        }
+            "Connection": "close",
+        })
+        # 先暖首頁
         try:
-            resp = requests.post(IBON_API, headers=headers, timeout=12, json={})
-            resp.raise_for_status()
-            data = resp.json()
-        except Exception as e:
-            logging.getLogger().error(f"[ibon api] request failed: {e}")
-            return []
+            s.get("https://ticket.ibon.com.tw/Index/entertainment", timeout=10)
+        except Exception:
+            pass
 
-        # 解析可能的包裝層
-        blobs = []
-        root = data.get("Data") or data.get("data") or data
-        if isinstance(root, dict):
-            for v in root.values():
-                if isinstance(v, list):
-                    blobs.extend(v)
-                elif isinstance(v, dict) and isinstance(v.get("ActivityList"), list):
-                    blobs.extend(v["ActivityList"])
-        elif isinstance(root, list):
-            blobs = root
-
-        if not blobs and isinstance(data, dict):
-            for v in data.values():
-                if isinstance(v, list):
-                    blobs.extend(v)
-
-        rows = []
-        for r in blobs:
+        base_rows = []
+        for attempt in range(3):
             try:
-                item = _normalize_item(r)
-                if not item.get("url"):
-                    continue
-                rows.append(item)
-            except Exception:
-                continue
+                r = s.post(IBON_API, headers={
+                    "Origin": "https://ticket.ibon.com.tw",
+                    "Referer": "https://ticket.ibon.com.tw/Index/entertainment",
+                    "Content-Type": "application/json;charset=UTF-8",
+                }, json={}, timeout=10)
+                if r.status_code == 200:
+                    data = r.json()
+                    blobs = []
+                    root = data.get("Data") or data.get("data") or data
+                    if isinstance(root, dict):
+                        for v in root.values():
+                            if isinstance(v, list):
+                                blobs.extend(v)
+                            elif isinstance(v, dict) and isinstance(v.get("ActivityList"), list):
+                                blobs.extend(v["ActivityList"])
+                    elif isinstance(root, list):
+                        blobs = root
+                    if not blobs and isinstance(data, dict):
+                        for v in data.values():
+                            if isinstance(v, list):
+                                blobs.extend(v)
 
-        _cache = {"ts": now, "data": rows}
+                    for r0 in blobs:
+                        try:
+                            item = _normalize_item(r0)
+                            if item.get("url"):
+                                base_rows.append(item)
+                        except Exception:
+                            continue
+                    break  # 成功就離開重試迴圈
 
-    # 過濾
+                if 500 <= r.status_code < 600:
+                    app.logger.warning(f"[ibon api] http={r.status_code} -> open breaker")
+                    _open_breaker()
+                    base_rows = []
+                    break
+                app.logger.info(f"[ibon api] http={r.status_code}")
+            except Exception as e:
+                app.logger.info(f"[ibon api] err: {e}")
+            _sleep_backoff(attempt)
+
+        _cache = {"ts": now, "data": base_rows}
+
+    # 過濾 + 截斷
     out = []
     kw = (keyword or "").strip()
-    for it in rows:
+    for it in base_rows:
         if kw and kw not in it["title"]:
             continue
         if only_concert and not _looks_like_concert(it["title"]):
@@ -1367,45 +1403,52 @@ def _truthy(v: Optional[str]) -> bool:
     return s in ("1", "true", "t", "yes", "y")
 
 def fetch_ibon_carousel_from_api(limit=10, keyword=None, only_concert=False):
-    url = IBON_API
+    """
+    嘗試從 ibon 首頁 API 抓活動；若 API 500/掛掉 → 打開斷路器一段時間。
+    無論 API 成不成功，都會做一次 HTML 兜底，確保回傳不為空（在站頁有內容時）。
+    """
+    items: List[Dict[str, Any]] = []
+    seen_urls: set = set()
 
-    # 先用 session 暖 Cookie
+    # —— 先暖 Cookie（有些 CDN/防護需要）
     s = requests.Session()
     s.headers.update({
-        "User-Agent": "Mozilla/5.0",
+        "User-Agent": UA,
         "Accept-Language": "zh-TW,zh;q=0.9,en;q=0.6",
         "Accept": "application/json, text/plain, */*",
         "Connection": "close",
     })
     try:
-        s.get("https://ticket.ibon.com.tw/Index/entertainment", timeout=12)
+        s.get("https://ticket.ibon.com.tw/Index/entertainment", timeout=10)
     except Exception as e:
-        app.logger.error(f"[carousel] warmup failed: {e}")
+        app.logger.info(f"[carousel] warmup fail: {e}")
 
-    headers = {
-        "Origin": "https://ticket.ibon.com.tw",
-        "Referer": "https://ticket.ibon.com.tw/Index/entertainment",
-        "Content-Type": "application/json;charset=UTF-8",
-    }
-
-    # 先試 API (POST -> GET)；失敗就放棄，不卡住
+    # —— API（若斷路器開啟則跳過）
     data = None
-    for attempt in range(2):
-        for method in ("POST", "GET"):
+    if not _breaker_open_now():
+        headers = {
+            "Origin": "https://ticket.ibon.com.tw",
+            "Referer": "https://ticket.ibon.com.tw/Index/entertainment",
+            "Content-Type": "application/json;charset=UTF-8",
+        }
+        for attempt in range(3):  # 最多 3 次（POST→GET 交替）
+            method = "POST" if (attempt % 2 == 0) else "GET"
             try:
-                r = s.post(url, json={}, headers=headers, timeout=12) if method == "POST" \
-                    else s.get(url, headers=headers, timeout=12)
+                r = s.post(IBON_API, json={}, headers=headers, timeout=10) if method == "POST" \
+                    else s.get(IBON_API, headers=headers, timeout=10)
                 if r.status_code == 200:
                     data = r.json()
                     break
-                app.logger.info(f"[carousel-api] attempt={attempt+1} {method} http={r.status_code}")
+                # 5xx 視為服務異常，打開斷路器
+                if 500 <= r.status_code < 600:
+                    app.logger.warning(f"[carousel-api] {method} http={r.status_code} -> open breaker")
+                    _open_breaker()
+                    break
+                # 其餘狀態碼：再試下一輪
+                app.logger.info(f"[carousel-api] {method} http={r.status_code}")
             except Exception as e:
-                app.logger.error(f"[carousel-api] attempt={attempt+1} {method} failed: {e}")
-        if data is not None:
-            break
-
-    items: List[Dict[str, Any]] = []
-    seen_urls: set = set()
+                app.logger.info(f"[carousel-api] {method} err: {e}")
+            _sleep_backoff(attempt)
 
     def _append_from_list(arr):
         nonlocal items, seen_urls
@@ -1445,7 +1488,7 @@ def fetch_ibon_carousel_from_api(limit=10, keyword=None, only_concert=False):
         keys = ("banner", "carousel", "advertis", "ad_list", "slider", "swiper", "focus", "main")
         return any(k in p for k in keys)
 
-    # 若 API 有回來，試著挑清單
+    # —— 解析 API JSON（如果成功）
     if data is not None:
         car_lists, other_lists = [], []
         for path, arr in _iter_lists(data):
@@ -1472,13 +1515,14 @@ def fetch_ibon_carousel_from_api(limit=10, keyword=None, only_concert=False):
             except Exception:
                 pass
 
-    # ▲▲ 即使 API 成功也可能抓不到；無論如何：再跑一次 HTML 兜底（regex 版）
+    # —— **一定**做 HTML 兜底（就算 API 成功也做一次，避免 API 沒含全部）
     if len(items) < limit:
         try:
-            r_html = s.get("https://ticket.ibon.com.tw/Index/entertainment", timeout=12)
+            r_html = s.get("https://ticket.ibon.com.tw/Index/entertainment", timeout=10)
             r_html.raise_for_status()
-            # 先用「純 regex」的硬解法
-            more = _extract_carousel_html_hard(r_html.text, limit=limit, keyword=keyword, only_concert=only_concert)
+            more = _extract_carousel_html_hard(
+                r_html.text, limit=limit, keyword=keyword, only_concert=only_concert
+            )
             for it in more:
                 if it["url"] not in seen_urls:
                     items.append(it)
@@ -1568,7 +1612,6 @@ def _extract_carousel_html_hard(html: str, limit=10, keyword=None, only_concert=
 # ====== 替換：/liff/activities 以多來源 fallback（優先輪播） ======
 @app.route("/liff/activities", methods=["GET"])
 def liff_activities():
-    # 參數：?limit=10&onlyConcert=1&q=關鍵字&debug=1
     try:
         limit = int(request.args.get("limit", "10"))
     except Exception:
@@ -1576,31 +1619,27 @@ def liff_activities():
     kw = request.args.get("q") or None
     only_concert = _truthy(request.args.get("onlyConcert"))
     want_debug = _truthy(request.args.get("debug"))
-
     dbg = {"steps": []}
 
     try:
-        # 1) API 輪播
-        acts = fetch_ibon_carousel_from_api(limit=limit, keyword=kw, only_concert=only_concert)
-        dbg["steps"].append({"phase": "carousel_api", "count": len(acts)})
+        # 1) HTML 兜底（最穩）
+        acts = fetch_ibon_entertainments(limit=limit, keyword=kw, only_concert=only_concert)
+        dbg["steps"].append({"phase": "html_first", "count": len(acts)})
 
-        # 2) API 泛抓
-        if not acts:
-            acts = fetch_ibon_list_via_api(limit=limit, keyword=kw, only_concert=only_concert)
-            dbg["steps"].append({"phase": "api_generic", "count": len(acts)})
-
-        # 3) HTML 保底
-        if not acts:
-            acts = fetch_ibon_entertainments(limit=limit, keyword=kw, only_concert=only_concert)
-            dbg["steps"].append({"phase": "html_fallback", "count": len(acts)})
+        # 2) API（輪播/泛抓）補齊
+        if len(acts) < limit:
+            more = fetch_ibon_carousel_from_api(limit=limit, keyword=kw, only_concert=only_concert)
+            dbg["steps"].append({"phase": "api_carousel_mixed", "count": len(more)})
+            # 合併去重
+            seen = {it["url"] for it in acts}
+            for it in more:
+                if it["url"] not in seen:
+                    acts.append(it); seen.add(it["url"])
+                if len(acts) >= limit:
+                    break
 
         if want_debug:
-            return jsonify({
-                "ok": True,
-                "count": len(acts),
-                "preview": acts[:2],
-                "trace": dbg["steps"],
-            }), 200
+            return jsonify({"ok": True, "count": len(acts), "preview": acts[:2], "trace": dbg["steps"]}), 200
 
         return jsonify(acts[:limit]), 200
 
