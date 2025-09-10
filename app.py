@@ -1323,76 +1323,81 @@ def http_check_once():
 
 # ====== Entertainment helpers & LIFF API ======
 
+def fetch_ibon_ent_html_hard(limit=10, keyword=None, only_concert=False):
+    """
+    超寬鬆 HTML 兜底：
+    * 直接在整頁以 regex 撈 img[alt] 當作標題
+    * 優先撿 /ActivityInfo/Details/<id>；沒有就給 SearchResult?keyword=標題
+    """
+# --- backward-compat alias (舊名 → 新實作) ---
 def fetch_ibon_entertainments(limit=10, keyword=None, only_concert=False):
-    url = "https://ticket.ibon.com.tw/Index/entertainment"
-    items, seen = [], set()
+    """
+    舊版本程式呼叫的名稱。為了相容，把它導向新版的硬解析實作。
+    """
+    return fetch_ibon_ent_html_hard(limit=limit, keyword=keyword, only_concert=only_concert)
 
+    url = "https://ticket.ibon.com.tw/Index/entertainment"
     s = requests.Session()
     s.headers.update({
         "User-Agent": UA,
         "Accept-Language": "zh-TW,zh;q=0.9,en;q=0.6",
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+        "Connection": "close",
     })
-
+    items, seen = [], set()
     try:
         r = s.get(url, timeout=12)
         r.raise_for_status()
         html = r.text
-        soup = BeautifulSoup(html, "lxml")
 
-        cards = soup.select(".owl-item .item") or []
-        for card in cards:
-            a = card.select_one(".title a[title]")
-            title = (a.get("title").strip() if a and a.get("title") else "") or \
-                    (card.find("img").get("alt").strip() if card.find("img") and card.find("img").get("alt") else "")
-            if not title:
-                continue
+        # 1) 以 <img ... alt="xxx" ...> 列出所有潛在標題
+        #    允許 src / data-src / data-original / data-lazy 作為圖片
+        patt = re.compile(
+            r'(?is)<img[^>]*\balt\s*=\s*"([^"]{2,})"[^>]*?(?:\bsrc|\bdata-src|\bdata-original|\bdata-lazy)\s*=\s*"([^"]+)"[^>]*>'
+        )
+        candidates = []
+        for m in patt.finditer(html):
+            title = m.group(1).strip()
+            src = urljoin(IBON_BASE, m.group(2).strip())
+            candidates.append((title, src))
 
-            img = None
-            img_tag = card.find("img")
-            if img_tag:
-                for key in ("src", "data-src", "data-original"):
-                    v = img_tag.get(key)
-                    if v and v.strip():
-                        img = urljoin(IBON_BASE, v.strip())
-                        break
+        # 2) 預先把整頁出現過的 Details id 收集起來
+        details_urls = []
+        for m in re.finditer(r'(?i)(?:https?://ticket\.ibon\.com\.tw)?/ActivityInfo/Details/(\d+)', html):
+            details_urls.append(urljoin(IBON_BASE, m.group(0)))
 
-            href = f"https://ticket.ibon.com.tw/SearchResult?keyword={title}"
+        def pick_details_for(title: str) -> str:
+            # 先找與 title 相近的區塊附近是否出現 Details；不強制，找不到就走搜尋
+            return f"https://ticket.ibon.com.tw/SearchResult?keyword={title}"
 
-            a2 = card.select_one('a[href*="ActivityInfo/Details"]')
-            if a2 and a2.get("href"):
-                href = urljoin(IBON_BASE, a2["href"])
-
-            text_blob = card.decode()
-            m = re.search(r'(?:https?://ticket\.ibon\.com\.tw)?/ActivityInfo/Details/(\d+)', text_blob)
-            if m:
-                href = urljoin(IBON_BASE, m.group(0))
-
+        # 3) 彙整
+        for title, img in candidates:
             if keyword and keyword not in title:
                 continue
             if only_concert and not _looks_like_concert(title):
                 continue
-            if href in seen:
+            href = pick_details_for(title)
+            key = (title, href)
+            if key in seen:
                 continue
-
+            seen.add(key)
             items.append({"title": title, "url": href, "image": img})
-            seen.add(href)
             if len(items) >= max(1, int(limit)):
                 break
 
-        # 🔻 若 Soup 版本抓不到，改用純 regex 再掃一次（硬兜底）
-        if not items:
-            more = _extract_carousel_html_hard(html, limit=limit, keyword=keyword, only_concert=only_concert)
-            for it in more:
-                if it["url"] not in seen:
-                    items.append(it)
-                    seen.add(it["url"])
+        # 4) 如果還不夠，再直接把任何 Details/<id> 變成「活動、無圖」補足
+        if len(items) < limit and details_urls:
+            for u in details_urls:
+                if any(it["url"] == u for it in items):
+                    continue
+                items.append({"title": "活動", "url": u, "image": None})
                 if len(items) >= limit:
                     break
 
         return items
 
     except Exception as e:
-        app.logger.error(f"[ibon html] failed: {e}")
+        app.logger.error(f"[html_hard] failed: {e}")
         return []
 
 def _truthy(v: Optional[str]) -> bool:
@@ -1401,15 +1406,17 @@ def _truthy(v: Optional[str]) -> bool:
     s = str(v).strip().lower()
     return s in ("1", "true", "t", "yes", "y")
 
-def fetch_ibon_carousel_from_api(limit=10, keyword=None, only_concert=False):
-    """
-    嘗試從 ibon 首頁 API 抓活動；若 API 500/掛掉 → 打開斷路器一段時間。
-    無論 API 成不成功，都會做一次 HTML 兜底，確保回傳不為空（在站頁有內容時）。
-    """
-    items: List[Dict[str, Any]] = []
-    seen_urls: set = set()
+# 簡單保險絲（30 分鐘）
+_API_BREAK_UNTIL = 0
 
-    # —— 先暖 Cookie（有些 CDN/防護需要）
+def fetch_ibon_carousel_from_api(limit=10, keyword=None, only_concert=False):
+    global _API_BREAK_UNTIL
+    now = time.time()
+    if now < _API_BREAK_UNTIL:
+        app.logger.info("[carousel-api] breaker open -> skip API, go HTML")
+        return []
+
+    url = IBON_API
     s = requests.Session()
     s.headers.update({
         "User-Agent": UA,
@@ -1418,55 +1425,47 @@ def fetch_ibon_carousel_from_api(limit=10, keyword=None, only_concert=False):
         "Connection": "close",
     })
     try:
-        s.get("https://ticket.ibon.com.tw/Index/entertainment", timeout=10)
-    except Exception as e:
-        app.logger.info(f"[carousel] warmup fail: {e}")
+        s.get("https://ticket.ibon.com.tw/Index/entertainment", timeout=12)
+    except Exception:
+        pass
 
-    # —— API（若斷路器開啟則跳過）
+    headers = {
+        "Origin": "https://ticket.ibon.com.tw",
+        "Referer": "https://ticket.ibon.com.tw/Index/entertainment",
+        "Content-Type": "application/json;charset=UTF-8",
+    }
+
     data = None
-    if not _breaker_open_now():
-        headers = {
-            "Origin": "https://ticket.ibon.com.tw",
-            "Referer": "https://ticket.ibon.com.tw/Index/entertainment",
-            "Content-Type": "application/json;charset=UTF-8",
-        }
-        for attempt in range(3):  # 最多 3 次（POST→GET 交替）
-            method = "POST" if (attempt % 2 == 0) else "GET"
-            try:
-                r = s.post(IBON_API, json={}, headers=headers, timeout=10) if method == "POST" \
-                    else s.get(IBON_API, headers=headers, timeout=10)
-                if r.status_code == 200:
-                    data = r.json()
-                    break
-                # 5xx 視為服務異常，打開斷路器
-                if 500 <= r.status_code < 600:
-                    app.logger.warning(f"[carousel-api] {method} http={r.status_code} -> open breaker")
-                    _open_breaker()
-                    break
-                # 其餘狀態碼：再試下一輪
-                app.logger.info(f"[carousel-api] {method} http={r.status_code}")
-            except Exception as e:
-                app.logger.info(f"[carousel-api] {method} err: {e}")
-            _sleep_backoff(attempt)
+    try:
+        r = s.post(url, json={}, headers=headers, timeout=12)
+        if r.status_code == 200:
+            data = r.json()
+        else:
+            app.logger.warning(f"[carousel-api] POST http={r.status_code} -> open breaker")
+            _API_BREAK_UNTIL = time.time() + 1800  # 30 分鐘
+            return []
+    except Exception as e:
+        app.logger.warning(f"[carousel-api] POST {e} -> open breaker")
+        _API_BREAK_UNTIL = time.time() + 1800
+        return []
+
+    # —— 以下沿用你原本的 _normalize_item 與過濾邏輯 ——
+    items, seen = [], set()
 
     def _append_from_list(arr):
-        nonlocal items, seen_urls
+        nonlocal items, seen
         for r in arr:
-            cand = r
-            if isinstance(r, dict) and len(r) == 1 and isinstance(next(iter(r.values())), dict):
-                cand = next(iter(r.values()))
             try:
-                it = _normalize_item(cand if isinstance(cand, dict) else r)
+                it = _normalize_item(r if isinstance(r, dict) else {})
                 if not it.get("url"):
                     continue
                 if keyword and keyword not in it["title"]:
                     continue
                 if only_concert and not _looks_like_concert(it["title"]):
                     continue
-                u = it["url"]
-                if u in seen_urls:
+                if it["url"] in seen:
                     continue
-                seen_urls.add(u)
+                seen.add(it["url"])
                 items.append(it)
                 if len(items) >= max(1, int(limit)):
                     return True
@@ -1482,54 +1481,20 @@ def fetch_ibon_carousel_from_api(limit=10, keyword=None, only_concert=False):
                 p = f"{path}.{k}" if path else str(k)
                 yield from _iter_lists(v, p)
 
-    def _looks_like_carousel(path: str) -> bool:
-        p = path.lower()
-        keys = ("banner", "carousel", "advertis", "ad_list", "slider", "swiper", "focus", "main")
-        return any(k in p for k in keys)
-
-    # —— 解析 API JSON（如果成功）
-    if data is not None:
-        car_lists, other_lists = [], []
-        for path, arr in _iter_lists(data):
-            if isinstance(arr, list) and arr:
-                (car_lists if _looks_like_carousel(path) else other_lists).append((path, arr))
-        for _, arr in car_lists:
+    # 優先看有沒有像輪播的 key
+    car_lists, other_lists = [], []
+    for path, arr in _iter_lists(data):
+        if not isinstance(arr, list) or not arr:
+            continue
+        (car_lists if any(k in path.lower() for k in ("banner", "carousel", "ad", "focus", "slider", "swiper"))
+         else other_lists).append((path, arr))
+    for _, arr in car_lists:
+        if _append_from_list(arr):
+            break
+    if len(items) < limit:
+        for _, arr in other_lists:
             if _append_from_list(arr):
                 break
-        if len(items) < limit:
-            for _, arr in other_lists:
-                if _append_from_list(arr):
-                    break
-        if len(items) < 1:
-            try:
-                sjson = json.dumps(data, ensure_ascii=False)
-                for m in re.finditer(r'/ActivityInfo/Details/(\d+)', sjson):
-                    u2 = urljoin(IBON_BASE, m.group(0))
-                    if u2 in seen_urls:
-                        continue
-                    items.append({"title": "活動", "url": u2, "image": None})
-                    seen_urls.add(u2)
-                    if len(items) >= limit:
-                        break
-            except Exception:
-                pass
-
-    # —— **一定**做 HTML 兜底（就算 API 成功也做一次，避免 API 沒含全部）
-    if len(items) < limit:
-        try:
-            r_html = s.get("https://ticket.ibon.com.tw/Index/entertainment", timeout=10)
-            r_html.raise_for_status()
-            more = _extract_carousel_html_hard(
-                r_html.text, limit=limit, keyword=keyword, only_concert=only_concert
-            )
-            for it in more:
-                if it["url"] not in seen_urls:
-                    items.append(it)
-                    seen_urls.add(it["url"])
-                if len(items) >= limit:
-                    break
-        except Exception as e:
-            app.logger.error(f"[carousel-html] failed: {e}")
 
     return items[:limit]
 
@@ -1611,6 +1576,7 @@ def _extract_carousel_html_hard(html: str, limit=10, keyword=None, only_concert=
 # ====== 替換：/liff/activities 以多來源 fallback（優先輪播） ======
 @app.route("/liff/activities", methods=["GET"])
 def liff_activities():
+    # 參數：?limit=10&onlyConcert=1&q=關鍵字&debug=1&raw=1
     try:
         limit = int(request.args.get("limit", "10"))
     except Exception:
@@ -1618,27 +1584,62 @@ def liff_activities():
     kw = request.args.get("q") or None
     only_concert = _truthy(request.args.get("onlyConcert"))
     want_debug = _truthy(request.args.get("debug"))
+    want_raw = _truthy(request.args.get("raw"))
+
     dbg = {"steps": []}
 
-    try:
-        # 1) HTML 兜底（最穩）
-        acts = fetch_ibon_entertainments(limit=limit, keyword=kw, only_concert=only_concert)
-        dbg["steps"].append({"phase": "html_first", "count": len(acts)})
+    # 若要求 raw，先把首頁抓下來做幾個快速檢測
+    raw_probe = None
+    if want_raw:
+        try:
+            s = requests.Session()
+            s.headers.update({
+                "User-Agent": UA,
+                "Accept-Language": "zh-TW,zh;q=0.9,en;q=0.6",
+                "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+                "Sec-Fetch-Site": "same-site",
+                "Sec-Fetch-Mode": "navigate",
+                "Sec-Fetch-Dest": "document",
+                "Upgrade-Insecure-Requests": "1",
+            })
+            r0 = s.get("https://ticket.ibon.com.tw/Index/entertainment", timeout=12)
+            html0 = r0.text
+            raw_probe = {
+                "status": r0.status_code,
+                "len": len(html0),
+                "has_owl": ("owl-carousel" in html0) or ("owl-item" in html0),
+                "has_details": ("/ActivityInfo/Details/" in html0),
+                "has_search": ("/SearchResult?keyword=" in html0),
+            }
+            dbg["raw_probe"] = raw_probe
+        except Exception as e:
+            dbg["raw_probe_error"] = str(e)
 
-        # 2) API（輪播/泛抓）補齊
+    try:
+        # 1) 先 HTML 粗抓（超寬鬆 regex）
+        acts = fetch_ibon_ent_html_hard(limit=limit, keyword=kw, only_concert=only_concert)
+        dbg["steps"].append({"phase": "html_hard", "count": len(acts)})
+
+        # 2) 再試 API（POST/GET 皆試、含 breaker）
         if len(acts) < limit:
-            more = fetch_ibon_carousel_from_api(limit=limit, keyword=kw, only_concert=only_concert)
+            more = fetch_ibon_carousel_from_api(limit=limit - len(acts), keyword=kw, only_concert=only_concert)
             dbg["steps"].append({"phase": "api_carousel_mixed", "count": len(more)})
-            # 合併去重
-            seen = {it["url"] for it in acts}
-            for it in more:
-                if it["url"] not in seen:
-                    acts.append(it); seen.add(it["url"])
-                if len(acts) >= limit:
-                    break
+            acts.extend(more)
+
+        # 3) 仍不足 → 再跑舊的 HTML 方法（class selector）
+        if len(acts) < limit:
+            more = fetch_ibon_entertainments(limit=limit - len(acts), keyword=kw, only_concert=only_concert)
+            dbg["steps"].append({"phase": "html_classic", "count": len(more)})
+            acts.extend(more)
 
         if want_debug:
-            return jsonify({"ok": True, "count": len(acts), "preview": acts[:2], "trace": dbg["steps"]}), 200
+            return jsonify({
+                "ok": True,
+                "count": len(acts),
+                "preview": acts[:min(3, len(acts))],
+                "trace": dbg["steps"],
+                **({"raw_probe": raw_probe} if raw_probe else {})
+            }), 200
 
         return jsonify(acts[:limit]), 200
 
