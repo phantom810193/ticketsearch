@@ -31,6 +31,9 @@ def _sleep_backoff(attempt: int):
     d = min(2.0, 0.4 * (2 ** attempt)) + (0.05 * attempt)
     time.sleep(d)
 
+def _as_list(x):
+    return x if isinstance(x, list) else []
+
 IBON_API = "https://ticketapi.ibon.com.tw/api/ActivityInfo/GetIndexData"
 IBON_BASE = "https://ticket.ibon.com.tw/"
 
@@ -166,7 +169,8 @@ def fetch_ibon_list_via_api(limit=10, keyword=None, only_concert=False):
         out.append(it)
         if len(out) >= max(1, int(limit)):
             break
-    return out
+        return out if isinstance(out, list) else []
+
 
 # --------- LINE SDK（可選）---------
 HAS_LINE = True
@@ -1496,7 +1500,8 @@ def fetch_ibon_carousel_from_api(limit=10, keyword=None, only_concert=False):
             if _append_from_list(arr):
                 break
 
-    return items[:limit]
+        # 確保回傳 list
+    return (items[:limit]) if items else []
 
 def _extract_carousel_html_hard(html: str, limit=10, keyword=None, only_concert=False):
     """
@@ -1576,78 +1581,45 @@ def _extract_carousel_html_hard(html: str, limit=10, keyword=None, only_concert=
 # ====== 替換：/liff/activities 以多來源 fallback（優先輪播） ======
 @app.route("/liff/activities", methods=["GET"])
 def liff_activities():
-    # 參數：?limit=10&onlyConcert=1&q=關鍵字&debug=1&raw=1
     try:
-        limit = int(request.args.get("limit", "10"))
-    except Exception:
-        limit = 10
-    kw = request.args.get("q") or None
-    only_concert = _truthy(request.args.get("onlyConcert"))
-    want_debug = _truthy(request.args.get("debug"))
-    want_raw = _truthy(request.args.get("raw"))
-
-    dbg = {"steps": []}
-
-    # 若要求 raw，先把首頁抓下來做幾個快速檢測
-    raw_probe = None
-    if want_raw:
         try:
-            s = requests.Session()
-            s.headers.update({
-                "User-Agent": UA,
-                "Accept-Language": "zh-TW,zh;q=0.9,en;q=0.6",
-                "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-                "Sec-Fetch-Site": "same-site",
-                "Sec-Fetch-Mode": "navigate",
-                "Sec-Fetch-Dest": "document",
-                "Upgrade-Insecure-Requests": "1",
-            })
-            r0 = s.get("https://ticket.ibon.com.tw/Index/entertainment", timeout=12)
-            html0 = r0.text
-            raw_probe = {
-                "status": r0.status_code,
-                "len": len(html0),
-                "has_owl": ("owl-carousel" in html0) or ("owl-item" in html0),
-                "has_details": ("/ActivityInfo/Details/" in html0),
-                "has_search": ("/SearchResult?keyword=" in html0),
-            }
-            dbg["raw_probe"] = raw_probe
-        except Exception as e:
-            dbg["raw_probe_error"] = str(e)
+            limit = int(request.args.get("limit", "10"))
+        except Exception:
+            limit = 10
+        kw = request.args.get("q") or None
+        only_concert = _truthy(request.args.get("onlyConcert"))
+        want_debug = _truthy(request.args.get("debug"))
 
-    try:
-        # 1) 先 HTML 粗抓（超寬鬆 regex）
-        acts = fetch_ibon_ent_html_hard(limit=limit, keyword=kw, only_concert=only_concert)
-        dbg["steps"].append({"phase": "html_hard", "count": len(acts)})
+        trace = []
 
-        # 2) 再試 API（POST/GET 皆試、含 breaker）
-        if len(acts) < limit:
-            more = fetch_ibon_carousel_from_api(limit=limit - len(acts), keyword=kw, only_concert=only_concert)
-            dbg["steps"].append({"phase": "api_carousel_mixed", "count": len(more)})
-            acts.extend(more)
+        # 1) API 輪播（包含 API 與 HTML 兜底的混合策略）
+        acts = fetch_ibon_carousel_from_api(limit=limit, keyword=kw, only_concert=only_concert)
+        trace.append({"phase": "api_carousel_mixed", "count": len(acts or [])})
 
-        # 3) 仍不足 → 再跑舊的 HTML 方法（class selector）
-        if len(acts) < limit:
-            more = fetch_ibon_entertainments(limit=limit - len(acts), keyword=kw, only_concert=only_concert)
-            dbg["steps"].append({"phase": "html_classic", "count": len(more)})
-            acts.extend(more)
+        # 2) 一般 API
+        if not acts:
+            acts = fetch_ibon_list_via_api(limit=limit, keyword=kw, only_concert=only_concert)
+            trace.append({"phase": "api_generic", "count": len(acts or [])})
+
+        # 3) HTML 兜底
+        if not acts:
+            acts = fetch_ibon_entertainments(limit=limit, keyword=kw, only_concert=only_concert)
+            trace.append({"phase": "html_fallback", "count": len(acts or [])})
+
+        # 防 None
+        acts = acts or []
 
         if want_debug:
-            return jsonify({
-                "ok": True,
-                "count": len(acts),
-                "preview": acts[:min(3, len(acts))],
-                "trace": dbg["steps"],
-                **({"raw_probe": raw_probe} if raw_probe else {})
-            }), 200
+            return jsonify({"ok": True, "count": len(acts), "preview": acts[:2], "trace": trace}), 200
 
         return jsonify(acts[:limit]), 200
 
     except Exception as e:
-        app.logger.error(f"/liff/activities error: {e}")
+        app.logger.error(f"/liff/activities error: {e}\n{traceback.format_exc()}")
+        # 錯誤時也保持結構一致
+        want_debug = _truthy(request.args.get("debug"))
         if want_debug:
-            dbg["error"] = str(e)
-            return jsonify({"ok": False, **dbg}), 200
+            return jsonify({"ok": False, "error": str(e), "trace": []}), 200
         return jsonify({"ok": False, "error": str(e)}), 500
 
 @app.route("/liff/activities_debug", methods=["GET"])
@@ -1676,6 +1648,10 @@ def liff_activities_debug():
 @app.route("/liff/", methods=["GET"])
 def liff_index():
     return send_from_directory("liff", "index.html")
+
+@app.route("/liff/ping", methods=["GET"])
+def liff_ping():
+    return jsonify({"ok": True, "time": datetime.utcnow().isoformat()+"Z"}), 200
 
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=int(os.getenv("PORT", "8080")))
