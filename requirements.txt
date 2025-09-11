@@ -5,14 +5,16 @@ requests==2.32.3
 beautifulsoup4==4.12.3
 lxml>=5.3,<6
 line-bot-sdk>=3.11,<4
-flask-cors
+flask-cors==4.0.1
 
 # Google Cloud
 google-cloud-firestore==2.16.0
-google-cloud-tasks==2.16.3
+# google-cloud-tasks==2.16.3   # 目前沒用到可先註解
 grpcio>=1.74,<1.76
 
-# Playwright 只在 Linux/Mac 安裝（Docker/Cloud Run 會裝，Windows 本機不裝）
+# 瀏覽器自動化（Selenium 優先）
+selenium==4.26.1
+# webdriver-manager 會在執行期下載，Cloud Run 不建議 → 移除
+
+# Playwright 僅在 Linux/Cloud Run 裝；Windows 本機跳過
 playwright==1.47.2 ; sys_platform != "win32"
-selenium>=4.26.1
-webdriver-manager>=4.0.2
