@@ -13,26 +13,7 @@ from typing import Dict, Tuple, Optional, Any, List
 from urllib.parse import urlparse, urlunparse, parse_qs, urlencode, urljoin
 from flask import send_from_directory
 from flask import jsonify, Flask, request, abort
-# Playwright (optional)
-try:
-    from playwright.sync_api import sync_playwright
-    _PLAYWRIGHT_AVAILABLE = True
-except Exception:
-    _PLAYWRIGHT_AVAILABLE = False
-    def sync_playwright():
-        raise RuntimeError("Playwright not available")
-
-# Selenium (optional; prefer this when available)
-try:
-    from selenium import webdriver
-    from selenium.webdriver.chrome.options import Options
-    from selenium.webdriver.chrome.service import Service
-    from selenium.webdriver.common.by import By
-    from selenium.webdriver.support.ui import WebDriverWait
-    from selenium.webdriver.support import expected_conditions as EC
-    _SELENIUM_OK = True
-except Exception:
-    _SELENIUM_OK = False
+from playwright.sync_api import sync_playwright
 
 # ==== ibon API circuit breaker ====
 _IBON_BREAK_OPEN_UNTIL = 0.0  # timestamp，> now 代表 API 暫停使用
@@ -217,95 +198,6 @@ from google.cloud import firestore
 # ===== Flask & CORS =====
 app = Flask(__name__)
 
-def _new_chrome_driver():
-    """
-    建立 headless Chrome。若設了 CHROMEDRIVER_PATH 就用它，
-    否則交給 Selenium Manager 自動找。
-    """
-    opt = Options()
-    opt.add_argument("--headless=new")
-    opt.add_argument("--no-sandbox")
-    opt.add_argument("--disable-dev-shm-usage")
-    opt.add_argument("--disable-gpu")
-    opt.add_argument("--window-size=1280,800")
-    opt.add_argument("--lang=zh-TW")
-    # 如果你在 Cloud Run 有自訂 chromium 路徑，可用以下兩行指定：
-    # opt.binary_location = os.getenv("CHROME_BINARY", opt.binary_location or "")
-    drv_path = os.getenv("CHROMEDRIVER_PATH", "").strip()
-    if drv_path:
-        return webdriver.Chrome(service=Service(drv_path), options=opt)
-    return webdriver.Chrome(options=opt)
-
-def grab_ibon_carousel_urls_selenium(timeout=15):
-    """用 Selenium 觸發首頁輪播點擊，攔截所有導頁 URL。"""
-    driver = _new_chrome_driver()
-    try:
-        driver.get("https://ticket.ibon.com.tw/Index/entertainment")
-        WebDriverWait(driver, timeout).until(
-            lambda d: len(d.find_elements(By.CSS_SELECTOR,
-                    ".item.ng-star-inserted, .owl-item, a[href*='ActivityInfo/Details']")) > 0
-        )
-
-        js = """
-        const links = new Set();
-        const keep = u => { if (!u) return; links.add(new URL(u, location.href).href); };
-
-        const _open = window.open; window.open = (u)=>{ keep(u); return null; };
-        const _assign = location.assign.bind(location); location.assign = u => { keep(u); };
-        const _replace = location.replace.bind(location); location.replace = u => { keep(u); };
-
-        let hrefDesc;
-        try {
-          hrefDesc = Object.getOwnPropertyDescriptor(Location.prototype, 'href');
-          if (hrefDesc && hrefDesc.set) {
-            Object.defineProperty(Location.prototype, 'href', {
-              configurable:true, enumerable:hrefDesc.enumerable,
-              get: hrefDesc.get, set(u){ keep(u); }
-            });
-          }
-        } catch(e){}
-
-        const _push = history.pushState; history.pushState = (s,t,u)=>{ keep(u); };
-        const _repl = history.replaceState; history.replaceState = (s,t,u)=>{ keep(u); };
-
-        const click = el => el.dispatchEvent(new MouseEvent('click', {bubbles:true, cancelable:true}));
-        document.querySelectorAll('.item.ng-star-inserted, .item.ng-star-inserted a, .item.ng-star-inserted img, .owl-item a, .owl-item img')
-          .forEach(el => { try { click(el); } catch(e){} });
-
-        const out = Array.from(links);
-
-        // 還原
-        window.open = _open; location.assign = _assign; location.replace = _replace;
-        if (hrefDesc) Object.defineProperty(Location.prototype, 'href', hrefDesc);
-        history.pushState = _push; history.replaceState = _repl;
-
-        return out;
-        """
-        raw = driver.execute_script(js)
-        return sorted({u for u in (raw or []) if "/ActivityInfo/Details/" in u})
-    finally:
-        try: driver.quit()
-        except Exception: pass
-
-def get_carousel_urls():
-    """
-    先試 Selenium；失敗或未安裝再退回你原本的 Playwright 版。
-    這樣就做到「只加不刪」。
-    """
-    USE_SELENIUM = os.getenv("USE_SELENIUM", "1").lower() in ("1","true","t","yes","y")
-    if USE_SELENIUM and _SELENIUM_OK:
-        try:
-            return grab_ibon_carousel_urls_selenium()
-        except Exception as e:
-            app.logger.warning(f"[carousel] selenium failed: {e}; fallback to playwright")
-    # 退回你原本的函式（保留不動）
-    try:
-        if _PLAYWRIGHT_AVAILABLE:
-            return grab_ibon_carousel_urls()
-    except Exception as e:
-        app.logger.warning(f"[carousel] playwright failed: {e}")
-    return []
-
 def grab_ibon_carousel_urls():
     with sync_playwright() as p:
         browser = p.chromium.launch(headless=True)
@@ -349,12 +241,11 @@ def grab_ibon_carousel_urls():
         raw_links = page.evaluate(script)
         browser.close()
         # 只留活動詳細頁
-        urls = sorted({u for u in raw_links if "/ActivityInfo/Details/" in u})
-        return urls
+        return sorted({u for u in raw_links if "/ActivityInfo/Details/" in u})
 
 @app.get("/ibon/carousel")
 def ibon_carousel():
-    urls = get_carousel_urls()
+    urls = grab_ibon_carousel_urls()
     return jsonify({"count": len(urls), "urls": urls})
 
 # 建議：白名單（可多個網域）
@@ -1876,8 +1767,9 @@ def liff_activities():
         return jsonify(acts[:limit]), 200
 
     except Exception as e:
-        app.logger.error(f"/liff/activities error: {e}")
-        if _truthy(request.args.get("debug")):
+        app.logger.error(f"/liff/activities error: {e}\n{traceback.format_exc()}")
+        want_debug = _truthy(request.args.get("debug"))
+        if want_debug:
             return jsonify({"ok": False, "error": str(e), "trace": trace}), 200
         return jsonify({"ok": False, "error": str(e)}), 500
 
