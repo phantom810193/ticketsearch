@@ -288,44 +288,68 @@ def _run_js_with_fallback(url: str, js_func_literal: str):
         return []
 
 def grab_ibon_carousel_urls():
-    # 用同一段 JS，兩邊（Selenium / Playwright）都能執行
+    # 直接在 ibon 首頁的瀏覽器環境做同步 XHR 抓 JSON，比點擊穩很多
     script = r"""
     () => {
-      const links = new Set();
-      const keep = u => { if (!u) return; links.add(new URL(u, location.href).href); };
-
-      const _open = window.open; window.open = (u)=>{ keep(u); return null; };
-      const _assign = location.assign.bind(location); location.assign = u => { keep(u); };
-      const _replace = location.replace.bind(location); location.replace = u => { keep(u); };
-      let hrefDesc;
       try {
-        hrefDesc = Object.getOwnPropertyDescriptor(Location.prototype, 'href');
-        if (hrefDesc?.set) {
-          Object.defineProperty(Location.prototype, 'href', {
-            configurable:true, enumerable:hrefDesc.enumerable,
-            get: hrefDesc.get, set(u){ keep(u); }
+        const url = "https://ticketapi.ibon.com.tw/api/ActivityInfo/GetIndexData";
+        const xhr = new XMLHttpRequest();
+        xhr.open("POST", url, false);                 // 同步 XHR（Selenium/Playwright 都吃）
+        xhr.setRequestHeader("Content-Type", "application/json;charset=UTF-8");
+        xhr.setRequestHeader("X-Requested-With", "XMLHttpRequest");
+        xhr.send("{}");
+        if (xhr.status < 200 || xhr.status >= 300) return [];
+
+        let data; try { data = JSON.parse(xhr.responseText); } catch (e) { return []; }
+
+        // 走訪 JSON，把可能的 Details 連結/ID 全撿出來
+        const out = new Set();
+        const base = "https://ticket.ibon.com.tw";
+
+        const norm = (obj) => {
+          if (!obj || typeof obj !== "object") return;
+          const title = obj.Title || obj.ActivityTitle || obj.GameName || obj.Name || obj.Subject;
+          const link  = obj.Url || obj.URL || obj.LinkUrl || obj.LinkURL || obj.Link;
+          const id    = obj.ActivityInfoId || obj.ActivityInfoID || obj.ActivityId || obj.ActivityID ||
+                        obj.GameId || obj.GameID || obj.Id || obj.ID;
+
+          let href = null;
+          if (typeof link === "string" && link.trim()) {
+            href = new URL(link, base).href;
+          } else if (id) {
+            href = `${base}/ActivityInfo/Details/${id}`;
+          }
+          if (href && href.includes("/ActivityInfo/Details/")) out.add(href);
+
+          Object.values(obj).forEach(v => {
+            if (Array.isArray(v)) v.forEach(norm);
+            else if (v && typeof v === "object") norm(v);
           });
-        }
-      } catch(e){}
-      const _push = history.pushState; history.pushState = (s,t,u)=>{ keep(u); };
-      const _repl = history.replaceState; history.replaceState = (s,t,u)=>{ keep(u); };
+        };
 
-      const click = el => el.dispatchEvent(new MouseEvent('click', {bubbles:true, cancelable:true}));
-      document.querySelectorAll('.item.ng-star-inserted, .item.ng-star-inserted a, .item.ng-star-inserted img')
-        .forEach(el => { try { click(el); } catch(e){} });
-
-      // 還原
-      window.open = _open; location.assign = _assign; location.replace = _replace;
-      if (hrefDesc) Object.defineProperty(Location.prototype, 'href', hrefDesc);
-      history.pushState = _push; history.replaceState = _repl;
-
-      return Array.from(links);
+        norm(data);
+        return Array.from(out);
+      } catch (e) {
+        return [];
+      }
     }
     """
     url = IBON_ENT_URL
-    raw_links = _run_js_with_fallback(url, script)
-    # 只留活動詳細頁
-    only_details = sorted({u for u in raw_links if isinstance(u, str) and "/ActivityInfo/Details/" in u})
+    raw_links = _run_js_with_fallback(url, script) or []
+
+    # 這裡**不要**再用 typeof（那是 JS），只保留字串即可
+    if not isinstance(raw_links, (list, tuple, set)):
+        raw_links = [raw_links]
+    cleaned = []
+    for u in raw_links:
+        if isinstance(u, str) and u:
+            try:
+                # 統一為絕對網址
+                cleaned.append(urljoin(IBON_BASE, u))
+            except Exception:
+                pass
+
+    only_details = sorted({u for u in cleaned if "/ActivityInfo/Details/" in u})
     return only_details
 
 def _items_from_details_urls(urls: List[str], limit=10, keyword=None, only_concert=False):
