@@ -13,7 +13,22 @@ from typing import Dict, Tuple, Optional, Any, List
 from urllib.parse import urlparse, urlunparse, parse_qs, urlencode, urljoin
 from flask import send_from_directory
 from flask import jsonify, Flask, request, abort
-from playwright.sync_api import sync_playwright
+# --- Browser engines (optional) ---
+try:
+    from playwright.sync_api import sync_playwright
+    _PLAYWRIGHT_AVAILABLE = True
+except Exception:
+    _PLAYWRIGHT_AVAILABLE = False
+    def sync_playwright():
+        raise RuntimeError("Playwright not available")
+
+try:
+    from selenium import webdriver
+    from selenium.webdriver.chrome.options import Options
+    from selenium.webdriver.chrome.service import Service as ChromeService
+    _SELENIUM_AVAILABLE = True
+except Exception:
+    _SELENIUM_AVAILABLE = False
 
 # ==== ibon API circuit breaker ====
 _IBON_BREAK_OPEN_UNTIL = 0.0  # timestamp，> now 代表 API 暫停使用
@@ -198,50 +213,117 @@ from google.cloud import firestore
 # ===== Flask & CORS =====
 app = Flask(__name__)
 
+# === Browser helper: Selenium → Playwright fallback ===
+def _run_js_with_fallback(url: str, js_func_literal: str):
+    """
+    在指定 URL 上執行一段『函式字面量』JS（例如 "() => {...}"），
+    先用 Selenium，失敗再用 Playwright。回傳 JS 的 return 值（通常是 list）。
+    """
+    # 1) Selenium 先試
+    if _SELENIUM_AVAILABLE:
+        try:
+            chrome_path = os.environ.get("CHROME_BIN", "/usr/bin/chromium")
+            chromedriver_path = os.environ.get("CHROMEDRIVER", "/usr/bin/chromedriver")
+
+            opts = Options()
+            # headless on Cloud Run
+            opts.add_argument("--headless=new")
+            opts.add_argument("--no-sandbox")
+            opts.add_argument("--disable-dev-shm-usage")
+            opts.add_argument("--disable-gpu")
+            opts.binary_location = chrome_path
+
+            driver = webdriver.Chrome(service=ChromeService(executable_path=chromedriver_path), options=opts)
+            driver.set_page_load_timeout(30)
+            driver.get(url)
+            # 給一點時間讓前端輪播初始
+            try:
+                time.sleep(1.5)
+            except Exception:
+                pass
+
+            res = driver.execute_script(f"return ({js_func_literal})();")
+            driver.quit()
+            app.logger.info("[browser] Selenium path OK")
+            return res
+        except Exception as e:
+            try:
+                driver.quit()
+            except Exception:
+                pass
+            app.logger.warning(f"[browser] Selenium failed: {e}")
+
+    # 2) Playwright fallback
+    if _PLAYWRIGHT_AVAILABLE:
+        try:
+            with sync_playwright() as p:
+                browser = p.chromium.launch(headless=True, args=["--no-sandbox", "--disable-dev-shm-usage"])
+                ctx = browser.new_context(locale="zh-TW")
+                page = ctx.new_page()
+                page.goto(url, wait_until="networkidle")
+                res = page.evaluate(js_func_literal)
+                browser.close()
+            app.logger.info("[browser] Playwright path OK")
+            return res
+        except Exception as e:
+            app.logger.warning(f"[browser] Playwright failed: {e}")
+
+    # 3) 最後備援：純 requests 抓 HTML 用正則撈 Details（回傳 URL list）
+    try:
+        s = requests.Session()
+        s.headers.update({"User-Agent": "Mozilla/5.0"})
+        r = s.get(url, timeout=12)
+        html = r.text
+        urls = []
+        for m in re.finditer(r'(?i)(?:https?://ticket\.ibon\.com\.tw)?/ActivityInfo/Details/(\d+)', html):
+            u = urljoin("https://ticket.ibon.com.tw/", m.group(0))
+            urls.append(u)
+        seen = set()
+        return [u for u in urls if not (u in seen or seen.add(u))]
+    except Exception as e:
+        app.logger.error(f"[browser] no engine available and HTML fallback failed: {e}")
+        return []
+
 def grab_ibon_carousel_urls():
-    with sync_playwright() as p:
-        browser = p.chromium.launch(headless=True)
-        ctx = browser.new_context(locale="zh-TW")
-        page = ctx.new_page()
-        page.goto("https://ticket.ibon.com.tw/Index/entertainment", wait_until="networkidle")
+    # 用同一段 JS，兩邊（Selenium / Playwright）都能執行
+    script = r"""
+    () => {
+      const links = new Set();
+      const keep = u => { if (!u) return; links.add(new URL(u, location.href).href); };
 
-        script = r"""
-        () => {
-          const links = new Set();
-          const keep = u => { if (!u) return; links.add(new URL(u, location.href).href); };
-
-          const _open = window.open; window.open = (u)=>{ keep(u); return null; };
-          const _assign = location.assign.bind(location); location.assign = u => { keep(u); };
-          const _replace = location.replace.bind(location); location.replace = u => { keep(u); };
-          let hrefDesc;
-          try {
-            hrefDesc = Object.getOwnPropertyDescriptor(Location.prototype, 'href');
-            if (hrefDesc?.set) {
-              Object.defineProperty(Location.prototype, 'href', {
-                configurable:true, enumerable:hrefDesc.enumerable,
-                get: hrefDesc.get, set(u){ keep(u); }
-              });
-            }
-          } catch(e){}
-          const _push = history.pushState; history.pushState = (s,t,u)=>{ keep(u); };
-          const _repl = history.replaceState; history.replaceState = (s,t,u)=>{ keep(u); };
-
-          const click = el => el.dispatchEvent(new MouseEvent('click', {bubbles:true, cancelable:true}));
-          document.querySelectorAll('.item.ng-star-inserted, .item.ng-star-inserted a, .item.ng-star-inserted img')
-            .forEach(el => { try { click(el); } catch(e){} });
-
-          // 還原
-          window.open = _open; location.assign = _assign; location.replace = _replace;
-          if (hrefDesc) Object.defineProperty(Location.prototype, 'href', hrefDesc);
-          history.pushState = _push; history.replaceState = _repl;
-
-          return Array.from(links);
+      const _open = window.open; window.open = (u)=>{ keep(u); return null; };
+      const _assign = location.assign.bind(location); location.assign = u => { keep(u); };
+      const _replace = location.replace.bind(location); location.replace = u => { keep(u); };
+      let hrefDesc;
+      try {
+        hrefDesc = Object.getOwnPropertyDescriptor(Location.prototype, 'href');
+        if (hrefDesc?.set) {
+          Object.defineProperty(Location.prototype, 'href', {
+            configurable:true, enumerable:hrefDesc.enumerable,
+            get: hrefDesc.get, set(u){ keep(u); }
+          });
         }
-        """
-        raw_links = page.evaluate(script)
-        browser.close()
-        # 只留活動詳細頁
-        return sorted({u for u in raw_links if "/ActivityInfo/Details/" in u})
+      } catch(e){}
+      const _push = history.pushState; history.pushState = (s,t,u)=>{ keep(u); };
+      const _repl = history.replaceState; history.replaceState = (s,t,u)=>{ keep(u); };
+
+      const click = el => el.dispatchEvent(new MouseEvent('click', {bubbles:true, cancelable:true}));
+      document.querySelectorAll('.item.ng-star-inserted, .item.ng-star-inserted a, .item.ng-star-inserted img')
+        .forEach(el => { try { click(el); } catch(e){} });
+
+      // 還原
+      window.open = _open; location.assign = _assign; location.replace = _replace;
+      if (hrefDesc) Object.defineProperty(Location.prototype, 'href', hrefDesc);
+      history.pushState = _push; history.replaceState = _repl;
+
+      return Array.from(links);
+    }
+    """
+    url = "https://ticket.ibon.com.tw/Index/entertainment"
+    raw_links = _run_js_with_fallback(url, script)
+    # 只留活動詳細頁
+    only_details = sorted({u for u in raw_links if isinstance(u, str) and "/ActivityInfo/Details/" in u})
+    return only_details
 
 @app.get("/ibon/carousel")
 def ibon_carousel():

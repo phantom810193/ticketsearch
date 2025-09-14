@@ -9,12 +9,9 @@ flask-cors==4.0.1
 
 # Google Cloud
 google-cloud-firestore==2.16.0
-# google-cloud-tasks==2.16.3   # 目前沒用到可先註解
-grpcio>=1.74,<1.76
+grpcio>=1.74,<2.0
 
-# 瀏覽器自動化（Selenium 優先）
+# Browser automation
 selenium==4.26.1
-# webdriver-manager 會在執行期下載，Cloud Run 不建議 → 移除
-
-# Playwright 僅在 Linux/Cloud Run 裝；Windows 本機跳過
+# Playwright 在 Linux/Cloud Run 安裝，在 Windows 本機略過
 playwright>=1.47,<1.48 ; sys_platform != "win32"
