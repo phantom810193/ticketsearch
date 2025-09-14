@@ -52,6 +52,8 @@ def _as_list(x):
 
 IBON_API = "https://ticketapi.ibon.com.tw/api/ActivityInfo/GetIndexData"
 IBON_BASE = "https://ticket.ibon.com.tw/"
+# NEW: 首頁輪播 URL 抽成環境變數（可覆寫）
+IBON_ENT_URL = os.getenv("IBON_ENT_URL", "https://ticket.ibon.com.tw/Index/entertainment")
 
 # 簡單快取（5 分鐘）
 _cache = {"ts": 0, "data": []}
@@ -125,7 +127,7 @@ def fetch_ibon_list_via_api(limit=10, keyword=None, only_concert=False):
         })
         # 先暖首頁
         try:
-            s.get("https://ticket.ibon.com.tw/Index/entertainment", timeout=10)
+            s.get(IBON_ENT_URL, timeout=10)
         except Exception:
             pass
 
@@ -222,8 +224,9 @@ def _run_js_with_fallback(url: str, js_func_literal: str):
     # 1) Selenium 先試
     if _SELENIUM_AVAILABLE:
         try:
-            chrome_path = os.environ.get("CHROME_BIN", "/usr/bin/chromium")
-            chromedriver_path = os.environ.get("CHROMEDRIVER", "/usr/bin/chromedriver")
+            chrome_path = (os.environ.get("CHROME_BIN")
+                           or ("/usr/bin/google-chrome" if os.path.exists("/usr/bin/google-chrome") else "/usr/bin/chromium"))
+            chromedriver_path = os.environ.get("CHROMEDRIVER") or "/usr/bin/chromedriver"
 
             opts = Options()
             # headless on Cloud Run
@@ -319,11 +322,30 @@ def grab_ibon_carousel_urls():
       return Array.from(links);
     }
     """
-    url = "https://ticket.ibon.com.tw/Index/entertainment"
+    url = IBON_ENT_URL
     raw_links = _run_js_with_fallback(url, script)
     # 只留活動詳細頁
     only_details = sorted({u for u in raw_links if isinstance(u, str) and "/ActivityInfo/Details/" in u})
     return only_details
+
+def _items_from_details_urls(urls: List[str], limit=10, keyword=None, only_concert=False):
+    items = []
+    s = sess_default()
+    for u in urls:
+        try:
+            info = fetch_from_ticket_details(u, s) or {}
+            title = info.get("title") or "活動"
+            if keyword and keyword not in title:
+                continue
+            if only_concert and not _looks_like_concert(title):
+                continue
+            img = info.get("poster") or None
+            items.append({"title": title, "url": u, "image": img})
+            if len(items) >= max(1, int(limit)):
+                break
+        except Exception:
+            continue
+    return items
 
 @app.get("/ibon/carousel")
 def ibon_carousel():
@@ -1503,7 +1525,7 @@ def fetch_ibon_ent_html_hard(limit=10, keyword=None, only_concert=False):
     - 標題拿不到時，用「活動」；圖片拿不到時給 None
     - 永遠回傳 list
     """
-    url = "https://ticket.ibon.com.tw/Index/entertainment"
+    url = IBON_ENT_URL
     s = requests.Session()
     s.headers.update({
         "User-Agent": UA,
@@ -1669,7 +1691,7 @@ def fetch_ibon_carousel_from_api(limit=10, keyword=None, only_concert=False):
         "Connection": "close",
     })
     try:
-        s.get("https://ticket.ibon.com.tw/Index/entertainment", timeout=12)
+        s.get(IBON_ENT_URL, timeout=12)
     except Exception:
         pass
 
@@ -1840,6 +1862,15 @@ def liff_activities():
         if not acts:
             acts = fetch_ibon_entertainments(limit=limit, keyword=kw, only_concert=only_concert)
             trace.append({"phase": "html_fallback", "count": len(acts or [])})
+        # 4) 仍為空 → 用瀏覽器引擎（Selenium→Playwright）按輪播抓連結，再還原成 items
+        if not acts:
+            try:
+                urls = grab_ibon_carousel_urls()
+                trace.append({"phase": "browser_carousel", "count": len(urls or [])})
+                if urls:
+                    acts = _items_from_details_urls(urls, limit=limit, keyword=kw, only_concert=only_concert)
+            except Exception as e:
+                app.logger.warning(f"[browser_fallback] {e}")
 
         acts = acts or []  # 防 None
 
