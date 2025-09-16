@@ -1941,5 +1941,21 @@ def liff_index():
 def liff_ping():
     return jsonify({"ok": True, "time": datetime.utcnow().isoformat()+"Z"}), 200
 
+@app.get("/netcheck")
+def netcheck():
+    urls = [
+        "https://www.google.com",
+        "https://ticket.ibon.com.tw/Index/entertainment",
+        "https://ticketapi.ibon.com.tw/api/ActivityInfo/GetIndexData",
+    ]
+    out = []
+    for u in urls:
+        try:
+            r = requests.get(u, timeout=10)
+            out.append({"url": u, "http": r.status_code, "len": len(r.text)})
+        except Exception as e:
+            out.append({"url": u, "error": repr(e)})
+    return jsonify({"results": out})
+
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=int(os.getenv("PORT", "8080")))
