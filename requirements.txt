@@ -14,4 +14,4 @@ grpcio>=1.74,<2.0
 # Browser automation
 selenium==4.26.1
 # Playwright 在 Linux/Cloud Run 安裝，在 Windows 本機略過
-playwright>=1.47,<1.48 ; sys_platform != "win32"
+playwright==1.47.0 ; sys_platform != "win32"

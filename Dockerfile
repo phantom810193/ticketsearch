@@ -15,7 +15,7 @@ ENV SSL_CERT_FILE=/etc/ssl/certs/ca-certificates.crt
 WORKDIR /app
 COPY requirements.txt ./
 RUN pip install --no-cache-dir -r requirements.txt \
-    && pip install --no-cache-dir playwright==1.47.2
+    && pip install --no-cache-dir playwright==1.47.0
 
 RUN python -m playwright install --with-deps chromium
 
