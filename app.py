@@ -55,6 +55,10 @@ IBON_TOKEN_API = "https://ticketapi.ibon.com.tw/api/ActivityInfo/GetToken"
 IBON_BASE = "https://ticket.ibon.com.tw/"
 # NEW: 首頁輪播 URL 抽成環境變數（可覆寫）
 IBON_ENT_URL = os.getenv("IBON_ENT_URL", "https://ticket.ibon.com.tw/Index/entertainment")
+IBON_BIG_BANNER_API = "https://ticketapi.ibon.com.tw/api/ADInfo/GetBigBanner"
+IBON_AD_IMAGE_BASE = os.getenv("IBON_AD_IMAGE_BASE", "https://ticketimg2.azureedge.net/image/ADImage/")
+if not IBON_AD_IMAGE_BASE.endswith("/"):
+    IBON_AD_IMAGE_BASE = IBON_AD_IMAGE_BASE + "/"
 
 
 def _parse_ibon_index_patterns(raw: Optional[str]) -> List[str]:
@@ -177,16 +181,17 @@ def _normalize_item(row):
     """
     # title
     title = (row.get("Title") or row.get("ActivityTitle") or row.get("GameName")
-             or row.get("ActivityName") or row.get("Name") or row.get("Subject") or "活動")
+             or row.get("ActivityName") or row.get("Name") or row.get("Subject")
+             or row.get("ADTitle") or row.get("ADName") or "活動")
 
     # image
     img = (row.get("ImgUrl") or row.get("ImageUrl") or row.get("Image")
-           or row.get("ActivityImage")
+           or row.get("ActivityImage") or row.get("ADImageURL")
            or row.get("PicUrl") or row.get("PictureUrl") or "").strip() or None
 
     # url / id
     url = (row.get("Url") or row.get("URL") or row.get("LinkUrl")
-           or row.get("LinkURL") or row.get("Link")
+           or row.get("LinkURL") or row.get("Link") or row.get("ADURL")
            or row.get("GameTicketURL") or row.get("GameTicketUrl")
            or "").strip()
 
@@ -224,7 +229,12 @@ def _normalize_item(row):
 
     # 有些圖片給相對路徑
     if img and not img.lower().startswith("http"):
-        img = urljoin(IBON_BASE, img)
+        if img.startswith("//"):
+            img = "https:" + img
+        elif row.get("ADLocation") or "ADImage" in img:
+            img = urljoin(IBON_AD_IMAGE_BASE, img)
+        else:
+            img = urljoin(IBON_BASE, img)
 
     return {"title": str(title).strip(), "url": url, "image": img}
 
@@ -246,6 +256,54 @@ def _iter_activity_dicts(obj: Any):
                 return
             else:
                 yield from _iter_activity_dicts(parsed)
+
+
+def _fetch_big_banner_documents(session: requests.Session, token: Optional[str], patterns: List[str]) -> Tuple[List[Dict[str, Any]], bool, bool]:
+    docs: List[Dict[str, Any]] = []
+    unauthorized = False
+    server_error = False
+
+    headers = {
+        "Origin": "https://ticket.ibon.com.tw",
+        "Referer": IBON_ENT_URL,
+        "X-Requested-With": "XMLHttpRequest",
+    }
+    if token:
+        headers["X-XSRF-TOKEN"] = token
+
+    for pattern in patterns or ["Entertainment"]:
+        pat = "" if pattern is None else str(pattern)
+        files = {"patternCode": (None, pat)}
+        try:
+            resp = session.post(
+                IBON_BIG_BANNER_API,
+                headers=headers,
+                files=files,
+                timeout=10,
+            )
+        except Exception as e:
+            app.logger.info(f"[ibon big banner] pattern={pat or 'Entertainment'} err: {e}")
+            continue
+
+        if resp.status_code == 200:
+            try:
+                docs.append(resp.json())
+            except Exception as e:
+                app.logger.info(f"[ibon big banner] pattern={pat or 'Entertainment'} json err: {e}")
+            continue
+
+        if resp.status_code in (401, 403, 419):
+            unauthorized = True
+            app.logger.info(f"[ibon big banner] pattern={pat or 'Entertainment'} auth http={resp.status_code}")
+            break
+
+        if 500 <= resp.status_code < 600:
+            server_error = True
+            app.logger.warning(f"[ibon big banner] pattern={pat or 'Entertainment'} http={resp.status_code}")
+        else:
+            app.logger.info(f"[ibon big banner] pattern={pat or 'Entertainment'} http={resp.status_code}")
+
+    return docs, unauthorized, server_error
 
 
 def _fetch_index_documents(session: requests.Session, token: Optional[str], patterns: List[str]) -> Tuple[List[Dict[str, Any]], bool, bool]:
@@ -1927,6 +1985,69 @@ def fetch_ibon_carousel_from_api(limit=10, keyword=None, only_concert=False):
     session: Optional[requests.Session] = None
     token: Optional[str] = None
     patterns = list(_IBON_INDEX_PATTERNS) or ["Entertainment"]
+
+    items: List[Dict[str, Any]] = []
+    seen: set[str] = set()
+    target = max(1, int(limit))
+
+    def _append_from_docs(docs: List[Any]) -> bool:
+        appended = False
+        for doc in docs or []:
+            if isinstance(doc, dict):
+                payload: Any = doc.get("Item") or doc.get("Data") or doc.get("data") or doc
+            else:
+                payload = doc
+            for cand in _iter_activity_dicts(payload):
+                if not isinstance(cand, dict):
+                    continue
+                try:
+                    it = _normalize_item(cand)
+                except Exception:
+                    continue
+                url = it.get("url")
+                if not url:
+                    continue
+                title = it.get("title") or ""
+                if keyword and keyword not in title:
+                    continue
+                if only_concert and not _looks_like_concert(title):
+                    continue
+                if url in seen:
+                    continue
+                seen.add(url)
+                items.append(it)
+                appended = True
+                if len(items) >= target:
+                    return True
+        return appended
+
+    # 1) 首先嘗試首頁大圖輪播（ADInfo/GetBigBanner）
+    banner_docs: List[Any] = []
+    for attempt in range(3):
+        if session is None:
+            session, token = _prepare_ibon_session()
+
+        docs, unauthorized, server_error = _fetch_big_banner_documents(session, token, patterns)
+
+        if docs:
+            banner_docs = docs
+            _append_from_docs(banner_docs)
+            break
+
+        if unauthorized:
+            session, token = _prepare_ibon_session()
+            continue
+
+        if server_error:
+            app.logger.warning("[carousel-api] big banner 5xx -> fallback to other sources")
+            break
+
+        _sleep_backoff(attempt)
+
+    if len(items) >= target:
+        return items[:target]
+
+    # 2) 若輪播不足，再拉一般 Index Data 兜底
     payloads: List[Any] = []
 
     for attempt in range(3):
@@ -1946,31 +2067,31 @@ def fetch_ibon_carousel_from_api(limit=10, keyword=None, only_concert=False):
         if server_error:
             app.logger.warning("[carousel-api] index data 5xx -> open breaker")
             _API_BREAK_UNTIL = time.time() + 1800
-            return []
+            return items[:target] if items else []
 
         _sleep_backoff(attempt)
 
     if not payloads:
-        return []
-
-    items, seen = [], set()
+        return items[:target] if items else []
 
     def _append_from_list(arr):
         nonlocal items, seen
         for r in arr or []:
             try:
                 it = _normalize_item(r if isinstance(r, dict) else {})
-                if not it.get("url"):
+                url = it.get("url")
+                if not url:
                     continue
-                if keyword and keyword not in it["title"]:
+                title = it.get("title") or ""
+                if keyword and keyword not in title:
                     continue
-                if only_concert and not _looks_like_concert(it["title"]):
+                if only_concert and not _looks_like_concert(title):
                     continue
-                if it["url"] in seen:
+                if url in seen:
                     continue
-                seen.add(it["url"])
+                seen.add(url)
                 items.append(it)
-                if len(items) >= max(1, int(limit)):
+                if len(items) >= target:
                     return True
             except Exception:
                 continue
@@ -2002,17 +2123,17 @@ def fetch_ibon_carousel_from_api(limit=10, keyword=None, only_concert=False):
             base_obj = doc
         for path, arr in _iter_lists(base_obj):
             if isinstance(arr, list) and arr:
-                (car_lists if any(k in path.lower() for k in ("banner","carousel","ad","focus","slider","swiper"))
+                (car_lists if any(k in path.lower() for k in ("banner", "carousel", "ad", "focus", "slider", "swiper"))
                  else other_lists).append((path, arr))
     for _, arr in car_lists:
         if _append_from_list(arr):
             break
-    if len(items) < limit:
+    if len(items) < target:
         for _, arr in other_lists:
             if _append_from_list(arr):
                 break
 
-    return items[:limit] if items else []
+    return items[:target] if items else []
 
 def _extract_carousel_html_hard(html: str, limit=10, keyword=None, only_concert=False):
     """
