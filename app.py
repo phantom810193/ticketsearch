@@ -10,7 +10,7 @@ import traceback
 import requests
 from datetime import datetime, timezone, timedelta
 from typing import Dict, Tuple, Optional, Any, List
-from urllib.parse import urlparse, urlunparse, parse_qs, urlencode, urljoin
+from urllib.parse import urlparse, urlunparse, parse_qs, urlencode, urljoin, unquote
 from flask import send_from_directory
 from flask import jsonify, Flask, request, abort
 # --- Browser engines (optional) ---
@@ -51,6 +51,7 @@ def _as_list(x):
     return x if isinstance(x, list) else []
 
 IBON_API = "https://ticketapi.ibon.com.tw/api/ActivityInfo/GetIndexData"
+IBON_TOKEN_API = "https://ticketapi.ibon.com.tw/api/ActivityInfo/GetToken"
 IBON_BASE = "https://ticket.ibon.com.tw/"
 # NEW: 首頁輪播 URL 抽成環境變數（可覆寫）
 IBON_ENT_URL = os.getenv("IBON_ENT_URL", "https://ticket.ibon.com.tw/Index/entertainment")
@@ -64,6 +65,98 @@ _CONCERT_WORDS = ("演唱會", "演場會", "音樂會", "演唱", "演出", "LI
 def _looks_like_concert(title: str) -> bool:
     t = title or ""
     return any(w.lower() in t.lower() for w in _CONCERT_WORDS)
+
+
+def _extract_xsrf_token(payload: Any) -> Optional[str]:
+    """從 ibon 的 GetToken 結構中提取 XSRF token。"""
+
+    def _collect_tokens(src: Any) -> List[str]:
+        out: List[str] = []
+        if isinstance(src, dict):
+            for key in ("token", "Token", "xsrfToken", "XSRFToken", "XsrfToken", "Xsrf", "XSRF"):
+                val = src.get(key)
+                if isinstance(val, str) and val.strip():
+                    out.append(val.strip())
+            # Item 內有 Message / Token
+            item = src.get("Item") or src.get("item")
+            if isinstance(item, dict):
+                out.extend(_collect_tokens(item))
+            # 其它巢狀結構
+            for v in src.values():
+                if isinstance(v, dict):
+                    out.extend(_collect_tokens(v))
+        elif isinstance(src, list):
+            for v in src:
+                out.extend(_collect_tokens(v))
+        elif isinstance(src, str) and src.strip():
+            out.append(src.strip())
+        return out
+
+    candidates = _collect_tokens(payload)
+    for cand in candidates:
+        token = cand
+        if "|" in token:
+            parts = [p.strip() for p in token.split("|") if p.strip()]
+            if parts:
+                token = parts[-1]
+        token = unquote(token)
+        if token:
+            return token
+    return None
+
+
+def _prepare_ibon_session() -> Tuple[requests.Session, Optional[str]]:
+    """建立與 ibon API 溝通所需的 session 與 XSRF token。"""
+
+    s = requests.Session()
+    s.headers.update({
+        "User-Agent": UA,
+        "Accept-Language": "zh-TW,zh;q=0.9,en;q=0.6",
+        "Accept": "application/json, text/plain, */*",
+        "Connection": "close",
+    })
+
+    try:
+        s.get(IBON_ENT_URL, timeout=10)
+    except Exception as e:
+        app.logger.info(f"[ibon token] warm-up failed: {e}")
+
+    token: Optional[str] = None
+    try:
+        token_resp = s.post(
+            IBON_TOKEN_API,
+            headers={
+                "Origin": "https://ticket.ibon.com.tw",
+                "Referer": IBON_ENT_URL,
+                "X-Requested-With": "XMLHttpRequest",
+            },
+            timeout=10,
+        )
+        if token_resp.status_code == 200:
+            data: Any
+            try:
+                data = token_resp.json()
+            except Exception:
+                data = token_resp.text
+            token = _extract_xsrf_token(data)
+        else:
+            app.logger.info(f"[ibon token] http={token_resp.status_code}")
+    except Exception as e:
+        app.logger.warning(f"[ibon token] err: {e}")
+
+    if not token:
+        token = s.cookies.get("XSRF-TOKEN")
+        if token:
+            token = unquote(token)
+
+    if token:
+        domain = urlparse(IBON_BASE).netloc or urlparse(IBON_ENT_URL).netloc
+        try:
+            s.cookies.set("XSRF-TOKEN", token, domain=domain, path="/")
+        except Exception:
+            s.cookies.set("XSRF-TOKEN", token)
+
+    return s, token
 
 # -------- HTML 解析 --------
 from bs4 import BeautifulSoup
@@ -118,30 +211,29 @@ def fetch_ibon_list_via_api(limit=10, keyword=None, only_concert=False):
         if _breaker_open_now():
             return []  # 斷路器期間直接跳過 API
 
-        s = requests.Session()
-        s.headers.update({
-            "User-Agent": UA,
-            "Accept-Language": "zh-TW,zh;q=0.9,en;q=0.6",
-            "Accept": "application/json, text/plain, */*",
-            "Connection": "close",
-        })
-        # 先暖首頁
-        try:
-            s.get(IBON_ENT_URL, timeout=10)
-        except Exception:
-            pass
-
+        session: Optional[requests.Session] = None
+        token: Optional[str] = None
         base_rows = []
         for attempt in range(3):
+            if session is None:
+                session, token = _prepare_ibon_session()
+
             try:
-                r = s.post(
+                headers = {
+                    "Origin": "https://ticket.ibon.com.tw",
+                    "Referer": IBON_ENT_URL,
+                    "X-Requested-With": "XMLHttpRequest",
+                }
+                if token:
+                    headers["X-XSRF-TOKEN"] = token
+
+                files = {"pattern": (None, "")}
+
+                r = session.post(
                     IBON_API,
-                    headers={
-                        "Origin": "https://ticket.ibon.com.tw",
-                        "Referer": "https://ticket.ibon.com.tw/Index/entertainment",
-                        "Content-Type": "application/json;charset=UTF-8",
-                    },
-                    json={}, timeout=10
+                    headers=headers,
+                    files=files,
+                    timeout=10,
                 )
                 if r.status_code == 200:
                     data = r.json()
@@ -168,6 +260,11 @@ def fetch_ibon_list_via_api(limit=10, keyword=None, only_concert=False):
                         except Exception:
                             continue
                     break  # 成功就離開重試迴圈
+
+                if r.status_code in (401, 403, 419):
+                    app.logger.info(f"[ibon api] auth http={r.status_code}, refresh token")
+                    session, token = _prepare_ibon_session()
+                    continue
 
                 if 500 <= r.status_code < 600:
                     app.logger.warning(f"[ibon api] http={r.status_code} -> open breaker")
@@ -293,11 +390,24 @@ def grab_ibon_carousel_urls():
     () => {
       try {
         const url = "https://ticketapi.ibon.com.tw/api/ActivityInfo/GetIndexData";
+        const token = (() => {
+          const raw = document.cookie.split(";").map(v => v.trim()).find(v => v.startsWith("XSRF-TOKEN="));
+          if (!raw) return null;
+          try {
+            return decodeURIComponent(raw.split("=")[1] || "");
+          } catch (e) {
+            return (raw.split("=")[1] || "");
+          }
+        })();
+
+        const form = new FormData();
+        form.append("pattern", "");
+
         const xhr = new XMLHttpRequest();
         xhr.open("POST", url, false);                 // 同步 XHR（Selenium/Playwright 都吃）
-        xhr.setRequestHeader("Content-Type", "application/json;charset=UTF-8");
         xhr.setRequestHeader("X-Requested-With", "XMLHttpRequest");
-        xhr.send("{}");
+        if (token) xhr.setRequestHeader("X-XSRF-TOKEN", token);
+        xhr.send(form);
         if (xhr.status < 200 || xhr.status >= 300) return [];
 
         let data; try { data = JSON.parse(xhr.responseText); } catch (e) { return []; }
