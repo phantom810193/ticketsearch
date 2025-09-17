@@ -10,7 +10,7 @@ import traceback
 import requests
 from datetime import datetime, timezone, timedelta
 from typing import Dict, Tuple, Optional, Any, List
-from urllib.parse import urlparse, urlunparse, parse_qs, urlencode, urljoin
+from urllib.parse import urlparse, urlunparse, parse_qs, urlencode, urljoin, unquote
 from flask import send_from_directory
 from flask import jsonify, Flask, request, abort
 # --- Browser engines (optional) ---
@@ -51,9 +51,26 @@ def _as_list(x):
     return x if isinstance(x, list) else []
 
 IBON_API = "https://ticketapi.ibon.com.tw/api/ActivityInfo/GetIndexData"
+IBON_TOKEN_API = "https://ticketapi.ibon.com.tw/api/ActivityInfo/GetToken"
 IBON_BASE = "https://ticket.ibon.com.tw/"
 # NEW: 首頁輪播 URL 抽成環境變數（可覆寫）
 IBON_ENT_URL = os.getenv("IBON_ENT_URL", "https://ticket.ibon.com.tw/Index/entertainment")
+
+
+def _parse_ibon_index_patterns(raw: Optional[str]) -> List[str]:
+    if raw is None:
+        return ["Entertainment"]
+    patterns: List[str] = []
+    for part in raw.split(","):
+        p = part.strip()
+        if not p:
+            continue
+        if p not in patterns:
+            patterns.append(p)
+    return patterns or ["Entertainment"]
+
+
+_IBON_INDEX_PATTERNS = tuple(_parse_ibon_index_patterns(os.getenv("IBON_INDEX_PATTERNS")))
 
 # 簡單快取（5 分鐘）
 _cache = {"ts": 0, "data": []}
@@ -65,6 +82,91 @@ def _looks_like_concert(title: str) -> bool:
     t = title or ""
     return any(w.lower() in t.lower() for w in _CONCERT_WORDS)
 
+
+def _extract_xsrf_token(payload: Any) -> Optional[str]:
+    """從 ibon 的 GetToken 結構中提取 XSRF token。"""
+
+    def _collect_tokens(src: Any) -> List[str]:
+        out: List[str] = []
+        if isinstance(src, dict):
+            for val in src.values():
+                if isinstance(val, str) and val.strip():
+                    out.append(val.strip())
+                elif isinstance(val, (dict, list)):
+                    out.extend(_collect_tokens(val))
+        elif isinstance(src, list):
+            for v in src:
+                out.extend(_collect_tokens(v))
+        elif isinstance(src, str) and src.strip():
+            out.append(src.strip())
+        return out
+
+    candidates = _collect_tokens(payload)
+    for cand in candidates:
+        token = cand
+        if "|" in token:
+            parts = [p.strip() for p in token.split("|") if p.strip()]
+            if parts:
+                token = parts[-1]
+        token = unquote(token)
+        if token:
+            return token
+    return None
+
+
+def _prepare_ibon_session() -> Tuple[requests.Session, Optional[str]]:
+    """建立與 ibon API 溝通所需的 session 與 XSRF token。"""
+
+    s = requests.Session()
+    s.headers.update({
+        "User-Agent": UA,
+        "Accept-Language": "zh-TW,zh;q=0.9,en;q=0.6",
+        "Accept": "application/json, text/plain, */*",
+        "Connection": "close",
+    })
+
+    try:
+        s.get(IBON_ENT_URL, timeout=10)
+    except Exception as e:
+        app.logger.info(f"[ibon token] warm-up failed: {e}")
+
+    token: Optional[str] = None
+    try:
+        token_resp = s.post(
+            IBON_TOKEN_API,
+            headers={
+                "Origin": "https://ticket.ibon.com.tw",
+                "Referer": IBON_ENT_URL,
+                "X-Requested-With": "XMLHttpRequest",
+            },
+            timeout=10,
+        )
+        if token_resp.status_code == 200:
+            data: Any
+            try:
+                data = token_resp.json()
+            except Exception:
+                data = token_resp.text
+            token = _extract_xsrf_token(data)
+        else:
+            app.logger.info(f"[ibon token] http={token_resp.status_code}")
+    except Exception as e:
+        app.logger.warning(f"[ibon token] err: {e}")
+
+    if not token:
+        token = s.cookies.get("XSRF-TOKEN")
+        if token:
+            token = unquote(token)
+
+    if token:
+        domain = urlparse(IBON_BASE).netloc or urlparse(IBON_ENT_URL).netloc
+        try:
+            s.cookies.set("XSRF-TOKEN", token, domain=domain, path="/")
+        except Exception:
+            s.cookies.set("XSRF-TOKEN", token)
+
+    return s, token
+
 # -------- HTML 解析 --------
 from bs4 import BeautifulSoup
 
@@ -75,15 +177,18 @@ def _normalize_item(row):
     """
     # title
     title = (row.get("Title") or row.get("ActivityTitle") or row.get("GameName")
-             or row.get("Name") or row.get("Subject") or "活動")
+             or row.get("ActivityName") or row.get("Name") or row.get("Subject") or "活動")
 
     # image
     img = (row.get("ImgUrl") or row.get("ImageUrl") or row.get("Image")
+           or row.get("ActivityImage")
            or row.get("PicUrl") or row.get("PictureUrl") or "").strip() or None
 
     # url / id
     url = (row.get("Url") or row.get("URL") or row.get("LinkUrl")
-           or row.get("LinkURL") or row.get("Link") or "").strip()
+           or row.get("LinkURL") or row.get("Link")
+           or row.get("GameTicketURL") or row.get("GameTicketUrl")
+           or "").strip()
 
     if not url:
         act_id = (row.get("ActivityInfoId") or row.get("ActivityInfoID")
@@ -92,6 +197,26 @@ def _normalize_item(row):
                   or row.get("Id") or row.get("ID"))
         if act_id:
             url = urljoin(IBON_BASE, f"/ActivityInfo/Details/{act_id}")
+
+    if url and "/ActivityInfo/Details" in url:
+        try:
+            parsed = urlparse(url)
+            act_id = None
+            if parsed.path:
+                m = re.search(r"/ActivityInfo/Details/(\d+)", parsed.path)
+                if m:
+                    act_id = m.group(1)
+            if not act_id:
+                qs = parse_qs(parsed.query or "")
+                for key in ("id", "activityid", "activityId", "activityInfoId", "gameId", "gameID"):
+                    vals = qs.get(key)
+                    if vals:
+                        act_id = vals[-1]
+                        break
+            if act_id:
+                url = urljoin(IBON_BASE, f"/ActivityInfo/Details/{act_id}")
+        except Exception:
+            pass
 
     # 統一為絕對網址
     if url and not url.lower().startswith("http"):
@@ -102,6 +227,74 @@ def _normalize_item(row):
         img = urljoin(IBON_BASE, img)
 
     return {"title": str(title).strip(), "url": url, "image": img}
+
+
+def _iter_activity_dicts(obj: Any):
+    if isinstance(obj, dict):
+        yield obj
+        for v in obj.values():
+            yield from _iter_activity_dicts(v)
+    elif isinstance(obj, list):
+        for v in obj:
+            yield from _iter_activity_dicts(v)
+    elif isinstance(obj, str):
+        text = obj.strip()
+        if text.startswith("{") or text.startswith("["):
+            try:
+                parsed = json.loads(text)
+            except Exception:
+                return
+            else:
+                yield from _iter_activity_dicts(parsed)
+
+
+def _fetch_index_documents(session: requests.Session, token: Optional[str], patterns: List[str]) -> Tuple[List[Dict[str, Any]], bool, bool]:
+    docs: List[Dict[str, Any]] = []
+    unauthorized = False
+    server_error = False
+
+    headers = {
+        "Origin": "https://ticket.ibon.com.tw",
+        "Referer": IBON_ENT_URL,
+        "X-Requested-With": "XMLHttpRequest",
+    }
+    if token:
+        headers["X-XSRF-TOKEN"] = token
+
+    for pattern in patterns or ["Entertainment"]:
+        pat = "" if pattern is None else str(pattern)
+        files = {"pattern": (None, pat)}
+        try:
+            resp = session.post(
+                IBON_API,
+                headers=headers,
+                files=files,
+                timeout=10,
+            )
+        except Exception as e:
+            app.logger.info(f"[ibon api] pattern={pat or 'Entertainment'} err: {e}")
+            continue
+
+        if resp.status_code == 200:
+            try:
+                docs.append(resp.json())
+            except Exception as e:
+                app.logger.info(f"[ibon api] pattern={pat or 'Entertainment'} json err: {e}")
+            continue
+
+        if resp.status_code in (401, 403, 419):
+            unauthorized = True
+            app.logger.info(f"[ibon api] pattern={pat or 'Entertainment'} auth http={resp.status_code}")
+            break
+
+        if 500 <= resp.status_code < 600:
+            server_error = True
+            app.logger.warning(f"[ibon api] pattern={pat or 'Entertainment'} http={resp.status_code}")
+        else:
+            app.logger.info(f"[ibon api] pattern={pat or 'Entertainment'} http={resp.status_code}")
+
+    return docs, unauthorized, server_error
+
 
 # --------- 直接打 API 拉清單 ---------
 def fetch_ibon_list_via_api(limit=10, keyword=None, only_concert=False):
@@ -118,65 +311,59 @@ def fetch_ibon_list_via_api(limit=10, keyword=None, only_concert=False):
         if _breaker_open_now():
             return []  # 斷路器期間直接跳過 API
 
-        s = requests.Session()
-        s.headers.update({
-            "User-Agent": UA,
-            "Accept-Language": "zh-TW,zh;q=0.9,en;q=0.6",
-            "Accept": "application/json, text/plain, */*",
-            "Connection": "close",
-        })
-        # 先暖首頁
-        try:
-            s.get(IBON_ENT_URL, timeout=10)
-        except Exception:
-            pass
+        session: Optional[requests.Session] = None
+        token: Optional[str] = None
+        patterns = list(_IBON_INDEX_PATTERNS) or ["Entertainment"]
+        base_rows: List[Dict[str, Any]] = []
 
-        base_rows = []
         for attempt in range(3):
-            try:
-                r = s.post(
-                    IBON_API,
-                    headers={
-                        "Origin": "https://ticket.ibon.com.tw",
-                        "Referer": "https://ticket.ibon.com.tw/Index/entertainment",
-                        "Content-Type": "application/json;charset=UTF-8",
-                    },
-                    json={}, timeout=10
-                )
-                if r.status_code == 200:
-                    data = r.json()
-                    blobs = []
-                    root = data.get("Data") or data.get("data") or data
-                    if isinstance(root, dict):
-                        for v in root.values():
-                            if isinstance(v, list):
-                                blobs.extend(v)
-                            elif isinstance(v, dict) and isinstance(v.get("ActivityList"), list):
-                                blobs.extend(v["ActivityList"])
-                    elif isinstance(root, list):
-                        blobs = root
-                    if not blobs and isinstance(data, dict):
-                        for v in data.values():
-                            if isinstance(v, list):
-                                blobs.extend(v)
+            if session is None:
+                session, token = _prepare_ibon_session()
 
-                    for r0 in blobs or []:
+            docs, unauthorized, server_error = _fetch_index_documents(session, token, patterns)
+
+            if docs:
+                merged: Dict[str, Dict[str, Any]] = {}
+                order: List[str] = []
+                for doc in docs:
+                    payload: Any
+                    if isinstance(doc, dict):
+                        payload = doc.get("Item") or doc.get("Data") or doc.get("data") or doc
+                    else:
+                        payload = doc
+                    for cand in _iter_activity_dicts(payload):
+                        if not isinstance(cand, dict):
+                            continue
                         try:
-                            item = _normalize_item(r0 if isinstance(r0, dict) else {})
-                            if item.get("url"):
-                                base_rows.append(item)
+                            item = _normalize_item(cand)
                         except Exception:
                             continue
-                    break  # 成功就離開重試迴圈
+                        url = item.get("url")
+                        if not url:
+                            continue
+                        existing = merged.get(url)
+                        if not existing:
+                            merged[url] = item
+                            order.append(url)
+                        else:
+                            title = item.get("title")
+                            if title and title.strip() and existing.get("title") in (None, "", "活動") and title != "活動":
+                                existing["title"] = title
+                            img = item.get("image")
+                            if img and not existing.get("image"):
+                                existing["image"] = img
+                base_rows = [merged[k] for k in order]
+                break
 
-                if 500 <= r.status_code < 600:
-                    app.logger.warning(f"[ibon api] http={r.status_code} -> open breaker")
-                    _open_breaker()
-                    base_rows = []
-                    break
-                app.logger.info(f"[ibon api] http={r.status_code}")
-            except Exception as e:
-                app.logger.info(f"[ibon api] err: {e}")
+            if unauthorized:
+                session, token = _prepare_ibon_session()
+                continue
+
+            if server_error:
+                _open_breaker()
+                base_rows = []
+                break
+
             _sleep_backoff(attempt)
 
         _cache = {"ts": now, "data": base_rows}
@@ -289,19 +476,22 @@ def _run_js_with_fallback(url: str, js_func_literal: str):
 
 def grab_ibon_carousel_urls():
     # 直接在 ibon 首頁的瀏覽器環境做同步 XHR 抓 JSON，比點擊穩很多
+    patterns_js = json.dumps(list(_IBON_INDEX_PATTERNS) or ["Entertainment"])
     script = r"""
     () => {
       try {
         const url = "https://ticketapi.ibon.com.tw/api/ActivityInfo/GetIndexData";
-        const xhr = new XMLHttpRequest();
-        xhr.open("POST", url, false);                 // 同步 XHR（Selenium/Playwright 都吃）
-        xhr.setRequestHeader("Content-Type", "application/json;charset=UTF-8");
-        xhr.setRequestHeader("X-Requested-With", "XMLHttpRequest");
-        xhr.send("{}");
-        if (xhr.status < 200 || xhr.status >= 300) return [];
+        const token = (() => {
+          const raw = document.cookie.split(";").map(v => v.trim()).find(v => v.startsWith("XSRF-TOKEN="));
+          if (!raw) return null;
+          try {
+            return decodeURIComponent(raw.split("=")[1] || "");
+          } catch (e) {
+            return (raw.split("=")[1] || "");
+          }
+        })();
 
-        let data; try { data = JSON.parse(xhr.responseText); } catch (e) { return []; }
-
+        const patterns = __PATTERNS__;
         // 走訪 JSON，把可能的 Details 連結/ID 全撿出來
         const out = new Set();
         const base = "https://ticket.ibon.com.tw";
@@ -324,16 +514,44 @@ def grab_ibon_carousel_urls():
           Object.values(obj).forEach(v => {
             if (Array.isArray(v)) v.forEach(norm);
             else if (v && typeof v === "object") norm(v);
+            else if (typeof v === "string") {
+              const text = v.trim();
+              if (text.startsWith("[") || text.startsWith("{")) {
+                try {
+                  const parsed = JSON.parse(text);
+                  if (Array.isArray(parsed)) parsed.forEach(norm);
+                  else if (parsed && typeof parsed === "object") norm(parsed);
+                } catch (err) {}
+              }
+            }
           });
         };
 
-        norm(data);
+        const targets = (Array.isArray(patterns) && patterns.length ? patterns : ["Entertainment"]);
+        for (const pattern of targets) {
+          try {
+            const form = new FormData();
+            form.append("pattern", pattern);
+
+            const xhr = new XMLHttpRequest();
+            xhr.open("POST", url, false);                 // 同步 XHR（Selenium/Playwright 都吃）
+            xhr.setRequestHeader("X-Requested-With", "XMLHttpRequest");
+            if (token) xhr.setRequestHeader("X-XSRF-TOKEN", token);
+            xhr.send(form);
+            if (xhr.status < 200 || xhr.status >= 300) continue;
+
+            let data; try { data = JSON.parse(xhr.responseText); } catch (e) { continue; }
+            norm(data);
+          } catch (inner) {
+            // ignore single-pattern errors
+          }
+        }
         return Array.from(out);
       } catch (e) {
         return [];
       }
     }
-    """
+    """.replace("__PATTERNS__", patterns_js)
     url = IBON_ENT_URL
     raw_links = _run_js_with_fallback(url, script) or []
 
@@ -1706,37 +1924,33 @@ def fetch_ibon_carousel_from_api(limit=10, keyword=None, only_concert=False):
         app.logger.info("[carousel-api] breaker open -> skip API, go HTML")
         return []
 
-    url = IBON_API
-    s = requests.Session()
-    s.headers.update({
-        "User-Agent": UA,
-        "Accept-Language": "zh-TW,zh;q=0.9,en;q=0.6",
-        "Accept": "application/json, text/plain, */*",
-        "Connection": "close",
-    })
-    try:
-        s.get(IBON_ENT_URL, timeout=12)
-    except Exception:
-        pass
+    session: Optional[requests.Session] = None
+    token: Optional[str] = None
+    patterns = list(_IBON_INDEX_PATTERNS) or ["Entertainment"]
+    payloads: List[Any] = []
 
-    headers = {
-        "Origin": "https://ticket.ibon.com.tw",
-        "Referer": "https://ticket.ibon.com.tw/Index/entertainment",
-        "Content-Type": "application/json;charset=UTF-8",
-    }
+    for attempt in range(3):
+        if session is None:
+            session, token = _prepare_ibon_session()
 
-    data = None
-    try:
-        r = s.post(url, json={}, headers=headers, timeout=12)
-        if r.status_code == 200:
-            data = r.json()
-        else:
-            app.logger.warning(f"[carousel-api] POST http={r.status_code} -> open breaker")
-            _API_BREAK_UNTIL = time.time() + 1800  # 30 分鐘
+        docs, unauthorized, server_error = _fetch_index_documents(session, token, patterns)
+
+        if docs:
+            payloads = docs
+            break
+
+        if unauthorized:
+            session, token = _prepare_ibon_session()
+            continue
+
+        if server_error:
+            app.logger.warning("[carousel-api] index data 5xx -> open breaker")
+            _API_BREAK_UNTIL = time.time() + 1800
             return []
-    except Exception as e:
-        app.logger.warning(f"[carousel-api] POST {e} -> open breaker")
-        _API_BREAK_UNTIL = time.time() + 1800
+
+        _sleep_backoff(attempt)
+
+    if not payloads:
         return []
 
     items, seen = [], set()
@@ -1769,12 +1983,27 @@ def fetch_ibon_carousel_from_api(limit=10, keyword=None, only_concert=False):
             for k, v in obj.items():
                 p = f"{path}.{k}" if path else str(k)
                 yield from _iter_lists(v, p)
+        elif isinstance(obj, str):
+            text = obj.strip()
+            if text.startswith("[") or text.startswith("{"):
+                try:
+                    parsed = json.loads(text)
+                except Exception:
+                    return
+                else:
+                    yield from _iter_lists(parsed, path)
 
     car_lists, other_lists = [], []
-    for path, arr in _iter_lists(data):
-        if isinstance(arr, list) and arr:
-            (car_lists if any(k in path.lower() for k in ("banner","carousel","ad","focus","slider","swiper"))
-             else other_lists).append((path, arr))
+    for doc in payloads:
+        base_obj: Any
+        if isinstance(doc, dict):
+            base_obj = doc.get("Item") or doc.get("Data") or doc.get("data") or doc
+        else:
+            base_obj = doc
+        for path, arr in _iter_lists(base_obj):
+            if isinstance(arr, list) and arr:
+                (car_lists if any(k in path.lower() for k in ("banner","carousel","ad","focus","slider","swiper"))
+                 else other_lists).append((path, arr))
     for _, arr in car_lists:
         if _append_from_list(arr):
             break
