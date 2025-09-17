@@ -52,6 +52,7 @@ def _as_list(x):
 
 IBON_API = "https://ticketapi.ibon.com.tw/api/ActivityInfo/GetIndexData"
 IBON_TOKEN_API = "https://ticketapi.ibon.com.tw/api/ActivityInfo/GetToken"
+IBON_DETAIL_API = "https://ticketapi.ibon.com.tw/api/ActivityInfo/GetDetailData"
 IBON_BASE = "https://ticket.ibon.com.tw/"
 # NEW: 首頁輪播 URL 抽成環境變數（可覆寫）
 IBON_ENT_URL = os.getenv("IBON_ENT_URL", "https://ticket.ibon.com.tw/Index/entertainment")
@@ -79,6 +80,9 @@ _IBON_INDEX_PATTERNS = tuple(_parse_ibon_index_patterns(os.getenv("IBON_INDEX_PA
 # 簡單快取（5 分鐘）
 _cache = {"ts": 0, "data": []}
 _CACHE_TTL = 300  # 秒
+
+_DETAIL_TO_UTK_CACHE: Dict[str, Tuple[str, float]] = {}
+_DETAIL_CACHE_TTL = 900  # 秒
 
 _CONCERT_WORDS = ("演唱會", "演場會", "音樂會", "演唱", "演出", "LIVE", "Live")
 
@@ -674,7 +678,7 @@ LINE_CHANNEL_ACCESS_TOKEN = os.getenv("LINE_CHANNEL_ACCESS_TOKEN", "")
 LINE_CHANNEL_SECRET = os.getenv("LINE_CHANNEL_SECRET", "")
 DEFAULT_PERIOD_SEC = int(os.getenv("DEFAULT_PERIOD_SEC", "60"))
 ALWAYS_NOTIFY = os.getenv("ALWAYS_NOTIFY", "0") == "1"
-FOLLOW_AREAS_PER_CHECK = int(os.getenv("FOLLOW_AREAS_PER_CHECK", "0"))
+FOLLOW_AREAS_PER_CHECK = int(os.getenv("FOLLOW_AREAS_PER_CHECK", "6"))
 
 # 可選：手動覆蓋宣傳圖或 Details 連結（通常不需要）
 PROMO_IMAGE_MAP: Dict[str, str] = {}
@@ -732,6 +736,138 @@ def hash_state(sections: Dict[str, int], selling: List[str]) -> str:
     raw = json.dumps({"num": items, "hot": hot}, ensure_ascii=False, separators=(",", ":"))
     return hashlib.md5(raw.encode("utf-8")).hexdigest()
 
+def _resolve_activity_detail_to_utk(activity_id: str, depth: int = 0) -> Optional[str]:
+    now = time.time()
+    cached = _DETAIL_TO_UTK_CACHE.get(activity_id)
+    if cached and cached[1] > now:
+        return cached[0]
+
+    session, token = _prepare_ibon_session()
+    referer = urljoin(IBON_BASE, f"ActivityInfo/Details/{activity_id}")
+    base_headers = {
+        "Origin": IBON_BASE.rstrip("/"),
+        "Referer": referer,
+        "User-Agent": UA,
+        "Accept-Language": "zh-TW,zh;q=0.9,en;q=0.6",
+    }
+
+    sys_type: Optional[int] = None
+    try:
+        headers = dict(base_headers)
+        if token:
+            headers["X-XSRF-TOKEN"] = token
+        resp = session.post(
+            IBON_DETAIL_API,
+            files={"id": (None, activity_id)},
+            headers=headers,
+            timeout=12,
+        )
+        if resp.status_code == 200:
+            try:
+                data = resp.json()
+                item = data.get("Item") if isinstance(data, dict) else None
+                raw = (item or {}).get("SystemBrowseType")
+                if isinstance(raw, int):
+                    sys_type = raw
+                elif isinstance(raw, str) and raw.isdigit():
+                    sys_type = int(raw)
+            except Exception as e:
+                app.logger.info(f"[detail-to-utk] parse detail fail: {e}")
+        else:
+            app.logger.info(f"[detail-to-utk] detail http={resp.status_code}")
+    except Exception as e:
+        app.logger.info(f"[detail-to-utk] detail error: {e}")
+
+    payload: Dict[str, Any] = {
+        "id": int(activity_id) if activity_id.isdigit() else activity_id,
+        "hasDeadline": True,
+        "SystemBrowseType": sys_type if isinstance(sys_type, int) else 0,
+    }
+
+    try:
+        headers = dict(base_headers)
+        headers.update({
+            "Content-Type": "application/json;charset=UTF-8",
+            "Accept": "application/json, text/plain, */*",
+        })
+        if token:
+            headers["X-XSRF-TOKEN"] = token
+        resp = session.post(
+            TICKET_API,
+            json=payload,
+            headers=headers,
+            timeout=12,
+        )
+        if resp.status_code != 200:
+            app.logger.info(f"[detail-to-utk] gameinfo http={resp.status_code}")
+            return None
+        data = resp.json()
+    except Exception as e:
+        app.logger.info(f"[detail-to-utk] gameinfo error: {e}")
+        return None
+
+    item = data.get("Item") if isinstance(data, dict) else None
+    entries = item.get("GIHtmls") if isinstance(item, dict) else None
+    if not isinstance(entries, list):
+        return None
+
+    def _priority(entry: dict) -> tuple:
+        sold_out = entry.get("SoldOut")
+        can_buy = entry.get("CanBuy")
+        rush = entry.get("Rush")
+
+        def _to_bool(val: Any) -> Optional[bool]:
+            if isinstance(val, bool):
+                return val
+            if isinstance(val, str):
+                v = val.strip().lower()
+                if v in ("1", "true", "y", "yes"):
+                    return True
+                if v in ("0", "false", "n", "no"):
+                    return False
+            return None
+
+        sold_flag = _to_bool(sold_out)
+        can_flag = _to_bool(can_buy)
+        rush_flag = _to_bool(rush)
+
+        prio = 0
+        if can_flag is False:
+            prio += 2
+        if sold_flag:
+            prio += 4
+        if rush_flag:
+            prio -= 1
+        return (prio, str(entry.get("StartDT") or entry.get("ShowSaleDate") or ""))
+
+    sorted_entries = sorted(
+        [e for e in entries if isinstance(e, dict) and (e.get("Href") or e.get("href"))],
+        key=_priority,
+    )
+
+    for entry in sorted_entries:
+        href = entry.get("Href") or entry.get("href")
+        if not href:
+            continue
+        candidate = urljoin(IBON_BASE, href)
+        resolved = candidate
+        try:
+            resolved = _resolve_ticket_url(candidate, depth + 1)
+        except Exception as e:
+            app.logger.info(f"[detail-to-utk] recurse fail: {e}")
+        if not resolved:
+            continue
+        parsed = urlparse(resolved)
+        if parsed.netloc.lower().endswith("orders.ibon.com.tw"):
+            _DETAIL_TO_UTK_CACHE[activity_id] = (resolved, now + _DETAIL_CACHE_TTL)
+            return resolved
+        if candidate != resolved:
+            _DETAIL_TO_UTK_CACHE[activity_id] = (resolved, now + _DETAIL_CACHE_TTL)
+            return resolved
+
+    return None
+
+
 def _resolve_ticket_url(u: str, depth: int = 0) -> str:
     if depth > 3:
         return u
@@ -747,6 +883,11 @@ def _resolve_ticket_url(u: str, depth: int = 0) -> str:
 
     if netloc.endswith("ticket.ibon.com.tw"):
         lower_path = path.lower()
+        m = re.match(r"/activityinfo/details/(\d+)", lower_path)
+        if m:
+            target = _resolve_activity_detail_to_utk(m.group(1), depth + 1)
+            if target:
+                return target
         if "/activityinfo/goticketurl" in lower_path:
             # 官方會把目標網址塞進 GoUrl 參數，通常會再 encode 一次
             for key in ("GoUrl", "GoURL", "gourl", "go"):
