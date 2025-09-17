@@ -100,8 +100,13 @@ function render(acts){
         alert("已送出監看指令到聊天室！");
         return liff.openWindow({ url: url, external: false });
       }).catch(function(e){
-        alert("送訊息或開啟頁面失敗：" + e);
         console.error(e);
+        var detail = (e && e.message) ? e.message : e;
+        var msg = "送訊息或開啟頁面失敗：" + detail;
+        if (detail && String(detail).toLowerCase().indexOf("permission is not in liff app scope") !== -1) {
+          msg += "\n\n請前往 LINE Developers > LIFF 設定加入 chat_message.write 權限，並重新發布 LIFF/rich menu。";
+        }
+        alert(msg);
       }).finally(finish);
     };
 

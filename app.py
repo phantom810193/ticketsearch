@@ -732,8 +732,55 @@ def hash_state(sections: Dict[str, int], selling: List[str]) -> str:
     raw = json.dumps({"num": items, "hot": hot}, ensure_ascii=False, separators=(",", ":"))
     return hashlib.md5(raw.encode("utf-8")).hexdigest()
 
+def _resolve_ticket_url(u: str, depth: int = 0) -> str:
+    if depth > 3:
+        return u
+    try:
+        parsed = urlparse(u)
+    except Exception:
+        return u
+
+    netloc = (parsed.netloc or "").lower()
+    path = parsed.path or ""
+    query = parse_qs(parsed.query, keep_blank_values=True)
+    query_by_lower = {k.lower(): v for k, v in query.items()}
+
+    if netloc.endswith("ticket.ibon.com.tw"):
+        lower_path = path.lower()
+        if "/activityinfo/goticketurl" in lower_path:
+            # 官方會把目標網址塞進 GoUrl 參數，通常會再 encode 一次
+            for key in ("GoUrl", "GoURL", "gourl", "go"):
+                vals = query.get(key) or query_by_lower.get(key.lower())
+                if not vals:
+                    continue
+                target = vals[-1]
+                if not target:
+                    continue
+                resolved = unquote(target)
+                if "%" in resolved:
+                    second = unquote(resolved)
+                    if second != resolved:
+                        resolved = second
+                if resolved.startswith("//"):
+                    resolved = "https:" + resolved
+                if resolved.startswith("/"):
+                    resolved = urljoin(IBON_BASE, resolved)
+                if resolved:
+                    return _resolve_ticket_url(resolved, depth + 1)
+        if lower_path.startswith("/eventbuy/") or lower_path.startswith("/event/"):
+            parts = [p for p in path.split("/") if p]
+            product_id = parts[1] if len(parts) >= 2 else None
+            performance_id = parts[2] if len(parts) >= 3 else None
+            if product_id and performance_id:
+                return ("https://orders.ibon.com.tw/application/UTK02/UTK0201_000.aspx"
+                        f"?PRODUCT_ID={product_id}&PERFORMANCE_ID={performance_id}")
+
+    return u
+
+
 def canonicalize_url(u: str) -> str:
-    p = urlparse(u.strip())
+    resolved = _resolve_ticket_url((u or "").strip())
+    p = urlparse(resolved)
     q = parse_qs(p.query, keep_blank_values=True)
     q_sorted = []
     for k in sorted(q.keys()):
@@ -1387,11 +1434,13 @@ def parse_UTK0201_000(url: str, sess: requests.Session) -> dict:
     return out
 
 def probe(url: str) -> dict:
+    original = (url or "").strip()
+    resolved = _resolve_ticket_url(original)
     s = sess_default()
-    p = urlparse(url)
+    p = urlparse(resolved)
     if "orders.ibon.com.tw" in p.netloc and p.path.upper().endswith("/UTK0201_000.ASPX"):
-        return parse_UTK0201_000(url, s)
-    r = s.get(url, timeout=12)
+        return parse_UTK0201_000(resolved, s)
+    r = s.get(resolved, timeout=12)
     title = ""
     try:
         soup = soup_parse(r.text)
@@ -1400,8 +1449,8 @@ def probe(url: str) -> dict:
     except Exception:
         pass
     return {
-        "ok": False, "sig": "NA", "url": url, "image": LOGO,
-        "title": title or "（未取到標題）", "place": "", "date": "", "msg": url,
+        "ok": False, "sig": "NA", "url": resolved, "image": LOGO,
+        "title": title or "（未取到標題）", "place": "", "date": "", "msg": original or resolved,
     }
 
 # ============= LINE 指令 =============
