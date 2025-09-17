@@ -84,11 +84,123 @@ _CACHE_TTL = 300  # 秒
 _DETAIL_TO_UTK_CACHE: Dict[str, Tuple[str, float]] = {}
 _DETAIL_CACHE_TTL = 900  # 秒
 
+# 也快取 Detail / GameInfo 解析出的標題、地點、時間資訊，讓尚未開放購票的活動
+# 仍能顯示完整資訊（避免 LINE 推播變成空白）。
+_DETAIL_INFO_CACHE: Dict[str, Tuple[Dict[str, str], float]] = {}
+
 _CONCERT_WORDS = ("演唱會", "演場會", "音樂會", "演唱", "演出", "LIVE", "Live")
 
 def _looks_like_concert(title: str) -> bool:
     t = title or ""
     return any(w.lower() in t.lower() for w in _CONCERT_WORDS)
+
+
+def _clean_detail_text(value: Optional[str]) -> Optional[str]:
+    if not value:
+        return None
+    text = str(value).strip()
+    if not text:
+        return None
+    return re.sub(r"\s+", " ", text)
+
+
+def _format_iso_datetime(value: Optional[str]) -> Optional[str]:
+    if not value:
+        return None
+    text = str(value).strip()
+    if not text:
+        return None
+    try:
+        dt = datetime.fromisoformat(text.replace("Z", "+00:00"))
+        return dt.strftime("%Y/%m/%d %H:%M")
+    except Exception:
+        return None
+
+
+_RE_SHOW_SALE = re.compile(r"(\d{4}/\d{2}/\d{2}).*?(\d{2}:\d{2})")
+
+
+def _format_show_sale(value: Optional[str]) -> Optional[str]:
+    if not value:
+        return None
+    text = str(value)
+    m = _RE_SHOW_SALE.search(text)
+    if not m:
+        return None
+    return f"{m.group(1)} {m.group(2)}"
+
+
+def _cache_detail_info(activity_id: str, detail_item: Optional[Dict[str, Any]], entries: Optional[List[Dict[str, Any]]]):
+    info: Dict[str, str] = {}
+    if isinstance(detail_item, dict):
+        title = _clean_detail_text(detail_item.get("ActivityName") or detail_item.get("ActivityNameEN"))
+        if title:
+            info["title"] = title
+        poster = _clean_detail_text(detail_item.get("ActivityImageURL") or detail_item.get("PlatformImageURL"))
+        if poster:
+            info["poster"] = poster
+        event_dt = _format_iso_datetime(detail_item.get("ActivitySDate")) or _format_iso_datetime(detail_item.get("ActivityEDate"))
+        if event_dt:
+            info.setdefault("date", event_dt)
+        sale_dt = _format_iso_datetime(detail_item.get("ActivityTicketSDate"))
+        if sale_dt:
+            info["sale_time"] = sale_dt
+    if isinstance(entries, list):
+        for entry in entries:
+            if not isinstance(entry, dict):
+                continue
+            place = _clean_detail_text(entry.get("VenueRegion") or entry.get("Venue"))
+            if place and not info.get("place"):
+                info["place"] = place
+            title = _clean_detail_text(entry.get("GameInfoName"))
+            if title and not info.get("title"):
+                info["title"] = title
+            dt = _format_show_sale(entry.get("ShowSaleDate")) or _format_iso_datetime(entry.get("StartDT"))
+            if dt and not info.get("date"):
+                info["date"] = dt
+    if info:
+        _DETAIL_INFO_CACHE[activity_id] = (info, time.time() + _DETAIL_CACHE_TTL)
+
+
+def _get_detail_info(activity_id: str) -> Dict[str, str]:
+    now = time.time()
+    cached = _DETAIL_INFO_CACHE.get(activity_id)
+    if cached and cached[1] > now:
+        return cached[0]
+    try:
+        _resolve_activity_detail_to_utk(activity_id)
+    except Exception:
+        pass
+    cached = _DETAIL_INFO_CACHE.get(activity_id)
+    if cached and cached[1] > time.time():
+        return cached[0]
+    return {}
+
+
+def _extract_activity_id_from_url(u: str) -> Optional[str]:
+    if not u:
+        return None
+    try:
+        parsed = urlparse(u)
+    except Exception:
+        parsed = None
+    candidates = []
+    if parsed and parsed.path:
+        m = re.search(r"/ActivityInfo/Details/(\d+)", parsed.path, flags=re.I)
+        if m:
+            candidates.append(m.group(1))
+    qs = parse_qs(parsed.query) if parsed else {}
+    for key in ("id", "activityid", "activityId", "activityInfoId", "gameId", "gameID"):
+        vals = qs.get(key)
+        if vals:
+            candidates.append(vals[-1])
+    for cand in candidates:
+        if cand and cand.isdigit():
+            return cand
+    m = re.search(r"/(\d{4,})", u)
+    if m:
+        return m.group(1)
+    return None
 
 
 def _extract_xsrf_token(payload: Any) -> Optional[str]:
@@ -752,6 +864,7 @@ def _resolve_activity_detail_to_utk(activity_id: str, depth: int = 0) -> Optiona
     }
 
     sys_type: Optional[int] = None
+    detail_item: Optional[Dict[str, Any]] = None
     try:
         headers = dict(base_headers)
         if token:
@@ -766,6 +879,8 @@ def _resolve_activity_detail_to_utk(activity_id: str, depth: int = 0) -> Optiona
             try:
                 data = resp.json()
                 item = data.get("Item") if isinstance(data, dict) else None
+                if isinstance(item, dict):
+                    detail_item = item
                 raw = (item or {}).get("SystemBrowseType")
                 if isinstance(raw, int):
                     sys_type = raw
@@ -808,6 +923,13 @@ def _resolve_activity_detail_to_utk(activity_id: str, depth: int = 0) -> Optiona
 
     item = data.get("Item") if isinstance(data, dict) else None
     entries = item.get("GIHtmls") if isinstance(item, dict) else None
+    if detail_item is None and isinstance(item, dict):
+        detail_item = item
+    if detail_item or entries:
+        try:
+            _cache_detail_info(activity_id, detail_item, entries if isinstance(entries, list) else None)
+        except Exception as e:
+            app.logger.info(f"[detail-to-utk] cache info fail: {e}")
     if not isinstance(entries, list):
         return None
 
@@ -1578,20 +1700,43 @@ def probe(url: str) -> dict:
     original = (url or "").strip()
     resolved = _resolve_ticket_url(original)
     s = sess_default()
+    detail_id = _extract_activity_id_from_url(original) or _extract_activity_id_from_url(resolved)
+    detail_info = _get_detail_info(detail_id) if detail_id else {}
     p = urlparse(resolved)
     if "orders.ibon.com.tw" in p.netloc and p.path.upper().endswith("/UTK0201_000.ASPX"):
         return parse_UTK0201_000(resolved, s)
     r = s.get(resolved, timeout=12)
-    title = ""
+    title = detail_info.get("title", "")
+    place = detail_info.get("place", "")
+    date = detail_info.get("date", "")
+    poster = detail_info.get("poster")
     try:
         soup = soup_parse(r.text)
-        if soup.title and soup.title.text:
+        if not title and soup.title and soup.title.text:
             title = soup.title.text.strip()
     except Exception:
         pass
+    sale_time = detail_info.get("sale_time")
+    msg_lines = [
+        f"🎫 {title or '（未取到標題）'}",
+        f"地點：{place or '（未取到場地）'}",
+        f"日期：{date or '（未取到日期）'}",
+    ]
+    if sale_time:
+        msg_lines.append(f"\n尚未開放購票，預計開賣：{sale_time}")
+    else:
+        msg_lines.append("\n暫時讀不到剩餘數（可能為動態載入）。")
+    msg_lines.append(resolved)
     return {
-        "ok": False, "sig": "NA", "url": resolved, "image": LOGO,
-        "title": title or "（未取到標題）", "place": "", "date": "", "msg": original or resolved,
+        "ok": False,
+        "sig": "NA",
+        "url": resolved,
+        "image": poster or LOGO,
+        "title": title or "（未取到標題）",
+        "place": place or "（未取到場地）",
+        "date": date or "（未取到日期）",
+        "sale_time": sale_time,
+        "msg": "\n".join(msg_lines),
     }
 
 # ============= LINE 指令 =============
@@ -1734,7 +1879,11 @@ def fmt_result_text(res: dict) -> str:
             for n in selling:
                 lines.append(f"・{n}（熱賣中）")
     else:
-        lines.append("\n暫時讀不到剩餘數（可能為動態載入）。")
+        sale_time = res.get("sale_time")
+        if sale_time:
+            lines.append(f"\n尚未開放購票，預計開賣：{sale_time}")
+        else:
+            lines.append("\n暫時讀不到剩餘數（可能為動態載入）。")
     lines.append(res.get("url", ""))
     return "\n".join(lines)
 
