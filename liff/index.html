@@ -8,18 +8,29 @@
   <script src="https://static.line-scdn.net/liff/edge/versions/2.23.1/sdk.js"></script>
   <style>
     body { font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,Helvetica,Arial,"Noto Sans TC",sans-serif; margin:16px; }
+    h1 { margin:0 0 6px; font-size:22px; }
+    .subtitle { color:#555; margin-bottom:12px; line-height:1.5; }
     .row { display:flex; gap:12px; align-items:center; margin-top:8px; flex-wrap:wrap; }
-    .card { border:1px solid #ddd; border-radius:12px; padding:12px; margin:10px 0; }
-    .title { font-weight:700; }
-    .hint { color:#666; }
-    button { padding:8px 12px; border-radius:10px; border:1px solid #ccc; cursor:pointer; }
+    .card { border:1px solid #ddd; border-radius:12px; padding:12px; margin:10px 0; background:#fff; }
+    .card.disabled { opacity:0.65; }
+    .title { font-weight:700; margin-bottom:4px; }
+    .hint { color:#666; line-height:1.5; }
+    .meta { color:#444; font-size:14px; margin-bottom:4px; }
+    button { padding:8px 12px; border-radius:10px; border:1px solid #ccc; cursor:pointer; background:#fafafa; }
+    button:disabled { opacity:0.6; cursor:not-allowed; }
+    button.danger { background:#ffeceb; border-color:#ff867c; color:#d84315; }
     input { padding:6px 8px; border-radius:8px; border:1px solid #ccc; width:90px; }
+    a { color:#007aff; text-decoration:none; }
+    a:hover { text-decoration:underline; }
     #out { margin:8px 0; color:#999; }
+    .hidden { display:none !important; }
   </style>
 </head>
 <body>
-  <div class="row">
-    監看秒數：<input id="sec" type="number" min="15" step="1" value="30" />
+  <h1 id="pageTitle">票數偵測 LIFF</h1>
+  <div id="modeHint" class="subtitle"></div>
+  <div class="row" id="controls">
+    <span id="secWrap">監看秒數：<input id="sec" type="number" min="15" step="1" value="30" /></span>
     <button id="reload">重新整理清單</button>
   </div>
   <div id="out" class="hint">初始化中…</div>
@@ -28,9 +39,113 @@
 <script>
 /** ====== 你的設定（使用完整網域） ====== */
 var LIFF_ID = "2008066018-EMmpzmKo";  // 你的 LIFF ID
-var API     = "https://ticketsearch-419460755270.asia-east1.run.app/liff/activities"; // ← 改成你的完整網址
+var API_BASE = "https://ticketsearch-419460755270.asia-east1.run.app/liff"; // 後端網址（不含尾端斜線）
 var MIN_SEC = 15;
 /** ===================================== */
+
+var API_ACTIVITIES = API_BASE + "/activities";
+var API_TASKS = API_BASE + "/tasks";
+var API_UNWATCH = API_BASE + "/unwatch";
+
+var params = new URLSearchParams(window.location.search);
+var MODE = (params.get("mode") || "watch").toLowerCase();
+var MODE_CONFIG = {
+  "watch": {
+    pageTitle: "開始監看",
+    description: "選擇要追蹤的活動並傳送 /watch 指令，系統會依指定秒數自動監測剩餘票數。",
+    reloadLabel: "重新整理清單",
+    buttonLabel: "✅ 監看",
+    busyLabel: "送出中…",
+    successAlert: "已送出監看指令到聊天室！",
+    needsActs: true,
+    needsSec: true,
+    emptyHint: "目前抓不到活動清單，請稍後再試。",
+    apiError: "請確認後端 /liff/activities 是否可用，並開啟 CORS。",
+    commandBuilder: function(url){
+      var sec = ensureSec(document.getElementById("sec").value);
+      return "/watch " + url + " " + sec;
+    },
+    onOutsideLine: function(url){
+      alert("提示：目前不是從 LINE 內開啟，將僅開啟活動頁面。");
+      window.open(url, "_blank");
+    },
+    onSuccess: function(url){
+      try {
+        liff.openWindow({ url: url, external: false });
+      } catch (e) {}
+    }
+  },
+  "check": {
+    pageTitle: "快速查看",
+    description: "點擊活動即可快速傳送 /check 指令，立即返回聊天室查看最新票數。",
+    reloadLabel: "重新整理清單",
+    buttonLabel: "👀 快速查看",
+    busyLabel: "查詢中…",
+    successAlert: "已送出查詢指令到聊天室！",
+    needsActs: true,
+    needsSec: false,
+    emptyHint: "目前抓不到活動清單，請稍後再試。",
+    apiError: "請確認後端 /liff/activities 是否可用。",
+    commandBuilder: function(url){ return "/check " + url; },
+    onOutsideLine: function(){
+      alert("提示：請從 LINE 內開啟此頁，以便把查詢結果送回聊天室。");
+    },
+    onSuccess: function(){
+      setTimeout(function(){
+        try { liff.closeWindow(); } catch (e) {}
+      }, 400);
+    }
+  },
+  "list": {
+    pageTitle: "查看清單",
+    description: "顯示目前的監看任務與最近讀取狀態。",
+    reloadLabel: "重新整理任務",
+    needsTasks: true,
+    allowStop: false,
+    defaultStatus: "all",
+    emptyTitle: "沒有監看任務",
+    emptyHint: "目前沒有任何監看任務。",
+    apiError: "請確認後端 /liff/tasks 是否可用。"
+  },
+  "stop": {
+    pageTitle: "停止監看",
+    description: "挑選要停用的任務，系統會立即停止監看。",
+    reloadLabel: "重新整理任務",
+    needsTasks: true,
+    allowStop: true,
+    defaultStatus: "on",
+    emptyTitle: "沒有啟用中的任務",
+    emptyHint: "目前沒有啟用中的監看任務。",
+    apiError: "請確認後端 /liff/tasks 是否可用。"
+  }
+};
+
+if (!MODE_CONFIG[MODE]) MODE = "watch";
+var CONFIG = MODE_CONFIG[MODE];
+CONFIG.needsActs = !!CONFIG.needsActs;
+CONFIG.needsTasks = !!CONFIG.needsTasks;
+CONFIG.needsSec = !!CONFIG.needsSec;
+CONFIG.allowStop = !!CONFIG.allowStop;
+
+var TASK_STATUS = normalizeStatus(params.get("status") || CONFIG.defaultStatus || "on");
+var reloadFn = function(){};
+var chatId = null;
+
+var titleEl = document.getElementById("pageTitle");
+var hintEl = document.getElementById("modeHint");
+var secWrap = document.getElementById("secWrap");
+var reloadBtn = document.getElementById("reload");
+var outEl = document.getElementById("out");
+
+if (titleEl) titleEl.textContent = CONFIG.pageTitle + "";
+if (hintEl) hintEl.textContent = CONFIG.description || "";
+if (reloadBtn) reloadBtn.textContent = CONFIG.reloadLabel || "重新整理";
+if (!CONFIG.needsSec && secWrap) secWrap.classList.add("hidden");
+document.title = CONFIG.pageTitle + " - 票數偵測 LIFF";
+
+document.getElementById("reload").onclick = function(){
+  if (typeof reloadFn === "function") reloadFn();
+};
 
 function ensureSec(v){
   var n = parseInt(v, 10);
@@ -38,11 +153,63 @@ function ensureSec(v){
   return n;
 }
 
+function normalizeStatus(v){
+  var s = String(v || "").toLowerCase();
+  if (s === "off") return "off";
+  if (s === "all") return "all";
+  return "on";
+}
+
+function buildActivityUrl(){
+  var qs = [];
+  var limit = params.get("limit");
+  if (limit) qs.push("limit=" + encodeURIComponent(limit));
+  var keyword = params.get("q");
+  if (keyword) qs.push("q=" + encodeURIComponent(keyword));
+  var onlyConcert = params.get("onlyConcert");
+  if (onlyConcert) qs.push("onlyConcert=" + encodeURIComponent(onlyConcert));
+  return qs.length ? (API_ACTIVITIES + "?" + qs.join("&")) : API_ACTIVITIES;
+}
+
+var ACTIVITY_URL = buildActivityUrl();
+
 function fetchActs(){
-  // 用完整網域時，建議帶上 credentials，後端需允許 CORS
-  return fetch(API, { credentials: "include", mode: "cors" }).then(function(res){
+  return fetch(ACTIVITY_URL, { credentials: "include", mode: "cors" }).then(function(res){
     if (!res.ok) throw new Error("HTTP " + res.status);
     return res.json();
+  });
+}
+
+function fetchTasks(){
+  if (!chatId) return Promise.reject(new Error("missing chatId"));
+  var url = API_TASKS + "?chatId=" + encodeURIComponent(chatId) + "&status=" + encodeURIComponent(TASK_STATUS);
+  return fetch(url, { credentials: "include", mode: "cors" }).then(function(res){
+    return res.json().catch(function(){ return {}; }).then(function(body){
+      if (!res.ok || !body.ok){
+        var msg = (body && body.error) ? body.error : ("HTTP " + res.status);
+        throw new Error(msg);
+      }
+      return body;
+    });
+  });
+}
+
+function sendUnwatch(taskId){
+  if (!chatId) return Promise.reject(new Error("missing chatId"));
+  return fetch(API_UNWATCH, {
+    method: "POST",
+    credentials: "include",
+    mode: "cors",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ chatId: chatId, taskId: taskId })
+  }).then(function(res){
+    return res.json().catch(function(){ return {}; }).then(function(body){
+      if (!res.ok || !body.ok){
+        var msg = (body && body.error) ? body.error : ("HTTP " + res.status);
+        throw new Error(msg);
+      }
+      return body;
+    });
   });
 }
 
@@ -53,23 +220,61 @@ function el(tag, cls, html){
   return d;
 }
 
-function render(acts){
+function showListMessage(title, desc){
+  var elList = document.getElementById("list");
+  elList.innerHTML = "";
+  var card = el("div", "card", "");
+  card.appendChild(el("div", "title", title || "提示"));
+  if (desc) card.appendChild(el("div", "hint", desc));
+  elList.appendChild(card);
+}
+
+function showFetchError(detail){
+  var desc = CONFIG.apiError || "請稍後再試。";
+  if (detail) desc += " (" + detail + ")";
+  showListMessage("讀取資料失敗", desc);
+}
+
+function pad2(n){
+  return String(n).padStart(2, "0");
+}
+
+function formatTime(iso){
+  if (!iso) return "";
+  var d = new Date(iso);
+  if (isNaN(d.getTime())) return "";
+  var y = d.getFullYear();
+  var m = pad2(d.getMonth() + 1);
+  var day = pad2(d.getDate());
+  var hh = pad2(d.getHours());
+  var mm = pad2(d.getMinutes());
+  return y + "/" + m + "/" + day + " " + hh + ":" + mm;
+}
+
+function renderActivities(acts){
   var elList = document.getElementById("list");
   elList.innerHTML = "";
 
   if (!Array.isArray(acts) || acts.length === 0){
-    elList.appendChild(el("div", "hint", "目前抓不到活動清單，請稍後再試。"));
+    showListMessage("目前抓不到活動清單", CONFIG.emptyHint || "請稍後再試。");
     return;
   }
 
   acts.forEach(function(it, i){
     var title = it.title || ("活動 " + (i + 1));
-    var url   = it.url || "";
+    var url = it.url || "";
 
     var card = el("div", "card", "");
-    card.appendChild(el("div", "title", String(i+1).padStart(2,"0") + ". " + title));
+    card.appendChild(el("div", "title", pad2(i + 1) + ". " + title));
 
-    var row  = el("div", "row", "");
+    if (it.date || it.place){
+      var info = [];
+      if (it.place) info.push("📍 " + it.place);
+      if (it.date) info.push("📅 " + it.date);
+      if (info.length) card.appendChild(el("div", "hint", info.join("｜")));
+    }
+
+    var row = el("div", "row", "");
     var link = el("a", null, "活動頁面");
     if (url){
       link.href = url;
@@ -81,69 +286,236 @@ function render(acts){
     }
     row.appendChild(link);
 
-    var btn = el("button", null, "✅ 監看");
-    btn.onclick = function(){
-      if (!url){ alert("此活動沒有可用的 URL，無法監看。"); return; }
-      var s = ensureSec(document.getElementById("sec").value);
-      var text = "/watch " + url + " " + s;
+    if (CONFIG.buttonLabel){
+      var btn = el("button", null, CONFIG.buttonLabel);
+      btn.onclick = function(){ handleActivityAction(url, btn); };
+      row.appendChild(btn);
+    }
 
-      btn.disabled = true; btn.textContent = "送出中…";
-      var finish = function(){ btn.disabled = false; btn.textContent = "✅ 監看"; };
-
-      if (!liff.isInClient()){
-        alert("提示：目前不是從 LINE 內開啟，將僅開啟活動頁面。");
-        window.open(url, "_blank");
-        finish();
-        return;
-      }
-      liff.sendMessages([{ type:"text", text:text }]).then(function(){
-        alert("已送出監看指令到聊天室！");
-        return liff.openWindow({ url: url, external: false });
-      }).catch(function(e){
-        console.error(e);
-        var detail = (e && e.message) ? e.message : e;
-        var msg = "送訊息或開啟頁面失敗：" + detail;
-        if (detail && String(detail).toLowerCase().indexOf("permission is not in liff app scope") !== -1) {
-          msg += "\n\n請前往 LINE Developers > LIFF 設定加入 chat_message.write 權限，並重新發布 LIFF/rich menu。";
-        }
-        alert(msg);
-      }).finally(finish);
-    };
-
-    row.appendChild(btn);
     card.appendChild(row);
     elList.appendChild(card);
   });
 }
 
-function showApiError(){
+function renderTasks(tasks){
   var elList = document.getElementById("list");
-  elList.innerHTML =
-    "<div class='card'><div class='title'>讀取活動清單失敗</div>" +
-    "<div class='hint'>請確認後端 " + API + " 是否 200 OK，並開啟 CORS。</div></div>";
-}
+  elList.innerHTML = "";
 
-function boot(){
-  var out = document.getElementById("out");
-  out.textContent = "LIFF 初始化中…";
+  if (!Array.isArray(tasks) || tasks.length === 0){
+    showListMessage(CONFIG.emptyTitle || "沒有監看任務", CONFIG.emptyHint || "");
+    return;
+  }
 
-  liff.init({ liffId: LIFF_ID }).then(function(){
-    if (!liff.isInClient()){
-      out.textContent = "提示：請從 LINE 內開啟此頁，以便直接把指令送回聊天室。";
+  tasks.forEach(function(task, idx){
+    var classes = "card";
+    if (!task.enabled) classes += " disabled";
+    var card = el("div", classes, "");
+    var displayTitle = task.title || ("任務 " + (task.id || pad2(idx + 1)));
+    card.appendChild(el("div", "title", pad2(idx + 1) + ". " + displayTitle));
+
+    var statusText = task.enabled ? "啟用中" : "已停用";
+    var metaParts = ["任務代碼：" + (task.id || "未知"), "狀態：" + statusText];
+    if (task.period) metaParts.push("頻率：" + task.period + " 秒");
+    card.appendChild(el("div", "meta", metaParts.join("｜")));
+
+    var infoParts = [];
+    if (task.place) infoParts.push("📍 " + task.place);
+    if (task.date) infoParts.push("📅 " + task.date);
+    if (infoParts.length) card.appendChild(el("div", "hint", infoParts.join("｜")));
+
+    var row = el("div", "row", "");
+    var link = el("a", null, "活動頁面");
+    if (task.url){
+      link.href = task.url;
+      link.target = "_blank";
     }else{
-      out.textContent = "";
+      link.className = "hint";
+      link.href = "javascript:void(0)";
+      link.innerHTML = "（無有效連結）";
     }
-    return fetchActs().then(render).catch(function(e){
-      console.error(e); showApiError();
-    });
-  }).catch(function(e){
-    console.error(e);
-    out.textContent = "LIFF 初始化失敗或 API 取用失敗。";
-    showApiError();
+    row.appendChild(link);
+    card.appendChild(row);
+
+    var statusParts = [];
+    if (typeof task.lastTotal === "number" && task.lastTotal > 0){
+      statusParts.push("最近讀取：" + task.lastTotal + " 張");
+    }else if (task.lastOk){
+      statusParts.push("最近讀取：有票但未公布數量");
+    }
+    if (task.updatedAt){
+      statusParts.push("更新：" + formatTime(task.updatedAt));
+    }
+    if (statusParts.length){
+      card.appendChild(el("div", "hint", statusParts.join("｜")));
+    }
+
+    if (CONFIG.allowStop && task.enabled){
+      var btnRow = el("div", "row", "");
+      var btn = el("button", "danger", "🛑 停止監看");
+      btn.onclick = function(){
+        if (!task.id) return;
+        if (!confirm("確定要停止任務 " + task.id + " 嗎？")) return;
+        var original = btn.textContent;
+        btn.disabled = true;
+        btn.textContent = "處理中…";
+        sendUnwatch(task.id).then(function(){
+          alert("已停止監看任務：" + task.id);
+          loadTasks();
+        }).catch(function(err){
+          console.error(err);
+          var detail = (err && err.message) ? err.message : err;
+          alert("停用失敗：" + detail);
+        }).finally(function(){
+          btn.disabled = false;
+          btn.textContent = original;
+        });
+      };
+      btnRow.appendChild(btn);
+      card.appendChild(btnRow);
+    }
+
+    elList.appendChild(card);
   });
 }
 
-document.getElementById("reload").onclick = boot;
+function handleActivityAction(url, btn){
+  if (!url){
+    alert("此活動沒有可用的 URL，無法操作。");
+    return;
+  }
+  if (!CONFIG.commandBuilder){
+    alert("此模式未提供指令功能。");
+    return;
+  }
+  var text = CONFIG.commandBuilder(url);
+  if (!text){
+    alert("無法建立指令，請稍後再試。");
+    return;
+  }
+
+  var original = btn.textContent;
+  btn.disabled = true;
+  btn.textContent = CONFIG.busyLabel || "處理中…";
+
+  var finish = function(){
+    btn.disabled = false;
+    btn.textContent = original;
+  };
+
+  if (!liff.isInClient()){
+    if (typeof CONFIG.onOutsideLine === "function"){
+      CONFIG.onOutsideLine(url);
+    } else {
+      alert("請從 LINE 內開啟此頁，以便送出指令。");
+    }
+    finish();
+    return;
+  }
+
+  liff.sendMessages([{ type: "text", text: text }]).then(function(){
+    if (CONFIG.successAlert) alert(CONFIG.successAlert);
+    if (typeof CONFIG.onSuccess === "function") CONFIG.onSuccess(url);
+  }).catch(function(e){
+    console.error(e);
+    var detail = (e && e.message) ? e.message : e;
+    var msg = "送訊息或開啟頁面失敗：" + detail;
+    if (detail && String(detail).toLowerCase().indexOf("permission is not in liff app scope") !== -1) {
+      msg += "\n\n請前往 LINE Developers > LIFF 設定加入 chat_message.write 權限，並重新發佈 LIFF / rich menu。";
+    }
+    alert(msg);
+  }).finally(finish);
+}
+
+function setOut(text){
+  if (outEl) outEl.textContent = text || "";
+}
+
+function resolveChatId(ctx, profile){
+  if (!ctx) return (profile && profile.userId) || null;
+  switch (ctx.type) {
+    case "utou":
+    case "user":
+    case "none":
+      return (profile && profile.userId) || ctx.userId || null;
+    case "group":
+      return ctx.groupId || null;
+    case "room":
+      return ctx.roomId || null;
+    default:
+      return (profile && profile.userId) || null;
+  }
+}
+
+function loadActivities(){
+  setOut("讀取活動清單中…");
+  fetchActs().then(function(acts){
+    setOut("");
+    renderActivities(acts);
+  }).catch(function(err){
+    console.error(err);
+    setOut("");
+    showFetchError(err && err.message);
+  });
+}
+
+function loadTasks(){
+  if (!chatId){
+    setOut("請重新整理或回到 LINE 對話再試。");
+    return;
+  }
+  setOut("讀取任務清單中…");
+  fetchTasks().then(function(data){
+    setOut("");
+    renderTasks(data.tasks || []);
+  }).catch(function(err){
+    console.error(err);
+    setOut("");
+    showFetchError(err && err.message);
+  });
+}
+
+function boot(){
+  setOut("LIFF 初始化中…");
+  liff.init({ liffId: LIFF_ID }).then(function(){
+    if (CONFIG.needsTasks){
+      if (!liff.isInClient()){
+        setOut("請從 LINE 對話中開啟此功能，以便讀取任務清單。");
+        showListMessage("需要從 LINE 開啟", "請回到與機器人的聊天視窗後再點選此功能。");
+        return;
+      }
+      var ctx = null;
+      try { ctx = liff.getContext(); } catch (e) { ctx = null; }
+      liff.getProfile().then(function(profile){
+        chatId = resolveChatId(ctx, profile);
+        if (!chatId){
+          setOut("找不到聊天資訊，請從 LINE 對話中重新開啟。");
+          showListMessage("找不到聊天 ID", "請回到 LINE 對話中重新開啟此功能。");
+          return;
+        }
+        reloadFn = loadTasks;
+        loadTasks();
+      }).catch(function(err){
+        console.error(err);
+        setOut("讀取使用者資訊失敗，請稍後再試。");
+        showListMessage("讀取失敗", "無法取得使用者資訊，請稍後再試。");
+      });
+      return;
+    }
+
+    if (!liff.isInClient()){
+      setOut("提示：請從 LINE 內開啟此頁，以便直接把指令送回聊天室。");
+    } else {
+      setOut("");
+    }
+    reloadFn = loadActivities;
+    loadActivities();
+  }).catch(function(err){
+    console.error(err);
+    setOut("LIFF 初始化失敗或 API 取用失敗。");
+    showFetchError(err && err.message);
+  });
+}
+
 boot();
 </script>
 </body>

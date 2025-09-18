@@ -1846,6 +1846,48 @@ def fs_disable(chat_id: str, tid: str) -> bool:
     })
     return True
 
+
+def _dt_to_iso(value: Any) -> Optional[str]:
+    if isinstance(value, datetime):
+        if value.tzinfo is None:
+            value = value.replace(tzinfo=timezone.utc)
+        else:
+            value = value.astimezone(timezone.utc)
+        return value.isoformat().replace("+00:00", "Z")
+    return None
+
+
+def _task_preview(row: Dict[str, Any]) -> Dict[str, Any]:
+    out: Dict[str, Any] = {
+        "id": row.get("id"),
+        "url": row.get("url"),
+        "urlCanon": row.get("url_canon"),
+        "period": int(row.get("period", DEFAULT_PERIOD_SEC) or DEFAULT_PERIOD_SEC),
+        "enabled": bool(row.get("enabled", True)),
+        "lastSig": row.get("last_sig"),
+        "lastTotal": int(row.get("last_total", 0) or 0),
+        "lastOk": bool(row.get("last_ok", False)),
+        "createdAt": _dt_to_iso(row.get("created_at")),
+        "updatedAt": _dt_to_iso(row.get("updated_at")),
+        "nextRunAt": _dt_to_iso(row.get("next_run_at")),
+    }
+
+    url = row.get("url") or ""
+    detail_id = _extract_activity_id_from_url(url)
+    if detail_id:
+        try:
+            info = _get_detail_info(detail_id)
+        except Exception:
+            info = {}
+        if info:
+            if info.get("title"):
+                out["title"] = info.get("title")
+            if info.get("place"):
+                out["place"] = info.get("place")
+            if info.get("date"):
+                out["date"] = info.get("date")
+    return out
+
 def fmt_result_text(res: dict) -> str:
     lines = []
     if res.get("task_id"):
@@ -1994,7 +2036,8 @@ def handle_command(text: str, chat_id: str):
             out = json.dumps(res, ensure_ascii=False)
             return [TextSendMessage(text=out)] if HAS_LINE else [out]
 
-        return [TextSendMessage(text=HELP)] if HAS_LINE else [HELP]
+        app.logger.info(f"[handle_command] ignored command={cmd} chat={chat_id}")
+        return [] if HAS_LINE else [HELP]
     except Exception as e:
         app.logger.error(f"handle_command error: {e}\n{traceback.format_exc()}")
         msg = "指令處理發生錯誤，請稍後再試。"
@@ -2041,8 +2084,14 @@ if HAS_LINE and handler:
 
         chat = source_id(ev)
         msgs = handle_command(text, chat)
-        if isinstance(msgs, list) and msgs and not isinstance(msgs[0], str):
-            line_bot_api.reply_message(ev.reply_token, msgs)
+        if not msgs:
+            return
+        if isinstance(msgs, list):
+            if msgs and all(isinstance(m, (TextSendMessage, ImageSendMessage)) for m in msgs):
+                line_bot_api.reply_message(ev.reply_token, msgs)
+            else:
+                merged = "\n".join(str(m) for m in msgs)
+                line_bot_api.reply_message(ev.reply_token, [TextSendMessage(text=merged)])
         else:
             line_bot_api.reply_message(ev.reply_token, [TextSendMessage(text=str(msgs))])
 
@@ -2548,6 +2597,52 @@ def _extract_carousel_html_hard(html: str, limit=10, keyword=None, only_concert=
             break
 
     return items
+
+# ====== 任務清單 API ======
+@app.route("/liff/tasks", methods=["GET"])
+def liff_tasks():
+    if not FS_OK:
+        return jsonify({"ok": False, "error": "firestore not available"}), 503
+
+    chat_id = (request.args.get("chatId") or "").strip()
+    if not chat_id:
+        return jsonify({"ok": False, "error": "missing chatId"}), 400
+
+    status = (request.args.get("status") or "on").strip().lower()
+    if status not in ("on", "off", "all"):
+        status = "on"
+
+    try:
+        rows = fs_list(chat_id, show=status)
+        tasks = [_task_preview(row) for row in rows]
+        return jsonify({"ok": True, "count": len(tasks), "tasks": tasks}), 200
+    except Exception as e:
+        app.logger.error(f"/liff/tasks error: {e}")
+        return jsonify({"ok": False, "error": str(e)}), 500
+
+
+@app.route("/liff/unwatch", methods=["POST"])
+def liff_unwatch():
+    if not FS_OK:
+        return jsonify({"ok": False, "error": "firestore not available"}), 503
+
+    data = request.get_json(silent=True) or {}
+    chat_id = str(data.get("chatId", "")).strip()
+    task_id = str(data.get("taskId", "")).strip()
+    if not chat_id or not task_id:
+        return jsonify({"ok": False, "error": "chatId and taskId are required"}), 400
+
+    try:
+        ok = fs_disable(chat_id, task_id)
+    except Exception as e:
+        app.logger.error(f"/liff/unwatch update error: {e}")
+        return jsonify({"ok": False, "error": str(e)}), 500
+
+    if not ok:
+        return jsonify({"ok": False, "error": "task not found"}), 404
+
+    return jsonify({"ok": True, "taskId": task_id}), 200
+
 
 # ====== 替換：/liff/activities 以多來源 fallback（優先輪播） ======
 @app.route("/liff/activities", methods=["GET"])
