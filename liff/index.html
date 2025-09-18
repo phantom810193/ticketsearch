@@ -48,7 +48,72 @@ var API_TASKS = API_BASE + "/tasks";
 var API_UNWATCH = API_BASE + "/unwatch";
 
 var params = new URLSearchParams(window.location.search);
-var MODE = (params.get("mode") || "watch").toLowerCase();
+
+function parseStateParams(raw){
+  if (!raw) return null;
+  try {
+    var decoded = decodeURIComponent(raw);
+    if (!decoded) return null;
+    if (decoded.indexOf("http://") === 0 || decoded.indexOf("https://") === 0){
+      var url = new URL(decoded);
+      return url.search ? new URLSearchParams(url.search.slice(1)) : null;
+    }
+    var query = decoded;
+    if (query.indexOf("?") >= 0){
+      query = query.split("?").pop();
+    }
+    if (query.indexOf("#") >= 0){
+      query = query.split("#")[0];
+    }
+    query = query.trim();
+    if (!query) return null;
+    if (query.indexOf("=") === -1){
+      var p = new URLSearchParams();
+      var modeText = query.replace(/^\/+/, "");
+      if (modeText){
+        p.set("mode", modeText);
+      }
+      return p;
+    }
+    return new URLSearchParams(query);
+  } catch (e){
+    console.error(e);
+    return null;
+  }
+}
+
+function parseHashParams(hash){
+  if (!hash) return null;
+  var text = String(hash || "").replace(/^#/, "").trim();
+  if (!text) return null;
+  if (text.indexOf("=") === -1){
+    var p = new URLSearchParams();
+    p.set("mode", text);
+    return p;
+  }
+  try {
+    return new URLSearchParams(text);
+  } catch (e){
+    console.error(e);
+    return null;
+  }
+}
+
+var stateParams = parseStateParams(params.get("liff.state"));
+var hashParams = parseHashParams(window.location.hash);
+
+function mergedParam(key){
+  if (params.has(key) && params.get(key) !== null && params.get(key) !== ""){
+    return params.get(key);
+  }
+  if (stateParams && stateParams.has(key)){
+    return stateParams.get(key);
+  }
+  if (hashParams && hashParams.has(key)){
+    return hashParams.get(key);
+  }
+  return null;
+}
 var MODE_CONFIG = {
   "watch": {
     pageTitle: "開始監看",
@@ -116,18 +181,53 @@ var MODE_CONFIG = {
     defaultStatus: "on",
     emptyTitle: "沒有啟用中的任務",
     emptyHint: "目前沒有啟用中的監看任務。",
-    apiError: "請確認後端 /liff/tasks 是否可用。"
+    apiError: "請確認後端 /liff/tasks 是否可用。",
+    stopButtonLabel: "🛑 停止監看",
+    stopConfirmMessage: "確定要停止監看任務 {id} 嗎？",
+    stopBusyLabel: "送出中…",
+    stopSuccessAlert: "已送出停止監看指令！",
+    stopFallbackAlert: "已停用任務，但未能傳送聊天訊息，請確認 LIFF 權限。",
+    stopSendError: "無法送出停止指令",
+    stopErrorAlert: "停用失敗",
+    stopOutsideHint: "請從 LINE 對話中開啟此功能，才能停止監看。",
+    stopCommandBuilder: function(task){
+      return (task && task.id) ? ("/unwatch " + task.id) : "";
+    },
+    stopUseApiFallback: true
   }
 };
 
-if (!MODE_CONFIG[MODE]) MODE = "watch";
+function detectMode(){
+  var mode = mergedParam("mode");
+  if (mode) mode = String(mode).toLowerCase();
+  if (!mode){
+    try {
+      var path = window.location && window.location.pathname ? window.location.pathname : "";
+      if (path){
+        var parts = path.split("/").filter(function(x){ return !!x; });
+        if (parts.length >= 2){
+          var guess = parts[parts.length - 1].toLowerCase();
+          if (MODE_CONFIG[guess]) mode = guess;
+        }
+      }
+    } catch (e){
+      console.error(e);
+    }
+  }
+  if (!mode || !MODE_CONFIG[mode]) mode = "watch";
+  return mode;
+}
+
+var MODE = detectMode();
 var CONFIG = MODE_CONFIG[MODE];
 CONFIG.needsActs = !!CONFIG.needsActs;
 CONFIG.needsTasks = !!CONFIG.needsTasks;
 CONFIG.needsSec = !!CONFIG.needsSec;
 CONFIG.allowStop = !!CONFIG.allowStop;
+CONFIG.stopUseApiFallback = CONFIG.stopUseApiFallback !== false;
+CONFIG.stopCommandBuilder = (typeof CONFIG.stopCommandBuilder === "function") ? CONFIG.stopCommandBuilder : null;
 
-var TASK_STATUS = normalizeStatus(params.get("status") || CONFIG.defaultStatus || "on");
+var TASK_STATUS = normalizeStatus(mergedParam("status") || CONFIG.defaultStatus || "on");
 var reloadFn = function(){};
 var chatId = null;
 
@@ -162,11 +262,11 @@ function normalizeStatus(v){
 
 function buildActivityUrl(){
   var qs = [];
-  var limit = params.get("limit");
+  var limit = mergedParam("limit");
   if (limit) qs.push("limit=" + encodeURIComponent(limit));
-  var keyword = params.get("q");
+  var keyword = mergedParam("q");
   if (keyword) qs.push("q=" + encodeURIComponent(keyword));
-  var onlyConcert = params.get("onlyConcert");
+  var onlyConcert = mergedParam("onlyConcert");
   if (onlyConcert) qs.push("onlyConcert=" + encodeURIComponent(onlyConcert));
   return qs.length ? (API_ACTIVITIES + "?" + qs.join("&")) : API_ACTIVITIES;
 }
@@ -351,25 +451,9 @@ function renderTasks(tasks){
 
     if (CONFIG.allowStop && task.enabled){
       var btnRow = el("div", "row", "");
-      var btn = el("button", "danger", "🛑 停止監看");
-      btn.onclick = function(){
-        if (!task.id) return;
-        if (!confirm("確定要停止任務 " + task.id + " 嗎？")) return;
-        var original = btn.textContent;
-        btn.disabled = true;
-        btn.textContent = "處理中…";
-        sendUnwatch(task.id).then(function(){
-          alert("已停止監看任務：" + task.id);
-          loadTasks();
-        }).catch(function(err){
-          console.error(err);
-          var detail = (err && err.message) ? err.message : err;
-          alert("停用失敗：" + detail);
-        }).finally(function(){
-          btn.disabled = false;
-          btn.textContent = original;
-        });
-      };
+      var btnLabel = CONFIG.stopButtonLabel || "🛑 停止監看";
+      var btn = el("button", "danger", btnLabel);
+      btn.onclick = function(){ handleStopTask(task, btn); };
       btnRow.appendChild(btn);
       card.appendChild(btnRow);
     }
@@ -424,6 +508,112 @@ function handleActivityAction(url, btn){
     }
     alert(msg);
   }).finally(finish);
+}
+
+function handleStopTask(task, btn){
+  if (!task) return;
+  var taskId = task.id || "";
+  if (!taskId){
+    alert("找不到任務代碼，無法停用。");
+    return;
+  }
+
+  var confirmMsg = CONFIG.stopConfirmMessage || "";
+  if (confirmMsg){
+    confirmMsg = confirmMsg.replace(/\{id\}/g, taskId);
+    if (!confirm(confirmMsg)) return;
+  }
+
+  var original = btn.textContent;
+  btn.disabled = true;
+  btn.textContent = CONFIG.stopBusyLabel || "處理中…";
+
+  var done = function(){
+    btn.disabled = false;
+    btn.textContent = original;
+  };
+
+  var reloadLater = function(delayMs){
+    var wait = typeof delayMs === "number" ? delayMs : 600;
+    setTimeout(function(){
+      try { loadTasks(); } catch (e) { console.error(e); }
+    }, wait);
+  };
+
+  var notifySuccess = function(fromFallback){
+    if (typeof CONFIG.onStopSuccess === "function"){
+      try { CONFIG.onStopSuccess(task, !!fromFallback); }
+      catch (e){ console.error(e); }
+    } else {
+      reloadLater();
+    }
+  };
+
+  var command = null;
+  if (CONFIG.stopCommandBuilder){
+    try { command = CONFIG.stopCommandBuilder(task); }
+    catch (e){ console.error(e); command = null; }
+  }
+  if (!command && taskId){
+    command = "/unwatch " + taskId;
+  }
+  if (command){
+    command = String(command).trim();
+    if (!command) command = null;
+  }
+
+  var useFallback = CONFIG.stopUseApiFallback !== false;
+
+  var fallback = function(){
+    if (!useFallback){
+      done();
+      return;
+    }
+    sendUnwatch(taskId).then(function(){
+      if (CONFIG.stopFallbackAlert){
+        alert(CONFIG.stopFallbackAlert.replace(/\{id\}/g, taskId));
+      }
+      notifySuccess(true);
+    }).catch(function(err){
+      console.error(err);
+      var detail = (err && err.message) ? err.message : err;
+      var prefix = CONFIG.stopErrorAlert || "停用失敗";
+      alert(prefix + (detail ? "：" + detail : ""));
+    }).finally(done);
+  };
+
+  if (!command){
+    fallback();
+    return;
+  }
+
+  if (!liff.isInClient()){
+    if (CONFIG.stopOutsideHint){
+      alert(CONFIG.stopOutsideHint);
+    }
+    fallback();
+    return;
+  }
+
+  liff.sendMessages([{ type: "text", text: command }]).then(function(){
+    if (CONFIG.stopSuccessAlert){
+      alert(CONFIG.stopSuccessAlert.replace(/\{id\}/g, taskId));
+    }
+    notifySuccess(false);
+    done();
+  }).catch(function(err){
+    console.error(err);
+    var detail = (err && err.message) ? err.message : err;
+    var msg = CONFIG.stopSendError || "無法送出停止指令";
+    if (detail){
+      msg += "：" + detail;
+    }
+    if (detail && String(detail).toLowerCase().indexOf("permission is not in liff app scope") !== -1){
+      msg += "\n\n請前往 LINE Developers > LIFF 設定加入 chat_message.write 權限，並重新發佈 LIFF / rich menu。";
+    }
+    alert(msg);
+    fallback();
+  });
 }
 
 function setOut(text){

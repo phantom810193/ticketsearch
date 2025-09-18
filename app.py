@@ -1946,7 +1946,7 @@ def handle_command(text: str, chat_id: str):
 
         if cmd == "/unwatch" and len(parts) >= 2:
             ok = fs_disable(chat_id, parts[1].strip())
-            msg = "已停用" if ok else "找不到該任務"
+            msg = "停止監看" if ok else "此活動無監看"
             return [TextSendMessage(text=msg)] if HAS_LINE else [msg]
 
         if cmd == "/list":
