@@ -54,28 +54,54 @@ function parseStateParams(raw){
   try {
     var decoded = decodeURIComponent(raw);
     if (!decoded) return null;
+    if (decoded.charAt(0) === '#'){
+      return parseHashParams(decoded);
+    }
     if (decoded.indexOf("http://") === 0 || decoded.indexOf("https://") === 0){
       var url = new URL(decoded);
-      return url.search ? new URLSearchParams(url.search.slice(1)) : null;
+      if (url.search && url.search.length > 1){
+        var qp = new URLSearchParams(url.search.slice(1));
+        if (!qp.has("mode") && url.hash){
+          var hp = parseHashParams(url.hash);
+          if (hp && hp.has("mode")) qp.set("mode", hp.get("mode"));
+        }
+        return qp;
+      }
+      if (url.hash){
+        return parseHashParams(url.hash);
+      }
+      return null;
     }
-    var query = decoded;
+    var hashIndex = decoded.indexOf("#");
+    var hashPart = hashIndex >= 0 ? decoded.slice(hashIndex) : "";
+    var query = hashIndex >= 0 ? decoded.slice(0, hashIndex) : decoded;
     if (query.indexOf("?") >= 0){
       query = query.split("?").pop();
     }
-    if (query.indexOf("#") >= 0){
-      query = query.split("#")[0];
-    }
     query = query.trim();
-    if (!query) return null;
+    if (!query){
+      return hashPart ? parseHashParams(hashPart) : null;
+    }
     if (query.indexOf("=") === -1){
       var p = new URLSearchParams();
       var modeText = query.replace(/^\/+/, "");
       if (modeText){
         p.set("mode", modeText);
+        return p;
       }
-      return p;
+      if (hashPart){
+        return parseHashParams(hashPart);
+      }
+      return null;
     }
-    return new URLSearchParams(query);
+    var params = new URLSearchParams(query);
+    if (hashPart){
+      var extra = parseHashParams(hashPart);
+      if (extra && extra.has("mode") && !params.has("mode")){
+        params.set("mode", extra.get("mode"));
+      }
+    }
+    return params;
   } catch (e){
     console.error(e);
     return null;
@@ -197,9 +223,47 @@ var MODE_CONFIG = {
   }
 };
 
+function normalizeMode(value){
+  if (value === undefined || value === null) return null;
+  var mode = String(value).trim().toLowerCase();
+  if (!mode) return null;
+  var alias = {
+    "start": "watch",
+    "monitor": "watch",
+    "watch": "watch",
+    "quick": "check",
+    "quickcheck": "check",
+    "quick-view": "check",
+    "quickview": "check",
+    "fast": "check",
+    "check": "check",
+    "stop": "stop",
+    "stopwatch": "stop",
+    "unwatch": "stop",
+    "cancel": "stop",
+    "cancelwatch": "stop",
+    "list": "list",
+    "lists": "list",
+    "task": "list",
+    "tasks": "list",
+    "tasklist": "list",
+    "view": "list"
+  };
+  if (alias[mode]){
+    mode = alias[mode];
+  }
+  return MODE_CONFIG[mode] ? mode : null;
+}
+
 function detectMode(){
-  var mode = mergedParam("mode");
-  if (mode) mode = String(mode).toLowerCase();
+  var mode = normalizeMode(mergedParam("mode"));
+  if (!mode){
+    var altKeys = ["feature", "action", "view", "tab"];
+    for (var i = 0; i < altKeys.length; i++){
+      mode = normalizeMode(mergedParam(altKeys[i]));
+      if (mode) break;
+    }
+  }
   if (!mode){
     try {
       var path = window.location && window.location.pathname ? window.location.pathname : "";
@@ -207,7 +271,8 @@ function detectMode(){
         var parts = path.split("/").filter(function(x){ return !!x; });
         if (parts.length >= 2){
           var guess = parts[parts.length - 1].toLowerCase();
-          if (MODE_CONFIG[guess]) mode = guess;
+          var normalized = normalizeMode(guess);
+          if (normalized) mode = normalized;
         }
       }
     } catch (e){

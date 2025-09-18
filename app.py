@@ -1771,12 +1771,41 @@ def make_task_id() -> str:
     return uuid.uuid4().hex[:6]
 
 def fs_get_task_by_canon(chat_id: str, url_canon: str):
-    if not FS_OK: return None
-    q = (fs_client.collection(COL)
-         .where("chat_id", "==", chat_id)
-         .where("url_canon", "==", url_canon)
-         .limit(1).stream())
-    for d in q: return d
+    if not FS_OK:
+        return None
+
+    coll = fs_client.collection(COL)
+
+    try:
+        q = (coll
+             .where("chat_id", "==", chat_id)
+             .where("url_canon", "==", url_canon)
+             .limit(1).stream())
+        for d in q:
+            return d
+    except Exception as e:
+        app.logger.info(f"[fs_get_task_by_canon] primary query failed: {e}")
+
+    # 兼容舊資料：早期沒有 url_canon 欄位，改以 url 或重新計算進行比對。
+    try:
+        q = coll.where("chat_id", "==", chat_id).limit(50).stream()
+        for d in q:
+            data = d.to_dict() if hasattr(d, "to_dict") else {}
+            if not isinstance(data, dict):
+                continue
+            stored_canon = data.get("url_canon")
+            if stored_canon and stored_canon == url_canon:
+                return d
+            raw_url = data.get("url")
+            if not stored_canon and raw_url:
+                try:
+                    if canonicalize_url(raw_url) == url_canon:
+                        return d
+                except Exception as err:
+                    app.logger.info(f"[fs_get_task_by_canon] fallback canon failed: {err}")
+    except Exception as e:
+        app.logger.info(f"[fs_get_task_by_canon] fallback query failed: {e}")
+
     return None
 
 def fs_get_task_by_id(chat_id: str, tid: str):
@@ -1788,7 +1817,7 @@ def fs_get_task_by_id(chat_id: str, tid: str):
     for d in q: return d
     return None
 
-def fs_upsert_watch(chat_id: str, url: str, sec: int):
+def fs_upsert_watch(chat_id: str, url: str, sec: int) -> Tuple[str, bool, Optional[int], str]:
     if not FS_OK:
         raise RuntimeError("Firestore not available")
     url_c = canonicalize_url(url)
@@ -1796,17 +1825,39 @@ def fs_upsert_watch(chat_id: str, url: str, sec: int):
     now = datetime.now(timezone.utc)
     doc = fs_get_task_by_canon(chat_id, url_c)
     if doc:
-        fs_client.collection(COL).document(doc.id).update({
-            "period": sec, "enabled": True, "updated_at": now,
-        })
-        return doc.to_dict()["id"], False
+        doc_data = doc.to_dict() if hasattr(doc, "to_dict") else {}
+        prev_period: Optional[int] = None
+        if isinstance(doc_data, dict):
+            try:
+                prev_period = int(doc_data.get("period")) if doc_data.get("period") is not None else None
+            except Exception:
+                prev_period = None
+        updates = {
+            "period": sec,
+            "enabled": True,
+            "updated_at": now,
+        }
+        if not isinstance(doc_data, dict) or doc_data.get("url") != url:
+            updates["url"] = url
+        if not isinstance(doc_data, dict) or doc_data.get("url_canon") != url_c:
+            updates["url_canon"] = url_c
+        fs_client.collection(COL).document(doc.id).update(updates)
+        task_id = doc_data.get("id") if isinstance(doc_data, dict) else None
+        if not task_id:
+            fallback_id = getattr(doc, "id", None)
+            task_id = fallback_id or make_task_id()
+            try:
+                fs_client.collection(COL).document(doc.id).set({"id": task_id}, merge=True)
+            except Exception:
+                pass
+        return task_id, False, prev_period, url_c
     tid = make_task_id()
     fs_client.collection(COL).add({
         "id": tid, "chat_id": chat_id, "url": url, "url_canon": url_c,
         "period": sec, "enabled": True, "created_at": now, "updated_at": now,
         "last_sig": "", "last_total": 0, "last_ok": False, "next_run_at": now,
     })
-    return tid, True
+    return tid, True, None, url_c
 
 def fs_list(chat_id: str, show: str = "on"):
     if not FS_OK:
@@ -1939,9 +1990,16 @@ def handle_command(text: str, chat_id: str):
         if cmd == "/watch" and len(parts) >= 2:
             url = parts[1].strip()
             sec = int(parts[2]) if len(parts) >= 3 and parts[2].isdigit() else DEFAULT_PERIOD_SEC
-            tid, created = fs_upsert_watch(chat_id, url, sec)
-            status = "啟用" if created else "更新"
-            msg = f"你的任務：\n{tid}｜{status}｜{sec}s\n{canonicalize_url(url)}"
+            tid, created, prev_period, canon = fs_upsert_watch(chat_id, url, sec)
+            status = "啟用" if created else "監看中"
+            lines = ["你的任務：", f"{tid}｜{status}｜{sec}s"]
+            if not created:
+                if prev_period and prev_period != sec:
+                    lines.append(f"（已將監看秒數由 {prev_period}s 更新為 {sec}s）")
+                else:
+                    lines.append("（該任務已在監看清單中）")
+            lines.append(canon)
+            msg = "\n".join(lines)
             return [TextSendMessage(text=msg)] if HAS_LINE else [msg]
 
         if cmd == "/unwatch" and len(parts) >= 2:
