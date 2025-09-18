@@ -2702,6 +2702,58 @@ def liff_unwatch():
     return jsonify({"ok": True, "taskId": task_id}), 200
 
 
+@app.route("/liff/resolve_task", methods=["POST"])
+def liff_resolve_task():
+    if not FS_OK:
+        return jsonify({"ok": False, "error": "firestore not available"}), 503
+
+    data = request.get_json(silent=True) or {}
+    chat_id = str(data.get("chatId", "")).strip()
+    url = str(data.get("url", "")).strip()
+    if not chat_id or not url:
+        return jsonify({"ok": False, "error": "chatId and url are required"}), 400
+
+    try:
+        url_canon = canonicalize_url(url)
+    except Exception as e:
+        app.logger.info(f"/liff/resolve_task canon error: {e}")
+        return jsonify({"ok": False, "error": "invalid url"}), 400
+
+    try:
+        doc = fs_get_task_by_canon(chat_id, url_canon)
+    except Exception as e:
+        app.logger.error(f"/liff/resolve_task lookup error: {e}")
+        return jsonify({"ok": False, "error": str(e)}), 500
+
+    if not doc:
+        return jsonify({"ok": False, "error": "task not found", "urlCanon": url_canon}), 404
+
+    doc_data = {}
+    try:
+        doc_data = doc.to_dict() if hasattr(doc, "to_dict") else {}
+    except Exception:
+        doc_data = {}
+    if not isinstance(doc_data, dict):
+        doc_data = {}
+
+    preview = _task_preview(doc_data)
+    if "enabled" not in preview:
+        preview["enabled"] = bool(doc_data.get("enabled", True))
+    else:
+        preview["enabled"] = bool(preview.get("enabled"))
+
+    task_id = preview.get("id") or doc_data.get("id") or getattr(doc, "id", "")
+    if task_id:
+        preview["id"] = task_id
+
+    return jsonify({
+        "ok": True,
+        "taskId": task_id,
+        "task": preview,
+        "urlCanon": url_canon,
+    }), 200
+
+
 # ====== 替換：/liff/activities 以多來源 fallback（優先輪播） ======
 @app.route("/liff/activities", methods=["GET"])
 def liff_activities():

@@ -46,6 +46,7 @@ var MIN_SEC = 15;
 var API_ACTIVITIES = API_BASE + "/activities";
 var API_TASKS = API_BASE + "/tasks";
 var API_UNWATCH = API_BASE + "/unwatch";
+var API_RESOLVE = API_BASE + "/resolve_task";
 
 var params = new URLSearchParams(window.location.search);
 
@@ -213,6 +214,10 @@ var MODE_CONFIG = {
     stopBusyLabel: "送出中…",
     stopSuccessAlert: "已送出停止監看指令！",
     stopFallbackAlert: "已停用任務，但未能傳送聊天訊息，請確認 LIFF 權限。",
+    stopNotFoundAlert: "此活動無監看",
+    stopPlaceholderCommand: "/unwatch NONE00",
+    stopPlaceholderNotice: "此活動無監看，請查看聊天室回覆。",
+    stopDisabledAlert: "此活動目前沒有啟用中的監看任務，請查看聊天室回覆。",
     stopSendError: "無法送出停止指令",
     stopErrorAlert: "停用失敗",
     stopOutsideHint: "請從 LINE 對話中開啟此功能，才能停止監看。",
@@ -295,6 +300,7 @@ CONFIG.stopCommandBuilder = (typeof CONFIG.stopCommandBuilder === "function") ? 
 var TASK_STATUS = normalizeStatus(mergedParam("status") || CONFIG.defaultStatus || "on");
 var reloadFn = function(){};
 var chatId = null;
+var chatIdPromise = null;
 
 var titleEl = document.getElementById("pageTitle");
 var hintEl = document.getElementById("modeHint");
@@ -378,6 +384,28 @@ function sendUnwatch(taskId){
   });
 }
 
+function resolveTaskByUrl(url){
+  if (!chatId) return Promise.reject(new Error("missing chatId"));
+  return fetch(API_RESOLVE, {
+    method: "POST",
+    credentials: "include",
+    mode: "cors",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ chatId: chatId, url: url })
+  }).then(function(res){
+    return res.json().catch(function(){ return {}; }).then(function(body){
+      if (!res.ok || !body.ok){
+        var msg = (body && body.error) ? body.error : ("HTTP " + res.status);
+        var err = new Error(msg);
+        err.status = res.status;
+        err.body = body;
+        throw err;
+      }
+      return body;
+    });
+  });
+}
+
 function el(tag, cls, html){
   var d = document.createElement(tag);
   if (cls) d.className = cls;
@@ -453,8 +481,22 @@ function renderActivities(acts){
 
     if (CONFIG.buttonLabel){
       var btn = el("button", null, CONFIG.buttonLabel);
-      btn.onclick = function(){ handleActivityAction(url, btn); };
+      btn.onclick = function(){ handleActivityAction(url, btn, it); };
       row.appendChild(btn);
+    }
+
+    if (MODE === "watch"){
+      var stopCfg = MODE_CONFIG.stop || {};
+      var stopLabel = stopCfg.stopButtonLabel || "🛑 停止監看";
+      var stopBtn = el("button", "danger", stopLabel);
+      stopBtn.onclick = function(){ handleStopByUrl(url, stopBtn, it); };
+      row.appendChild(stopBtn);
+
+      var quickCfg = MODE_CONFIG.check || {};
+      var quickLabel = quickCfg.buttonLabel || "👀 快速查看";
+      var quickBtn = el("button", null, quickLabel);
+      quickBtn.onclick = function(){ handleQuickCheck(url, quickBtn); };
+      row.appendChild(quickBtn);
     }
 
     card.appendChild(row);
@@ -527,7 +569,7 @@ function renderTasks(tasks){
   });
 }
 
-function handleActivityAction(url, btn){
+function handleActivityAction(url, btn, activity){
   if (!url){
     alert("此活動沒有可用的 URL，無法操作。");
     return;
@@ -573,6 +615,163 @@ function handleActivityAction(url, btn){
     }
     alert(msg);
   }).finally(finish);
+}
+
+function handleQuickCheck(url, btn){
+  if (!url){
+    alert("此活動沒有可用的 URL，無法操作。");
+    return;
+  }
+  var quickCfg = MODE_CONFIG.check || {};
+  var builder = (typeof quickCfg.commandBuilder === "function") ? quickCfg.commandBuilder : function(u){ return "/check " + u; };
+  var text = builder(url);
+  if (!text){
+    alert("無法建立指令，請稍後再試。");
+    return;
+  }
+
+  var original = btn.textContent;
+  btn.disabled = true;
+  btn.textContent = quickCfg.busyLabel || "查詢中…";
+
+  var finish = function(){
+    btn.disabled = false;
+    btn.textContent = original;
+  };
+
+  if (!liff.isInClient()){
+    if (typeof quickCfg.onOutsideLine === "function"){
+      quickCfg.onOutsideLine(url);
+    } else {
+      alert("請從 LINE 內開啟此頁，以便送出指令。");
+    }
+    finish();
+    return;
+  }
+
+  liff.sendMessages([{ type: "text", text: text }]).then(function(){
+    if (quickCfg.successAlert){
+      alert(quickCfg.successAlert);
+    }
+    if (typeof quickCfg.onSuccess === "function"){
+      quickCfg.onSuccess(url);
+    } else {
+      try { liff.closeWindow(); } catch (e) {}
+    }
+  }).catch(function(err){
+    console.error(err);
+    var detail = (err && err.message) ? err.message : err;
+    var msg = "送訊息或開啟頁面失敗：" + detail;
+    if (detail && String(detail).toLowerCase().indexOf("permission is not in liff app scope") !== -1){
+      msg += "\n\n請前往 LINE Developers > LIFF 設定加入 chat_message.write 權限，並重新發佈 LIFF / rich menu。";
+    }
+    alert(msg);
+  }).finally(finish);
+}
+
+function sendPlaceholderUnwatch(stopCfg, notice){
+  var cfg = stopCfg || {};
+  var placeholder = cfg.stopPlaceholderCommand || "/unwatch NONE00";
+  return liff.sendMessages([{ type: "text", text: placeholder }]).then(function(){
+    var msg = notice || cfg.stopPlaceholderNotice || cfg.stopNotFoundAlert || "此活動無監看";
+    alert(msg);
+  });
+}
+
+function handleStopByUrl(url, btn, activity){
+  if (!url){
+    alert("此活動沒有可用的 URL，無法操作。");
+    return;
+  }
+  var stopCfg = MODE_CONFIG.stop || {};
+  var original = btn.textContent;
+  btn.disabled = true;
+  btn.textContent = stopCfg.stopBusyLabel || "處理中…";
+
+  var finish = function(){
+    btn.disabled = false;
+    btn.textContent = original;
+  };
+
+  if (!liff.isInClient()){
+    if (stopCfg.stopOutsideHint){
+      alert(stopCfg.stopOutsideHint);
+    } else {
+      alert("請從 LINE 對話中開啟此功能，才能停止監看。");
+    }
+    finish();
+    return;
+  }
+
+  ensureChatContext().then(function(){
+    return resolveTaskByUrl(url);
+  }).then(function(payload){
+    var task = (payload && payload.task) ? payload.task : null;
+    if (!task || !task.id){
+      return sendPlaceholderUnwatch(stopCfg).finally(finish);
+    }
+
+    if (task.enabled === false){
+      return sendPlaceholderUnwatch(stopCfg, stopCfg.stopDisabledAlert || stopCfg.stopPlaceholderNotice).finally(finish);
+    }
+
+    var taskId = task.id;
+    var confirmMsg = stopCfg.stopConfirmMessage || "";
+    if (confirmMsg){
+      confirmMsg = confirmMsg.replace(/\{id\}/g, taskId);
+      var title = (task.title || (activity && activity.title) || "");
+      if (title){
+        confirmMsg = confirmMsg.replace(/\{title\}/g, title);
+      }
+      if (!confirm(confirmMsg)){
+        finish();
+        return;
+      }
+    }
+
+    var command = "/unwatch " + taskId;
+    liff.sendMessages([{ type: "text", text: command }]).then(function(){
+      var okMsg = stopCfg.stopSuccessAlert ? stopCfg.stopSuccessAlert.replace(/\{id\}/g, taskId) : "已送出停止監看指令！";
+      alert(okMsg);
+    }).catch(function(err){
+      console.error(err);
+      var detail = (err && err.message) ? err.message : err;
+      var msg = (stopCfg.stopSendError || "無法送出停止指令") + "：" + detail;
+      if (detail && String(detail).toLowerCase().indexOf("permission is not in liff app scope") !== -1){
+        msg += "\n\n請前往 LINE Developers > LIFF 設定加入 chat_message.write 權限，並重新發佈 LIFF / rich menu。";
+      }
+      alert(msg);
+      if (stopCfg.stopUseApiFallback === false){
+        return;
+      }
+      sendUnwatch(taskId).then(function(){
+        if (stopCfg.stopFallbackAlert){
+          alert(stopCfg.stopFallbackAlert.replace(/\{id\}/g, taskId));
+        } else {
+          alert("已停用任務，但未能傳送聊天訊息。請稍後確認。");
+        }
+      }).catch(function(apiErr){
+        console.error(apiErr);
+        var detail2 = (apiErr && apiErr.message) ? apiErr.message : apiErr;
+        var failMsg = (stopCfg.stopErrorAlert || "停用失敗") + "：" + detail2;
+        alert(failMsg);
+      });
+    }).finally(finish);
+  }).catch(function(err){
+    console.error(err);
+    if (err && err.status === 404){
+      sendPlaceholderUnwatch(stopCfg).catch(function(sendErr){
+        console.error(sendErr);
+        var detail = (sendErr && sendErr.message) ? sendErr.message : sendErr;
+        var msg = (stopCfg.stopSendError || "無法送出停止指令") + "：" + detail;
+        alert(msg);
+      }).finally(finish);
+      return;
+    }
+    var detailMsg = (err && err.message) ? err.message : err;
+    alert(detailMsg || "停止監看失敗，請稍後再試。");
+    finish();
+  });
 }
 
 function handleStopTask(task, btn){
@@ -701,6 +900,32 @@ function resolveChatId(ctx, profile){
   }
 }
 
+function ensureChatContext(){
+  if (chatId) return Promise.resolve(chatId);
+  if (chatIdPromise) return chatIdPromise;
+  if (!liff.isInClient()){
+    return Promise.reject(new Error("請從 LINE 對話中開啟此功能。"));
+  }
+  chatIdPromise = new Promise(function(resolve, reject){
+    var ctx = null;
+    try { ctx = liff.getContext(); } catch (e) { ctx = null; }
+    liff.getProfile().then(function(profile){
+      var id = resolveChatId(ctx, profile);
+      if (!id){
+        reject(new Error("找不到聊天 ID，請重新開啟此功能。"));
+        return;
+      }
+      chatId = id;
+      resolve(chatId);
+    }).catch(function(err){
+      reject(err);
+    });
+  }).finally(function(){
+    chatIdPromise = null;
+  });
+  return chatIdPromise;
+}
+
 function loadActivities(){
   setOut("讀取活動清單中…");
   fetchActs().then(function(acts){
@@ -738,10 +963,7 @@ function boot(){
         showListMessage("需要從 LINE 開啟", "請回到與機器人的聊天視窗後再點選此功能。");
         return;
       }
-      var ctx = null;
-      try { ctx = liff.getContext(); } catch (e) { ctx = null; }
-      liff.getProfile().then(function(profile){
-        chatId = resolveChatId(ctx, profile);
+      ensureChatContext().then(function(){
         if (!chatId){
           setOut("找不到聊天資訊，請從 LINE 對話中重新開啟。");
           showListMessage("找不到聊天 ID", "請回到 LINE 對話中重新開啟此功能。");
@@ -761,6 +983,9 @@ function boot(){
       setOut("提示：請從 LINE 內開啟此頁，以便直接把指令送回聊天室。");
     } else {
       setOut("");
+      ensureChatContext().catch(function(err){
+        console.warn("chat context init failed", err);
+      });
     }
     reloadFn = loadActivities;
     loadActivities();
