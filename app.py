@@ -4162,8 +4162,20 @@ def __nf(e):  # noqa: D401
     print("[NF]", request.method, request.path)
     return jsonify({"error": "not found", "path": request.path}), 404
 
+def _tick_bg(app):
+    with app.app_context():
+        try:
+            run_tick_jobs()  # 這裡做真正的巡檢/抓票/推播
+        except Exception:
+            current_app.logger.exception("tick job failed")
+
 @app.get("/cron/tick")
-def tick():
-    with current_app.app_context():
-        run_tick_jobs()
-    return "ok"
+def cron_tick():
+    app_obj = current_app._get_current_object()
+    threading.Thread(target=_tick_bg, args=(app_obj,), daemon=True).start()
+    return "ok", 200
+
+def http_get(sess, url, **kw):
+    kw.setdefault("timeout", (3.0, 6.0))  # 連線3s/讀取6s
+    kw.setdefault("headers", UA)
+    return sess.get(url, **kw)
