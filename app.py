@@ -181,6 +181,26 @@ _IBON_BREAK_OPEN_UNTIL = 0.0  # timestamp，> now 代表 API 暫停使用
 _IBON_BREAK_COOLDOWN = int(os.getenv("IBON_API_COOLDOWN_SEC", "300"))  # 500 後冷卻秒數（預設 5 分鐘）
 _IBON_API_DISABLED = os.getenv("IBON_API_DISABLE", "0") == "1"  # 緊急開關：1 => 永遠不用 API
 
+def _quick_check_bg(app, payload):
+    # 背景工作一定要有 app context
+    with app.app_context():
+        try:
+            url = payload["url"]              # 這裡做你的抓票/解析/推播
+            # do_fetch_and_push(url)
+        except Exception as e:
+            current_app.logger.exception("quick-bg failed for %s", url)
+
+@app.post("/api/liff/quick-check")
+def quick_check():
+    body = request.get_json(silent=True) or {}
+    if not body.get("url"):
+        return jsonify({"ok": False, "error": "missing url"}), 200
+    # 取出真正 app 物件傳進 thread
+    app_obj = current_app._get_current_object()
+    t = threading.Thread(target=_quick_check_bg, args=(app_obj, body), daemon=True)
+    t.start()
+    return jsonify({"ok": True, "task_id": "QC-XXXXXX"}), 200
+
 def _breaker_open_now() -> bool:
     return (time.time() < _IBON_BREAK_OPEN_UNTIL) or _IBON_API_DISABLED
 
@@ -870,7 +890,6 @@ _EVENT_DATE_KEYWORDS = (
     "場次",
 )
 
-
 def _normalize_date_text(text: Optional[str]) -> Optional[str]:
     if not text:
         return None
@@ -974,7 +993,9 @@ def _collect_datetime_candidates(lines: List[str]) -> List[Tuple[datetime, bool,
             pending_date = None
             continue
         compact = re.sub(r"\s+", " ", line)
+
         if any(ch in compact for ch in ("~", "～")):
+
             pending_date = None
             continue
         dt_match = _format_datetime_match(_RE_DATE.search(compact))
@@ -1084,6 +1105,31 @@ def _push_detail_to_chat(chat_id: Optional[str], detail: Optional[Dict[str, Any]
             send_text(chat_id, fallback)
     except Exception as exc:
         _get_logger().error(f"[push] failed to deliver result: {exc}")
+
+
+
+def _spawn_background_worker(name: str, target, *args, **kwargs) -> bool:
+    try:
+        threading.Thread(target=target, args=args, kwargs=kwargs, daemon=True, name=name).start()
+        return True
+    except Exception as exc:
+        app.logger.exception(f"[background] unable to start {name}: {exc}")
+        return False
+
+
+def _push_detail_to_chat(chat_id: Optional[str], detail: Optional[Dict[str, Any]], fallback: Optional[str] = None, extra_text: Optional[str] = None):
+    if not chat_id:
+        return
+    try:
+        if isinstance(detail, dict):
+            payload = dict(detail)
+            send_text(chat_id, fmt_result_text(payload))
+            if extra_text:
+                send_text(chat_id, extra_text)
+        elif fallback:
+            send_text(chat_id, fallback)
+    except Exception as exc:
+        app.logger.error(f"[push] failed to deliver result: {exc}")
 
 
 def sess_default() -> requests.Session:
@@ -1196,7 +1242,6 @@ def _unwrap_go_ticket_url(u: str) -> Optional[str]:
 
     return None
 
-
 def _resolve_utk_url(
     activity_id: Optional[str],
     pattern: Optional[str],
@@ -1243,6 +1288,7 @@ def _resolve_utk_url(
                     headers=headers,
                     allow_redirects=True,
                     timeout=6,
+
                 )
                 status = resp.status_code
                 request_url = resp.url
@@ -1261,6 +1307,7 @@ def _resolve_utk_url(
                             if candidate and "UTK0201_000" in candidate.upper():
                                 resolved = candidate
                                 break
+
                 else:
                     reason = f"http={status}"
             except Exception as exc:
@@ -1576,11 +1623,13 @@ def fetch_from_ticket_details(details_url: str, sess: requests.Session) -> Dict[
     html_lines: List[str] = []
     api_dt_values: List[Tuple[str, int]] = []
     try:
+
         resp = sess.get(details_url, timeout=6)
         if resp.status_code == 200:
             detail_html = _decode_ibon_html(resp)
     except Exception as exc:
         _get_logger().info(f"[details] fetch fail: {exc}")
+
 
     def _abs_url(u: Optional[str]) -> Optional[str]:
         if not u:
@@ -1793,6 +1842,7 @@ def fetch_from_ticket_details(details_url: str, sess: requests.Session) -> Dict[
 
             ticket_urls.extend(_extract_ticket_urls_from_text(detail_html))
         except Exception as e:
+
             _get_logger().info(f"[details] parse err: {e}")
 
     # 透過內容文字補齊場地
@@ -2330,7 +2380,9 @@ def try_fetch_livemap_by_perf(perf_id: str, sess: requests.Session, html: Option
                 if r.status_code == 200:
                     html = _decode_ibon_html(r)
                     if "<area" in html:
+
                         _get_logger().info(f"[livemap] hit {url}")
+
                         return _parse_livemap_text(html)
             except Exception as e:
                 _get_logger().info(f"[livemap] miss {url}: {e}")
@@ -2377,12 +2429,16 @@ def parse_UTK0201_000(url: str, sess: requests.Session, referer: Optional[str] =
         "Accept-Language": "zh-TW,zh;q=0.9,en;q=0.6",
     }
     headers["Referer"] = referer or url
+
     r = sess.get(url, headers=headers, timeout=6)
+
     if r.status_code != 200:
         out["msg"] = f"讀取失敗（HTTP {r.status_code}）"
         return out
     html = _decode_ibon_html(r)
+
     summary_info = _extract_utk_summary_from_html(html)
+
 
     q = parse_qs(urlparse(url).query)
     perf_id = (q.get("PERFORMANCE_ID") or [None])[0]
@@ -2569,6 +2625,7 @@ def parse_UTK0201_000(url: str, sess: requests.Session, referer: Optional[str] =
     else:
         out["tickets"] = tickets
 
+
     sig_base = hash_state(human_numeric, selling_names)
     out["sig"] = hashlib.md5((sig_base + ("|SO" if sold_out else "")).encode("utf-8")).hexdigest()
 
@@ -2696,7 +2753,9 @@ def _probe_activity_details(url: str, sess: requests.Session, trace: Optional[Li
             for ticket_url in ticket_candidates:
                 start_parse = time.time()
                 try:
+
                     parsed = parse_UTK0201_000(ticket_url, sess, referer=details_url_clean)
+
                 except Exception as e:
                     if trace is not None:
                         trace.append({
@@ -2706,7 +2765,9 @@ def _probe_activity_details(url: str, sess: requests.Session, trace: Optional[Li
                             "elapsed_ms": int((time.time() - start_parse) * 1000),
                             "reason": str(e),
                         })
+
                     _get_logger().info(f"[probe] parse ticket fail {ticket_url}: {e}")
+
                     continue
                 if not isinstance(parsed, dict):
                     if trace is not None:
@@ -3079,10 +3140,12 @@ def handle_command(text: str, chat_id: str):
 
 def webhook():
     if not (HAS_LINE and handler):
+
         _get_logger().warning("Webhook invoked but handler not ready")
         return jsonify({"ok": True}), 200
     signature = request.headers.get("X-Line-Signature", "")
     body = request.get_data(as_text=True)
+
 
     def _handle_async(app_obj: Flask, payload: str, sig: str) -> None:
         try:
@@ -3660,6 +3723,40 @@ def _build_probe_detail_payload(data: Optional[Dict[str, Any]]) -> Optional[Dict
         payload["status_text"] = msg
     return payload
 
+def _background_watch_job(chat_id: Optional[str], url: str, task_id: str, created: bool, period: int) -> None:
+    status_line = f"任務 {task_id} 已{'建立' if created else '更新'}，每 {period} 秒監看。"
+    fallback = f"{status_line} 但目前無法取得票券資訊。"
+    try:
+        detail = _maybe_probe(url)
+    except Exception as exc:  # pragma: no cover - network failure path
+        app.logger.error(f"[watch-bg] probe failed for {url}: {exc}")
+        if chat_id:
+            send_text(chat_id, f"{status_line} 查詢失敗：{exc}")
+        return
+
+    if isinstance(detail, dict):
+        payload = dict(detail)
+        payload.setdefault("task_id", task_id)
+        _push_detail_to_chat(chat_id, payload, extra_text=status_line)
+    else:
+        _push_detail_to_chat(chat_id, None, fallback=fallback)
+
+
+def _background_unwatch_job(chat_id: Optional[str], url: Optional[str], task_id: str) -> None:
+    status_line = f"任務 {task_id} 已停止監看。"
+    detail = None
+    if url:
+        try:
+            detail = _maybe_probe(url)
+        except Exception as exc:  # pragma: no cover - network failure path
+            app.logger.info(f"[unwatch-bg] probe failed for {url}: {exc}")
+            detail = None
+    if isinstance(detail, dict):
+        payload = dict(detail)
+        payload.setdefault("task_id", task_id)
+        _push_detail_to_chat(chat_id, payload, extra_text=status_line)
+    else:
+        _push_detail_to_chat(chat_id, None, fallback=status_line)
 
 def _background_watch_job(app_obj: Flask, chat_id: Optional[str], url: str, task_id: str, created: bool, period: int) -> None:
     logger = app_obj.logger
@@ -3701,12 +3798,15 @@ def _background_unwatch_job(app_obj: Flask, chat_id: Optional[str], url: Optiona
 
 def _background_quick_check_job(app_obj: Flask, chat_id: Optional[str], url: str, task_id: str) -> None:
     logger = app_obj.logger
+
     status_line = f"快速查看任務 {task_id} 已完成。"
     fallback = f"{status_line} 但目前無法取得票券資訊。"
     try:
         detail = _maybe_probe(url)
     except Exception as exc:  # pragma: no cover - network failure path
+
         logger.error(f"[quick-bg] probe failed for {url}: {exc}")
+
         if chat_id:
             send_text(chat_id, f"快速查看任務 {task_id} 失敗：{exc}")
         return
@@ -3717,7 +3817,6 @@ def _background_quick_check_job(app_obj: Flask, chat_id: Optional[str], url: str
         _push_detail_to_chat(chat_id, payload, extra_text=status_line)
     else:
         _push_detail_to_chat(chat_id, None, fallback=fallback)
-
 
 def _collect_liff_items(limit: int, keyword: Optional[str], only_concert: bool, mode: str, debug: bool) -> tuple[List[Dict[str, Any]], str, List[Dict[str, Any]]]:
     trace: List[Dict[str, Any]] = []
@@ -3770,6 +3869,32 @@ def _collect_liff_items(limit: int, keyword: Optional[str], only_concert: bool, 
                 data = _probe_activity_details(details_url, sess, trace=item_trace)
             except Exception as exc:
                 _get_logger().info(f"[liff_api] enrich fail {details_url}: {exc}")
+                if item_trace is not None:
+                    item_trace.append({"phase": "error", "reason": str(exc)})
+                continue
+            base_image = base.get("image_url") or base.get("image")
+            if base_image and not data.get("image"):
+                data["image"] = base_image
+                data["image_url"] = base_image
+            if item_trace:
+                data["trace"] = item_trace
+            enriched.append(data)
+        if enriched:
+            items = enriched
+            trace.append({"phase": "enrich", "count": len(items)})
+
+    if items:
+        sess = sess_default()
+        enriched: List[Dict[str, Any]] = []
+        for base in items:
+            details_url = base.get("details_url") or base.get("url")
+            if not isinstance(details_url, str) or not details_url:
+                continue
+            item_trace: Optional[List[Dict[str, Any]]] = [] if debug else None
+            try:
+                data = _probe_activity_details(details_url, sess, trace=item_trace)
+            except Exception as exc:
+                app.logger.info(f"[liff_api] enrich fail {details_url}: {exc}")
                 if item_trace is not None:
                     item_trace.append({"phase": "error", "reason": str(exc)})
                 continue
@@ -3852,7 +3977,9 @@ def watch():
     try:
         task_id, created = fs_upsert_watch(chat_id, url, sec)
     except Exception as exc:  # pragma: no cover - Firestore runtime errors
+
         _get_logger().error(f"/api/liff/watch error: {exc}")
+
         return jsonify({"ok": False, "error": str(exc)}), 200
 
     message = f"任務 {task_id} 已{'建立' if created else '更新'}，每 {sec} 秒監看，稍後會推送最新票券資訊。"
@@ -3908,7 +4035,9 @@ def unwatch():
         try:
             doc = fs_get_task_by_canon(chat_id, canonicalize_url(url))
         except Exception as exc:
+
             _get_logger().error(f"/api/liff/unwatch canonicalize fail: {exc}")
+
             return jsonify({"ok": False, "error": str(exc)}), 200
 
     if doc is None:
@@ -3924,11 +4053,14 @@ def unwatch():
     try:
         disabled = fs_disable(chat_id, task_id)
     except Exception as exc:  # pragma: no cover - Firestore runtime errors
+
         _get_logger().error(f"/api/liff/unwatch disable error: {exc}")
+
         return jsonify({"ok": False, "error": str(exc)}), 200
 
     if not disabled:
         return jsonify({"ok": False, "error": "unable to disable task"}), 200
+
 
     message = f"任務 {task_id} 停止監看中，稍後會推送最新狀態。"
     response: Dict[str, Any] = {"ok": True, "task_id": task_id, "message": message, "queued": True}
@@ -3946,6 +4078,7 @@ def unwatch():
         response["queued"] = False
         response.setdefault("warning", "背景作業啟動失敗，請稍後再試。")
 
+
     return jsonify(response), 200
 
 def _quick_check_impl(url: str, chat_id: Optional[str] = None):
@@ -3962,12 +4095,14 @@ def _quick_check_impl(url: str, chat_id: Optional[str] = None):
         "queued": True,
     }
 
+
     app_obj = current_app._get_current_object()
     if not _spawn_background_worker(
         app_obj,
         "quick-check",
         _background_quick_check_job,
         app_obj,
+
         chat_id,
         url,
         task_id,
@@ -4176,3 +4311,4 @@ def create_app() -> Flask:
 
 
 app = create_app()
+
