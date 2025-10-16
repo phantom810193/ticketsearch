@@ -180,7 +180,7 @@
       const CONFIG = window.LIFF_CONFIG || {};
       const LIFF_ID = CONFIG.liffId || "";
       const API_ROOT = CONFIG.apiRoot || "/api/liff";
-      const STATUS_API = CONFIG.statusApi || "/liff/watch_status";
+      const STATUS_API = CONFIG.statusApi || "/api/liff/status";
       const LIMIT = Math.max(1, Math.min(50, Number(CONFIG.limit) || 20));
       const PLACEHOLDER_IMAGE = CONFIG.placeholderImage ||
         "data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='640' height='360'><rect width='640' height='360' fill='%23f0f1f6'/><text x='50%' y='50%' dominant-baseline='middle' text-anchor='middle' font-size='28' font-family='Arial' fill='%23896a9'>暫無圖片</text></svg>";
