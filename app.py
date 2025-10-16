@@ -48,6 +48,26 @@ _IBON_BREAK_OPEN_UNTIL = 0.0  # timestamp，> now 代表 API 暫停使用
 _IBON_BREAK_COOLDOWN = int(os.getenv("IBON_API_COOLDOWN_SEC", "300"))  # 500 後冷卻秒數（預設 5 分鐘）
 _IBON_API_DISABLED = os.getenv("IBON_API_DISABLE", "0") == "1"  # 緊急開關：1 => 永遠不用 API
 
+def _quick_check_bg(app, payload):
+    # 背景工作一定要有 app context
+    with app.app_context():
+        try:
+            url = payload["url"]              # 這裡做你的抓票/解析/推播
+            # do_fetch_and_push(url)
+        except Exception as e:
+            current_app.logger.exception("quick-bg failed for %s", url)
+
+@app.post("/api/liff/quick-check")
+def quick_check():
+    body = request.get_json(silent=True) or {}
+    if not body.get("url"):
+        return jsonify({"ok": False, "error": "missing url"}), 200
+    # 取出真正 app 物件傳進 thread
+    app_obj = current_app._get_current_object()
+    t = threading.Thread(target=_quick_check_bg, args=(app_obj, body), daemon=True)
+    t.start()
+    return jsonify({"ok": True, "task_id": "QC-XXXXXX"}), 200
+
 def _breaker_open_now() -> bool:
     return (time.time() < _IBON_BREAK_OPEN_UNTIL) or _IBON_API_DISABLED
 
@@ -4141,3 +4161,9 @@ def __whoami():
 def __nf(e):  # noqa: D401
     print("[NF]", request.method, request.path)
     return jsonify({"error": "not found", "path": request.path}), 404
+
+@app.get("/cron/tick")
+def tick():
+    with current_app.app_context():
+        run_tick_jobs()
+    return "ok"
