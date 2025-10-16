@@ -148,6 +148,36 @@ function fetchWatchStatus(chatId, urls){
   });
 }
 
+function fetchWatchStatus(chatId, urls){
+  if (!chatId || !Array.isArray(urls) || urls.length === 0) return Promise.resolve({});
+  var unique = [];
+  var seen = {};
+  urls.forEach(function(u){
+    if (typeof u !== "string") return;
+    var val = u.trim();
+    if (!val || seen[val]) return;
+    seen[val] = true;
+    unique.push(val);
+  });
+  if (unique.length === 0) return Promise.resolve({});
+
+  return fetch(STATUS_API, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    credentials: "include",
+    mode: "cors",
+    body: JSON.stringify({ chatId: chatId, urls: unique })
+  }).then(function(res){
+    if (!res.ok) throw new Error("HTTP " + res.status);
+    return res.json();
+  }).then(function(body){
+    return body && body.results ? body.results : {};
+  }).catch(function(err){
+    console.error("watch_status error", err);
+    return {};
+  });
+}
+
 function el(tag, cls, html){
   var d = document.createElement(tag);
   if (cls) d.className = cls;

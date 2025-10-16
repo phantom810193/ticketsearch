@@ -436,6 +436,10 @@ from google.cloud import firestore
 
 # ===== Flask & CORS =====
 app = Flask(__name__)
+try:
+    app.url_map.strict_slashes = False
+except Exception:
+    pass
 
 # === Browser helper: Selenium → Playwright fallback ===
 def _run_js_with_fallback(url: str, js_func_literal: str):
@@ -1860,6 +1864,8 @@ def handle_command(text: str, chat_id: str):
 
 # ============= Webhook / Scheduler / Diag =============
 @app.route("/webhook", methods=["POST"])
+@app.route("/line/webhook", methods=["POST"])
+@app.route("/callback", methods=["POST"])
 def webhook():
     if not (HAS_LINE and handler):
         app.logger.warning("Webhook invoked but handler not ready")
@@ -2334,42 +2340,6 @@ def fetch_ibon_carousel_from_api(limit=10, keyword=None, only_concert=False):
                 headers["X-XSRF-TOKEN"] = token
             continue
         else:
-            app.logger.warning(f"[carousel-api] http={resp.status_code} pattern={pattern} -> open breaker")
-            _API_BREAK_UNTIL = time.time() + 1800
-            return []
-
-        elif resp.status_code in (401, 403, 419):
-            session, token = _prepare_ibon_session()
-            if session is None:
-                break
-            headers = {
-                "Origin": "https://ticket.ibon.com.tw",
-                "Referer": IBON_ENT_URL,
-                "X-Requested-With": "XMLHttpRequest",
-            }
-            if token:
-                headers["X-XSRF-TOKEN"] = token
-            continue
-        else:
-            app.logger.warning(
-                f"[carousel-api] http={resp.status_code} pattern={pattern} -> open breaker"
-            )
-            _API_BREAK_UNTIL = time.time() + 1800
-            return []
-
-        elif resp.status_code in (401, 403, 419):
-            session, token = _prepare_ibon_session()
-            if session is None:
-                break
-            headers = {
-                "Origin": "https://ticket.ibon.com.tw",
-                "Referer": IBON_ENT_URL,
-                "X-Requested-With": "XMLHttpRequest",
-            }
-            if token:
-                headers["X-XSRF-TOKEN"] = token
-            continue
-        else:
             app.logger.warning(
                 f"[carousel-api] http={resp.status_code} pattern={pattern} -> open breaker"
             )
@@ -2616,6 +2586,7 @@ def liff_activities_debug():
 
     return jsonify({"ok": True, "count": 0, "items": [], "trace": trace}), 200
 
+@app.route("/liff", methods=["GET"])
 @app.route("/liff/", methods=["GET"])
 def liff_index():
     return send_from_directory("liff", "index.html")
