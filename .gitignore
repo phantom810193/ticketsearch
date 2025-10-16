@@ -1,0 +1,10 @@
+__pycache__/
+*.pyc
+errors.txt
+errors.json
+trace.txt
+trace.json
+*.bak.*
+wsgi.py.bak.*
+app.py.bak.*
+Dockerfile.bak.*
