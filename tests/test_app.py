@@ -69,6 +69,16 @@ def test_collect_datetime_candidates_filters_sale():
     assert candidates and candidates[0][0].year == 2024
     assert candidates[0][0].month == 6
 
+def test_collect_datetime_candidates_skips_ranges():
+    lines = [
+        "演出日期：2024/07/01 19:30",
+        "演出時間 2024/07/01 19:30 ~ 21:30",
+        "活動時間 2024/07/02 14:00",
+    ]
+    candidates = _collect_datetime_candidates(lines)
+    assert candidates
+    for _, _, raw in candidates:
+        assert "~" not in raw and "～" not in raw
 
 def test_parse_price_value_handles_currency():
     assert _parse_price_value("票價 NT$2,800") == 2800
@@ -83,4 +93,7 @@ def test_api_liff_quick_check(client):
 def test_watch_endpoints_no_firestore(client, endpoint):
     payload = {"chat_id": "test", "url": "https://example.com", "period": 60}
     resp = client.post(endpoint, data=json.dumps(payload), content_type="application/json")
-    _assert_status(resp, {200, 401, 403, 503})
+    _assert_status(resp, {200})
+    data = resp.get_json()
+    assert isinstance(data, dict)
+    assert data.get("ok") is False

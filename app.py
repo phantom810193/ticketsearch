@@ -7,6 +7,7 @@ import uuid
 import base64
 import hashlib
 import logging
+import threading
 import traceback
 import requests
 from datetime import datetime, timezone, timedelta
@@ -16,7 +17,6 @@ from flask import (
     Flask,
     jsonify,
     request,
-    abort,
     send_from_directory,
     Blueprint,
     current_app,
@@ -793,6 +793,17 @@ _RE_DATE = re.compile(
 )
 _RE_AREA_TAG = re.compile(r"<area\b[^>]*>", re.I)
 _SALE_KEYWORDS = ("售票", "販售", "銷售", "開賣", "購票")
+_EVENT_DATE_KEYWORDS = (
+    "演出",
+    "活動",
+    "日期",
+    "時間",
+    "Time",
+    "Date",
+    "開演",
+    "場次",
+)
+
 
 
 def _normalize_date_text(text: Optional[str]) -> Optional[str]:
@@ -898,7 +909,9 @@ def _collect_datetime_candidates(lines: List[str]) -> List[Tuple[datetime, bool,
             pending_date = None
             continue
         compact = re.sub(r"\s+", " ", line)
-        if "~" in compact and len(re.findall(r"\d{4}", compact)) >= 2:
+
+        if any(ch in compact for ch in ("~", "～")):
+
             pending_date = None
             continue
         dt_match = _format_datetime_match(_RE_DATE.search(compact))
@@ -1132,41 +1145,27 @@ def _resolve_utk_url(
                     base_url,
                     params=query,
                     headers=headers,
-                    allow_redirects=False,
+                    allow_redirects=True,
                     timeout=12,
                 )
                 status = resp.status_code
                 request_url = resp.url
 
-                if status in (301, 302, 303, 307, 308):
-                    location = resp.headers.get("Location") or ""
-                    candidate = _unwrap_go_ticket_url(location) or urljoin(IBON_HOST, location)
-                    if candidate and "UTK0201_000" in candidate.upper():
-                        resolved = candidate
-                    elif candidate:
-                        try:
-                            follow = sess.get(
-                                candidate,
-                                headers=headers,
-                                allow_redirects=True,
-                                timeout=12,
-                            )
-                            request_url = follow.url or candidate
-                            status = follow.status_code
-                            if follow.url and "UTK0201_000" in follow.url.upper():
-                                resolved = follow.url
-                            else:
-                                urls = _extract_ticket_urls_from_text(follow.text)
-                                if urls:
-                                    resolved = urls[0]
-                        except Exception as follow_exc:
-                            reason = str(follow_exc)
-                    else:
-                        reason = "redirect-missing-location"
-                elif status == 200:
+                final_url = resp.url or ""
+                if final_url and "UTK0201_000" in final_url.upper():
+                    resolved = final_url
+                elif 200 <= status < 400:
                     urls = _extract_ticket_urls_from_text(resp.text)
                     if urls:
                         resolved = urls[0]
+                    elif resp.history:
+                        for hist in reversed(resp.history):
+                            loc = hist.headers.get("Location") or ""
+                            candidate = _unwrap_go_ticket_url(loc) or urljoin(IBON_HOST, loc)
+                            if candidate and "UTK0201_000" in candidate.upper():
+                                resolved = candidate
+                                break
+
                 else:
                     reason = f"http={status}"
             except Exception as exc:
@@ -1478,6 +1477,17 @@ def fetch_from_ticket_details(details_url: str, sess: requests.Session) -> Dict[
     pattern = (parse_qs(parsed_details.query).get("pattern", ["ENTERTAINMENT"])[0] or "ENTERTAINMENT").strip() or "ENTERTAINMENT"
     out["pattern"] = pattern
 
+    detail_html: Optional[str] = None
+    html_lines: List[str] = []
+    api_dt_values: List[Tuple[str, int]] = []
+    try:
+        resp = sess.get(details_url, timeout=12)
+        if resp.status_code == 200:
+            detail_html = _decode_ibon_html(resp)
+    except Exception as exc:
+        app.logger.info(f"[details] fetch fail: {exc}")
+
+
     def _abs_url(u: Optional[str]) -> Optional[str]:
         if not u:
             return None
@@ -1573,22 +1583,18 @@ def fetch_from_ticket_details(details_url: str, sess: requests.Session) -> Dict[
         if place:
             out.setdefault("place", place)
 
-        start_dt = (
-            _format_api_dt(api_item.get("ActivityShowFrom"))
-            or _format_api_dt(api_item.get("ActivityTicketSDate"))
-            or _format_api_dt(api_item.get("ActivitySDate"))
-        )
-        end_dt = (
-            _format_api_dt(api_item.get("ActivityShowTo"))
-            or _format_api_dt(api_item.get("ActivityTicketEDate"))
-            or _format_api_dt(api_item.get("ActivityEDate"))
-        )
-        if start_dt and end_dt and start_dt != end_dt:
-            out.setdefault("dt", f"{start_dt} ~ {end_dt}")
-        elif start_dt:
-            out.setdefault("dt", start_dt)
-        elif end_dt:
-            out.setdefault("dt", end_dt)
+        show_from = _format_api_dt(api_item.get("ActivityShowFrom"))
+        show_to = _format_api_dt(api_item.get("ActivityShowTo"))
+        if show_from:
+            api_dt_values.append((show_from, 0))
+        if show_to:
+            api_dt_values.append((show_to, 0))
+        event_start = _format_api_dt(api_item.get("ActivitySDate"))
+        event_end = _format_api_dt(api_item.get("ActivityEDate"))
+        if event_start:
+            api_dt_values.append((event_start, 1))
+        if event_end:
+            api_dt_values.append((event_end, 1))
 
         content_html = api_item.get("ActivityContent") or ""
         if content_html:
@@ -1632,7 +1638,70 @@ def fetch_from_ticket_details(details_url: str, sess: requests.Session) -> Dict[
             except Exception as e:
                 app.logger.info(f"[details-api] content parse err: {e}")
 
-    # 透過內容文字補齊場地與時間
+    if detail_html:
+        try:
+            soup = soup_parse(detail_html)
+            html_lines = [ln.strip() for ln in soup.get_text("\n").split("\n") if ln.strip()]
+            if html_lines:
+                seen_lines = set(content_lines)
+                for line in html_lines:
+                    if line not in seen_lines:
+                        content_lines.append(line)
+                        seen_lines.add(line)
+            for idx, line in enumerate(html_lines):
+                if "地址" in line or "Address" in line:
+                    candidate = line.split("：", 1)[-1].strip()
+                    if candidate:
+                        text_address_candidates.append(candidate)
+                if any(key in line for key in ("地點", "場地", "演出地點", "活動地點")):
+                    candidate = line.split("：", 1)[-1].strip() if "：" in line else line
+                    if candidate:
+                        text_venue_candidates.append(candidate)
+                    if idx + 1 < len(html_lines):
+                        nxt = html_lines[idx + 1].strip()
+                        if nxt and not any(k in nxt for k in ("日期", "時間", "價", "售票")):
+                            text_venue_candidates.append(nxt)
+
+            if not out.get("poster"):
+                for sel in [
+                    'meta[property="og:image:secure_url"]',
+                    'meta[property="og:image"]',
+                    'meta[name="twitter:image"]',
+                ]:
+                    m = soup.select_one(sel)
+                    if m and m.get("content"):
+                        out["poster"] = urljoin(details_url, m["content"].strip())
+                        break
+                if not out.get("poster"):
+                    for img in soup.find_all("img"):
+                        src = (img.get("src") or "").strip()
+                        if src and any(k in src.lower() for k in ("activityimage", "azureedge", "banner", "cover", "adimage")):
+                            out["poster"] = urljoin(details_url, src)
+                            break
+
+            if not out.get("title"):
+                h1 = soup.select_one("h1")
+                if h1:
+                    t = h1.get_text(" ", strip=True)
+                    if t:
+                        out["title"] = t
+                if not out.get("title") and soup.title and soup.title.text:
+                    t = soup.title.get_text(" ", strip=True)
+                    if t:
+                        out["title"] = t
+
+            if not out.get("place"):
+                title_html, place_html, _ = extract_title_place_from_html(detail_html)
+                if place_html:
+                    out["place"] = place_html
+                if title_html and not out.get("title"):
+                    out["title"] = title_html
+
+            ticket_urls.extend(_extract_ticket_urls_from_text(detail_html))
+        except Exception as e:
+            app.logger.info(f"[details] parse err: {e}")
+
+    # 透過內容文字補齊場地
     if content_lines:
         if not out.get("place"):
             for idx, line in enumerate(content_lines):
@@ -1653,79 +1722,6 @@ def fetch_from_ticket_details(details_url: str, sess: requests.Session) -> Dict[
                         break
                     if out.get("place"):
                         break
-        if not out.get("dt"):
-            for line in content_lines:
-                dt_text = _format_datetime_match(_RE_DATE.search(line))
-                if dt_text:
-                    out["dt"] = dt_text
-                    break
-
-    # HTML 備援：若關鍵資訊仍缺，才去抓整頁
-    need_html = not all(out.get(k) for k in ("title", "poster", "dt", "place"))
-    if need_html:
-        try:
-            r = sess.get(details_url, timeout=12)
-            if r.status_code == 200:
-                html = _decode_ibon_html(r)
-                soup = soup_parse(html)
-                fallback_lines = [ln.strip() for ln in soup.get_text("\n").split("\n") if ln.strip()]
-                for line in fallback_lines:
-                    if line not in content_lines:
-                        content_lines.append(line)
-                for idx, line in enumerate(fallback_lines):
-                    if "地址" in line or "Address" in line:
-                        candidate = line.split("：", 1)[-1].strip()
-                        if candidate:
-                            text_address_candidates.append(candidate)
-                    if any(key in line for key in ("地點", "場地", "演出地點", "活動地點")):
-                        candidate = line.split("：", 1)[-1].strip() if "：" in line else line
-                        if candidate:
-                            text_venue_candidates.append(candidate)
-                        if idx + 1 < len(fallback_lines):
-                            nxt = fallback_lines[idx + 1].strip()
-                            if nxt and not any(k in nxt for k in ("日期", "時間", "票價", "售票")):
-                                text_venue_candidates.append(nxt)
-
-                if not out.get("poster"):
-                    for sel in [
-                        'meta[property="og:image:secure_url"]',
-                        'meta[property="og:image"]',
-                        'meta[name="twitter:image"]',
-                    ]:
-                        m = soup.select_one(sel)
-                        if m and m.get("content"):
-                            out["poster"] = urljoin(details_url, m["content"].strip())
-                            break
-                    if not out.get("poster"):
-                        for img in soup.find_all("img"):
-                            src = (img.get("src") or "").strip()
-                            if src and any(k in src.lower() for k in ("activityimage", "azureedge", "banner", "cover", "adimage")):
-                                out["poster"] = urljoin(details_url, src)
-                                break
-
-                if not out.get("title"):
-                    h1 = soup.select_one("h1")
-                    if h1:
-                        t = h1.get_text(" ", strip=True)
-                        if t:
-                            out["title"] = t
-
-                if not out.get("dt"):
-                    tx = soup.get_text(" ", strip=True)
-                    dt_text = _format_datetime_match(_RE_DATE.search(tx))
-                    if dt_text:
-                        out["dt"] = dt_text
-
-                if not out.get("place"):
-                    title_html, place_html, _ = extract_title_place_from_html(html)
-                    if place_html:
-                        out["place"] = place_html
-                    if title_html and not out.get("title"):
-                        out["title"] = title_html
-
-                ticket_urls.extend(_extract_ticket_urls_from_text(html))
-        except Exception as e:
-            app.logger.info(f"[details] fetch fail: {e}")
 
     def _ensure_https(url: Optional[str]) -> Optional[str]:
         if not url:
@@ -1759,6 +1755,8 @@ def fetch_from_ticket_details(details_url: str, sess: requests.Session) -> Dict[
     out["poster"] = final_image
     out["image_url"] = final_image
 
+
+    # datetime candidates derived from API values and page text
     dt_candidates: List[Tuple[int, datetime, bool]] = []
 
     def _add_dt_candidate(raw: Optional[str], priority: int):
@@ -1768,21 +1766,20 @@ def fetch_from_ticket_details(details_url: str, sess: requests.Session) -> Dict[
         if dt_obj:
             dt_candidates.append((priority, dt_obj, has_time))
 
-    if api_item:
-        _add_dt_candidate(_format_api_dt(api_item.get("ActivityShowFrom")), 0)
-        _add_dt_candidate(_format_api_dt(api_item.get("ActivityShowTo")), 0)
-        _add_dt_candidate(_format_api_dt(api_item.get("ActivitySDate")), 1)
-        _add_dt_candidate(_format_api_dt(api_item.get("ActivityEDate")), 1)
-        _add_dt_candidate(_format_api_dt(api_item.get("ActivityTicketSDate")), 5)
-        _add_dt_candidate(_format_api_dt(api_item.get("ActivityTicketEDate")), 5)
+    for raw, priority in api_dt_values:
+        _add_dt_candidate(raw, priority)
 
-    for dt_obj, has_time, _ in _collect_datetime_candidates(content_lines):
-        dt_candidates.append((1, dt_obj, has_time))
-
-    raw_dt = out.get("dt") if isinstance(out.get("dt"), str) else None
-    if raw_dt:
-        first_part = raw_dt.split("~", 1)[0].strip()
-        _add_dt_candidate(first_part, 3)
+    for dt_obj, has_time, line_text in _collect_datetime_candidates(content_lines):
+        if not line_text:
+            dt_candidates.append((2, dt_obj, has_time))
+            continue
+        if _is_sale_context(line_text):
+            continue
+        line_priority = 2
+        lower_line = line_text.lower()
+        if any(keyword.lower() in lower_line for keyword in _EVENT_DATE_KEYWORDS):
+            line_priority = 0
+        dt_candidates.append((line_priority, dt_obj, has_time))
 
     seen_dt: set[tuple] = set()
     dedup_dt: List[Tuple[int, datetime, bool]] = []
@@ -2166,9 +2163,14 @@ def fetch_area_left_from_utk0101(base_000_url: str, perf_id: str, product_id: st
         return None
 
 # --------- 主要解析器 ---------
-def parse_UTK0201_000(url: str, sess: requests.Session) -> dict:
+def parse_UTK0201_000(url: str, sess: requests.Session, referer: Optional[str] = None) -> dict:
     out = {"ok": False, "sig": "NA", "url": url, "image": LOGO}
-    r = sess.get(url, timeout=15)
+    headers = {
+        "User-Agent": UA,
+        "Accept-Language": "zh-TW,zh;q=0.9,en;q=0.6",
+    }
+    headers["Referer"] = referer or url
+    r = sess.get(url, headers=headers, timeout=15)
     if r.status_code != 200:
         out["msg"] = f"讀取失敗（HTTP {r.status_code}）"
         return out
@@ -2456,7 +2458,9 @@ def _probe_activity_details(url: str, sess: requests.Session, trace: Optional[Li
             for ticket_url in ticket_candidates:
                 start_parse = time.time()
                 try:
-                    parsed = parse_UTK0201_000(ticket_url, sess)
+
+                    parsed = parse_UTK0201_000(ticket_url, sess, referer=details_url_clean)
+
                 except Exception as e:
                     if trace is not None:
                         trace.append({
@@ -2840,15 +2844,24 @@ def handle_command(text: str, chat_id: str):
 def webhook():
     if not (HAS_LINE and handler):
         app.logger.warning("Webhook invoked but handler not ready")
-        return "OK", 200
+        return jsonify({"ok": True}), 200
     signature = request.headers.get("X-Line-Signature", "")
     body = request.get_data(as_text=True)
+
+    def _handle_async():
+        try:
+            handler.handle(body, signature)
+        except InvalidSignatureError:
+            app.logger.warning("InvalidSignature on /webhook")
+        except Exception as exc:
+            app.logger.exception(f"/webhook handler error: {exc}")
+
     try:
-        handler.handle(body, signature)
-    except InvalidSignatureError:
-        app.logger.warning("InvalidSignature on /webhook")
-        abort(400)
-    return "OK", 200
+        threading.Thread(target=_handle_async, daemon=True).start()
+    except Exception as exc:
+        app.logger.exception(f"/webhook thread error: {exc}")
+        return jsonify({"ok": False}), 200
+    return jsonify({"ok": True}), 200
 
 if HAS_LINE and handler:
 
@@ -3569,17 +3582,17 @@ def watch():
     sec = max(15, sec)
 
     if not chat_id:
-        return jsonify({"ok": False, "error": "missing chat_id"}), 400
+        return jsonify({"ok": False, "error": "missing chat_id"}), 200
     if not url:
-        return jsonify({"ok": False, "error": "missing url"}), 400
+        return jsonify({"ok": False, "error": "missing url"}), 200
     if not FS_OK:
-        return jsonify({"ok": False, "error": FS_ERROR_MSG or "watch service unavailable"}), 503
+        return jsonify({"ok": False, "error": FS_ERROR_MSG or "watch service unavailable"}), 200
 
     try:
         task_id, created = fs_upsert_watch(chat_id, url, sec)
     except Exception as exc:  # pragma: no cover - Firestore runtime errors
         current_app.logger.error(f"/api/liff/watch error: {exc}")
-        return jsonify({"ok": False, "error": str(exc)}), 500
+        return jsonify({"ok": False, "error": str(exc)}), 200
 
     detail: Optional[Dict[str, Any]] = None
     try:
@@ -3618,11 +3631,11 @@ def unwatch():
     ).strip()
 
     if not chat_id:
-        return jsonify({"ok": False, "error": "missing chat_id"}), 400
+        return jsonify({"ok": False, "error": "missing chat_id"}), 200
     if not task_code and not url:
-        return jsonify({"ok": False, "error": "missing url"}), 400
+        return jsonify({"ok": False, "error": "missing url"}), 200
     if not FS_OK:
-        return jsonify({"ok": False, "error": FS_ERROR_MSG or "watch service unavailable"}), 503
+        return jsonify({"ok": False, "error": FS_ERROR_MSG or "watch service unavailable"}), 200
 
     doc = None
     if task_code:
@@ -3632,7 +3645,7 @@ def unwatch():
             doc = fs_get_task_by_canon(chat_id, canonicalize_url(url))
         except Exception as exc:
             current_app.logger.error(f"/api/liff/unwatch canonicalize fail: {exc}")
-            return jsonify({"ok": False, "error": str(exc)}), 500
+            return jsonify({"ok": False, "error": str(exc)}), 200
 
     if doc is None:
         return jsonify({"ok": False, "reason": "no_watch", "message": "此活動目前沒有監看任務。"}), 200
@@ -3642,16 +3655,16 @@ def unwatch():
     target_url = url or data.get("url") or ""
 
     if not task_id:
-        return jsonify({"ok": False, "error": "missing task id"}), 500
+        return jsonify({"ok": False, "error": "missing task id"}), 200
 
     try:
         disabled = fs_disable(chat_id, task_id)
     except Exception as exc:  # pragma: no cover - Firestore runtime errors
         current_app.logger.error(f"/api/liff/unwatch disable error: {exc}")
-        return jsonify({"ok": False, "error": str(exc)}), 500
+        return jsonify({"ok": False, "error": str(exc)}), 200
 
     if not disabled:
-        return jsonify({"ok": False, "error": "unable to disable task"}), 500
+        return jsonify({"ok": False, "error": "unable to disable task"}), 200
 
     detail: Optional[Dict[str, Any]] = None
     if target_url:
@@ -3679,7 +3692,7 @@ def _quick_check_impl(url: str):
         detail = _maybe_probe(url)
     except Exception as exc:  # pragma: no cover - probe network errors
         current_app.logger.error(f"/api/liff/quick-check error: {exc}")
-        return jsonify({"ok": False, "error": str(exc)}), 500
+        return jsonify({"ok": False, "error": str(exc)}), 200
 
     response: Dict[str, Any] = {"ok": True, "detail": detail}
     if isinstance(detail, dict):
