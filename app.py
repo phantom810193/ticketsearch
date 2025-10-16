@@ -2590,7 +2590,6 @@ def _collect_liff_items(limit: int, keyword: Optional[str], only_concert: bool, 
 
     return items or [], actual_mode, trace
 
-
 def _read_json_payload() -> Dict[str, Any]:
     try:
         payload = request.get_json(silent=True) or {}
@@ -2599,7 +2598,6 @@ def _read_json_payload() -> Dict[str, Any]:
     if not isinstance(payload, dict):
         payload = {}
     return payload
-
 
 def _maybe_probe(url: str) -> Optional[Dict[str, Any]]:
     if not url:
