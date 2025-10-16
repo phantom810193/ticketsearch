@@ -13,6 +13,8 @@ from app import (  # noqa: E402
     _clean_venue_text,
     _collect_datetime_candidates,
     _parse_price_value,
+    _interpret_utk_status,
+
 )
 
 
@@ -87,6 +89,15 @@ def test_parse_price_value_handles_currency():
 def test_api_liff_quick_check(client):
     resp = client.get("/api/liff/quick-check", query_string={"url": "https://example.com"})
     _assert_status(resp, {200})
+    data = resp.get_json()
+    assert isinstance(data, dict)
+    assert "task_id" in data
+
+
+def test_interpret_utk_status_mappings():
+    assert _interpret_utk_status("剩餘 20 張") == (20, "可售")
+    assert _interpret_utk_status("熱賣中") == (None, "熱賣中")
+    assert _interpret_utk_status("已售完") == (0, "已售完")
 
 
 @pytest.mark.parametrize("endpoint", ["/api/liff/watch", "/api/liff/unwatch"])

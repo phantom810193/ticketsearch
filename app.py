@@ -804,8 +804,6 @@ _EVENT_DATE_KEYWORDS = (
     "場次",
 )
 
-
-
 def _normalize_date_text(text: Optional[str]) -> Optional[str]:
     if not text:
         return None
@@ -991,6 +989,31 @@ def send_image(to_id: str, img_url: str):
     except Exception as e:
         app.logger.error(f"[LINE] push image failed: {e}")
 
+
+def _spawn_background_worker(name: str, target, *args, **kwargs) -> bool:
+    try:
+        threading.Thread(target=target, args=args, kwargs=kwargs, daemon=True, name=name).start()
+        return True
+    except Exception as exc:
+        app.logger.exception(f"[background] unable to start {name}: {exc}")
+        return False
+
+
+def _push_detail_to_chat(chat_id: Optional[str], detail: Optional[Dict[str, Any]], fallback: Optional[str] = None, extra_text: Optional[str] = None):
+    if not chat_id:
+        return
+    try:
+        if isinstance(detail, dict):
+            payload = dict(detail)
+            send_text(chat_id, fmt_result_text(payload))
+            if extra_text:
+                send_text(chat_id, extra_text)
+        elif fallback:
+            send_text(chat_id, fallback)
+    except Exception as exc:
+        app.logger.error(f"[push] failed to deliver result: {exc}")
+
+
 def sess_default() -> requests.Session:
     s = requests.Session()
     s.headers.update({
@@ -1146,7 +1169,8 @@ def _resolve_utk_url(
                     params=query,
                     headers=headers,
                     allow_redirects=True,
-                    timeout=12,
+                    timeout=6,
+
                 )
                 status = resp.status_code
                 request_url = resp.url
@@ -1353,6 +1377,7 @@ def fetch_game_info_from_api(perf_id: Optional[str], product_id: Optional[str], 
                 add_payload(ActivityID=act, SystemBrowseType=browse, hasDeadline=has_deadline)
                 add_payload(ActivityId=act, SystemBrowseType=browse, hasDeadline=has_deadline)
 
+
     add_payload()
 
     picked: Dict[str, str] = {}
@@ -1481,12 +1506,13 @@ def fetch_from_ticket_details(details_url: str, sess: requests.Session) -> Dict[
     html_lines: List[str] = []
     api_dt_values: List[Tuple[str, int]] = []
     try:
-        resp = sess.get(details_url, timeout=12)
+
+        resp = sess.get(details_url, timeout=6)
+
         if resp.status_code == 200:
             detail_html = _decode_ibon_html(resp)
     except Exception as exc:
         app.logger.info(f"[details] fetch fail: {exc}")
-
 
     def _abs_url(u: Optional[str]) -> Optional[str]:
         if not u:
@@ -1755,7 +1781,6 @@ def fetch_from_ticket_details(details_url: str, sess: requests.Session) -> Dict[
     out["poster"] = final_image
     out["image_url"] = final_image
 
-
     # datetime candidates derived from API values and page text
     dt_candidates: List[Tuple[int, datetime, bool]] = []
 
@@ -1765,6 +1790,7 @@ def fetch_from_ticket_details(details_url: str, sess: requests.Session) -> Dict[
         dt_obj, has_time = _parse_datetime_string(raw)
         if dt_obj:
             dt_candidates.append((priority, dt_obj, has_time))
+
 
     for raw, priority in api_dt_values:
         _add_dt_candidate(raw, priority)
@@ -2101,6 +2127,120 @@ def _parse_livemap_text(txt: str) -> Tuple[Dict[str, int], int]:
     total = sum(sections.values())
     return sections, total
 
+
+def _interpret_utk_status(text: Optional[str]) -> Tuple[Optional[int], str]:
+    raw = (text or "").strip()
+    if not raw:
+        return None, ""
+
+    digits = [int(m.group(0)) for m in re.finditer(r"\d+", raw) if m.group(0)]
+    if digits:
+        return digits[-1], "可售"
+
+    lowered = raw.lower()
+    if "熱賣" in raw:
+        return None, "熱賣中"
+    if any(kw in lowered for kw in ("已售", "售完", "完售")):
+        return 0, "已售完"
+
+    return None, raw
+
+
+def _extract_utk_summary_from_html(html: str) -> Dict[str, str]:
+    summary: Dict[str, str] = {}
+    try:
+        soup = soup_parse(html)
+    except Exception:
+        return summary
+
+    title_node = soup.select_one("h1") or soup.select_one(".ticketTitle")
+    if title_node:
+        title_text = title_node.get_text(" ", strip=True)
+        if title_text:
+            summary["title"] = title_text
+
+    raw_lines = [ln.strip() for ln in soup.get_text("\n").split("\n") if ln.strip()]
+    lines = raw_lines[:120]
+
+    dt_candidates: List[Tuple[datetime, bool]] = []
+    for dt_obj, has_time, raw in _collect_datetime_candidates(lines):
+        if raw and (_is_sale_context(raw) or any(ch in raw for ch in ("~", "～"))):
+            continue
+        dt_candidates.append((dt_obj, has_time))
+
+    if dt_candidates:
+        dt_candidates.sort(key=lambda item: (item[0], 0 if item[1] else 1))
+        dt_obj, has_time = dt_candidates[0]
+        summary["date"] = dt_obj.strftime("%Y/%m/%d %H:%M") if has_time else dt_obj.strftime("%Y/%m/%d")
+
+    for line in lines:
+        if _is_sale_context(line):
+            continue
+        if any(kw in line for kw in ("演出地點", "活動地點", "演出場地", "活動場地", "地點", "場地")):
+            candidate = line.split("：", 1)[-1].strip() if "：" in line else line
+            cleaned = _clean_venue_text(candidate)
+            if cleaned:
+                summary.setdefault("venue", cleaned)
+                break
+
+    for line in lines:
+        if _is_sale_context(line):
+            continue
+        if "地址" in line:
+            candidate = line.split("：", 1)[-1].strip() if "：" in line else line
+            if candidate:
+                summary.setdefault("address", candidate)
+                break
+
+    return summary
+
+
+def _extract_utk_ticket_rows(html: str) -> List[Dict[str, Any]]:
+    try:
+        soup = soup_parse(html)
+    except Exception:
+        return []
+
+    results: List[Dict[str, Any]] = []
+    for table in soup.find_all("table"):
+        rows = table.find_all("tr")
+        data_rows: List[Dict[str, Any]] = []
+        for tr in rows:
+            cells = tr.find_all("td")
+            if len(cells) < 4:
+                continue
+
+            texts = [cell.get_text(" ", strip=True) for cell in cells[:4]]
+            if not any(texts):
+                continue
+
+            header_blob = "".join(texts[:3])
+            if any(key in header_blob for key in ("區域", "票價", "座位")) and not re.search(r"\d", texts[2]):
+                continue
+
+            area_text = re.sub(r"\s+", " ", texts[1]).strip() or re.sub(r"\s+", " ", texts[0]).strip()
+            price_val = _parse_price_value(texts[2])
+            status_text = texts[3]
+
+            if not area_text and price_val is None and not status_text:
+                continue
+
+            remaining, status = _interpret_utk_status(status_text)
+            entry: Dict[str, Any] = {
+                "area": area_text or "",
+                "price": price_val if isinstance(price_val, int) else 0,
+                "remaining": remaining if remaining is not None else (0 if status == "已售完" else None),
+            }
+            if status:
+                entry["status"] = status
+            data_rows.append(entry)
+
+        if data_rows:
+            results.extend(data_rows)
+
+    return results
+
+
 def try_fetch_livemap_by_perf(perf_id: str, sess: requests.Session, html: Optional[str] = None) -> Tuple[Dict[str, int], int]:
     if not perf_id:
         return {}, 0
@@ -2170,11 +2310,16 @@ def parse_UTK0201_000(url: str, sess: requests.Session, referer: Optional[str] =
         "Accept-Language": "zh-TW,zh;q=0.9,en;q=0.6",
     }
     headers["Referer"] = referer or url
-    r = sess.get(url, headers=headers, timeout=15)
+
+    r = sess.get(url, headers=headers, timeout=6)
+
     if r.status_code != 200:
         out["msg"] = f"讀取失敗（HTTP {r.status_code}）"
         return out
     html = _decode_ibon_html(r)
+
+    summary_info = _extract_utk_summary_from_html(html)
+
 
     q = parse_qs(urlparse(url).query)
     perf_id = (q.get("PERFORMANCE_ID") or [None])[0]
@@ -2215,9 +2360,34 @@ def parse_UTK0201_000(url: str, sess: requests.Session, referer: Optional[str] =
         chosen_img = seatmap if seatmap and _url_ok(seatmap) else LOGO
     out["image"] = chosen_img
 
-    out["title"] = details_info.get("title") or api_info.get("title") or html_title or "（未取到標題）"
-    out["place"] = details_info.get("place") or api_info.get("place") or html_place or "（未取到場地）"
-    out["date"]  = details_info.get("dt")    or api_info.get("dt")    or html_dt    or "（未取到日期）"
+    out["title"] = (
+        summary_info.get("title")
+        or details_info.get("title")
+        or api_info.get("title")
+        or html_title
+        or "（未取到標題）"
+    )
+    out["place"] = (
+        summary_info.get("venue")
+        or details_info.get("place")
+        or api_info.get("place")
+        or html_place
+        or "（未取到場地）"
+    )
+    out["date"] = (
+        summary_info.get("date")
+        or details_info.get("dt")
+        or details_info.get("date")
+        or api_info.get("dt")
+        or html_dt
+        or "（未取到日期）"
+    )
+    if summary_info.get("address"):
+        out["address"] = summary_info["address"]
+    elif details_info.get("address"):
+        out["address"] = details_info["address"]
+    elif api_info.get("address"):
+        out["address"] = api_info["address"]
 
     # 票區中文名 + 狀態（AMOUNT）+ 順序
     area_name_map, area_status_map, area_qty_map, area_order_map, area_price_map = extract_area_meta_from_000(html)
@@ -2329,7 +2499,13 @@ def parse_UTK0201_000(url: str, sess: requests.Session, referer: Optional[str] =
     tickets = sorted(ticket_map.values(), key=lambda t: (t.get("_order", 99999), t["area"], t.get("price", 0)))
     for t in tickets:
         t.pop("_order", None)
-    out["tickets"] = tickets
+
+    table_tickets = _extract_utk_ticket_rows(html)
+    if table_tickets:
+        out["tickets"] = table_tickets
+    else:
+        out["tickets"] = tickets
+
 
     sig_base = hash_state(human_numeric, selling_names)
     out["sig"] = hashlib.md5((sig_base + ("|SO" if sold_out else "")).encode("utf-8")).hexdigest()
@@ -3457,6 +3633,61 @@ def _build_probe_detail_payload(data: Optional[Dict[str, Any]]) -> Optional[Dict
         payload["status_text"] = msg
     return payload
 
+def _background_watch_job(chat_id: Optional[str], url: str, task_id: str, created: bool, period: int) -> None:
+    status_line = f"任務 {task_id} 已{'建立' if created else '更新'}，每 {period} 秒監看。"
+    fallback = f"{status_line} 但目前無法取得票券資訊。"
+    try:
+        detail = _maybe_probe(url)
+    except Exception as exc:  # pragma: no cover - network failure path
+        app.logger.error(f"[watch-bg] probe failed for {url}: {exc}")
+        if chat_id:
+            send_text(chat_id, f"{status_line} 查詢失敗：{exc}")
+        return
+
+    if isinstance(detail, dict):
+        payload = dict(detail)
+        payload.setdefault("task_id", task_id)
+        _push_detail_to_chat(chat_id, payload, extra_text=status_line)
+    else:
+        _push_detail_to_chat(chat_id, None, fallback=fallback)
+
+
+def _background_unwatch_job(chat_id: Optional[str], url: Optional[str], task_id: str) -> None:
+    status_line = f"任務 {task_id} 已停止監看。"
+    detail = None
+    if url:
+        try:
+            detail = _maybe_probe(url)
+        except Exception as exc:  # pragma: no cover - network failure path
+            app.logger.info(f"[unwatch-bg] probe failed for {url}: {exc}")
+            detail = None
+    if isinstance(detail, dict):
+        payload = dict(detail)
+        payload.setdefault("task_id", task_id)
+        _push_detail_to_chat(chat_id, payload, extra_text=status_line)
+    else:
+        _push_detail_to_chat(chat_id, None, fallback=status_line)
+
+
+def _background_quick_check_job(chat_id: Optional[str], url: str, task_id: str) -> None:
+    status_line = f"快速查看任務 {task_id} 已完成。"
+    fallback = f"{status_line} 但目前無法取得票券資訊。"
+    try:
+        detail = _maybe_probe(url)
+    except Exception as exc:  # pragma: no cover - network failure path
+        app.logger.error(f"[quick-bg] probe failed for {url}: {exc}")
+        if chat_id:
+            send_text(chat_id, f"快速查看任務 {task_id} 失敗：{exc}")
+        return
+
+    if isinstance(detail, dict):
+        payload = dict(detail)
+        payload.setdefault("task_id", task_id)
+        _push_detail_to_chat(chat_id, payload, extra_text=status_line)
+    else:
+        _push_detail_to_chat(chat_id, None, fallback=fallback)
+
+
 
 def _collect_liff_items(limit: int, keyword: Optional[str], only_concert: bool, mode: str, debug: bool) -> tuple[List[Dict[str, Any]], str, List[Dict[str, Any]]]:
     trace: List[Dict[str, Any]] = []
@@ -3594,28 +3825,28 @@ def watch():
         current_app.logger.error(f"/api/liff/watch error: {exc}")
         return jsonify({"ok": False, "error": str(exc)}), 200
 
-    detail: Optional[Dict[str, Any]] = None
-    try:
-        detail = _maybe_probe(url)
-    except Exception as exc:  # pragma: no cover - probe network errors
-        current_app.logger.info(f"/api/liff/watch probe failed: {exc}")
-
-    message = f"任務 {task_id} 已{'建立' if created else '更新'}，每 {sec} 秒監看。"
+    message = f"任務 {task_id} 已{'建立' if created else '更新'}，每 {sec} 秒監看，稍後會推送最新票券資訊。"
     response: Dict[str, Any] = {
         "ok": True,
         "task_id": task_id,
         "created": created,
         "period": sec,
         "message": message,
-        "detail": detail,
+        "queued": True,
     }
-    if isinstance(detail, dict):
-        remain_val = detail.get("remain")
-        if isinstance(remain_val, int):
-            response["remain"] = remain_val
-        status_text = detail.get("status_text")
-        if isinstance(status_text, str):
-            response["status_text"] = status_text
+
+    if not _spawn_background_worker(
+        "watch-probe",
+        _background_watch_job,
+        chat_id,
+        url,
+        task_id,
+        created,
+        sec,
+    ):
+        response["queued"] = False
+        response.setdefault("warning", "背景作業啟動失敗，請稍後再試。")
+
     return jsonify(response), 200
 
 @liff_api_bp.post("/unwatch")
@@ -3666,54 +3897,60 @@ def unwatch():
     if not disabled:
         return jsonify({"ok": False, "error": "unable to disable task"}), 200
 
-    detail: Optional[Dict[str, Any]] = None
-    if target_url:
-        try:
-            detail = _maybe_probe(target_url)
-        except Exception as exc:  # pragma: no cover - probe network errors
-            current_app.logger.info(f"/api/liff/unwatch probe failed: {exc}")
+    message = f"任務 {task_id} 停止監看中，稍後會推送最新狀態。"
+    response: Dict[str, Any] = {"ok": True, "task_id": task_id, "message": message, "queued": True}
 
-    response: Dict[str, Any] = {"ok": True, "task_id": task_id, "message": "stopped", "detail": detail}
-    if isinstance(detail, dict):
-        remain_val = detail.get("remain")
-        if isinstance(remain_val, int):
-            response["remain"] = remain_val
-        status_text = detail.get("status_text")
-        if isinstance(status_text, str):
-            response["status_text"] = status_text
+    if not _spawn_background_worker(
+        "unwatch-probe",
+        _background_unwatch_job,
+        chat_id,
+        target_url,
+        task_id,
+    ):
+        response["queued"] = False
+        response.setdefault("warning", "背景作業啟動失敗，請稍後再試。")
+
     return jsonify(response), 200
 
-def _quick_check_impl(url: str):
+def _quick_check_impl(url: str, chat_id: Optional[str] = None):
     url = (url or "").strip()
     if not url:
         return jsonify({"ok": False, "error": "missing url"}), 200
 
-    try:
-        detail = _maybe_probe(url)
-    except Exception as exc:  # pragma: no cover - probe network errors
-        current_app.logger.error(f"/api/liff/quick-check error: {exc}")
-        return jsonify({"ok": False, "error": str(exc)}), 200
+    task_id = f"QC-{uuid.uuid4().hex[:6].upper()}"
+    message = f"快速查看任務 {task_id} 已送出，稍後會推送結果。"
+    response: Dict[str, Any] = {
+        "ok": True,
+        "task_id": task_id,
+        "message": message,
+        "queued": True,
+    }
 
-    response: Dict[str, Any] = {"ok": True, "detail": detail}
-    if isinstance(detail, dict):
-        remain_val = detail.get("remain")
-        if isinstance(remain_val, int):
-            response["remain"] = remain_val
-        status_text = detail.get("status_text")
-        if isinstance(status_text, str):
-            response["status_text"] = status_text
-        # 這裡改成回傳 /check <url>，前端就會把這段直接送到聊天室
-        response["message"] = f"/check {detail.get('url') or url}"
+    if not _spawn_background_worker(
+        "quick-check",
+        _background_quick_check_job,
+        chat_id,
+        url,
+        task_id,
+    ):
+        response["queued"] = False
+        response["ok"] = False
+        response.setdefault("warning", "背景作業啟動失敗，請稍後再試。")
+
     return jsonify(response), 200
 
 @liff_api_bp.get("/quick-check")
 def quick_check_get():
-    return _quick_check_impl(request.args.get("url"))
+    return _quick_check_impl(
+        request.args.get("url"),
+        request.args.get("chat_id") or request.args.get("chatId"),
+    )
 
 @liff_api_bp.post("/quick-check")
 def quick_check_post():
     payload = _read_json_payload()
-    return _quick_check_impl(payload.get("url"))
+    chat_id = payload.get("chat_id") or payload.get("chatId")
+    return _quick_check_impl(payload.get("url"), chat_id)
 
 app.register_blueprint(liff_api_bp)
 
