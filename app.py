@@ -2068,4 +2068,54 @@ def netcheck():
     return jsonify({"results": out})
 
 if __name__ == "__main__":
-    app.run(host="0.0.0.0", port=int(os.getenv("PORT", "8080")))
+    app.run(host="0.0.0.0", port=int(os.getenv("PORT", "8080")))# --- Health & Root routes (auto-added) ---
+try:
+    import os, socket, datetime, subprocess
+    from flask import jsonify
+    from flask import Flask  # 若已匯入會被覆蓋無害
+    def _git_sha():
+        try:
+            return (os.environ.get("COMMIT_SHA")
+                    or subprocess.check_output(["git","rev-parse","--short","HEAD"], timeout=1).decode().strip())
+        except Exception:
+            return None
+
+    @app.get("/")
+    def _root():
+        return ("ticketsearch backend is running. Try /healthz or /liff/activities?debug=1\n",
+                200, {"Content-Type":"text/plain; charset=utf-8"})
+
+    @app.get("/healthz")
+    def _healthz():
+        return jsonify({
+            "status":"ok",
+            "service":"ticketsearch",
+            "time": datetime.datetime.utcnow().isoformat()+"Z",
+            "host": socket.gethostname(),
+            "region": os.environ.get("REGION","asia-east1"),
+            "project": os.environ.get("GOOGLE_CLOUD_PROJECT") or os.environ.get("PROJECT_ID"),
+            "revision": os.environ.get("K_REVISION"),
+            "commit": _git_sha(),
+        }), 200
+except Exception as _e:
+    # 不讓健康檢查的附加程式碼阻斷主服務
+    pass
+
+# === minimal health & root ===
+try:
+    from flask import jsonify
+except Exception:
+    pass
+
+try:
+    _r = app  # 若你的 app 實例叫 app
+    @_r.get("/healthz")
+    def _healthz():
+        return jsonify(status="ok", source="app.py"), 200
+
+    @_r.get("/")
+    def _root():
+        return jsonify(ok=True, source="app.py"), 200
+except Exception as _e:
+    # 若此檔沒有 app 實例而是用 create_app()，可忽略這段
+    pass
