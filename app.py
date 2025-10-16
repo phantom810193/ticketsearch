@@ -9,6 +9,7 @@ import hashlib
 import logging
 import threading
 import traceback
+import sys
 import requests
 from datetime import datetime, timezone, timedelta
 from typing import Dict, Tuple, Optional, Any, List
@@ -22,10 +23,142 @@ from flask import (
     current_app,
 )
 
-app = Flask(__name__)
-app.url_map.strict_slashes = False
-
 liff_api_bp = Blueprint("liff_api", __name__, url_prefix="/api/liff")
+main_bp = Blueprint("main", __name__)
+
+
+def _get_logger() -> logging.Logger:
+    try:
+        return current_app.logger  # type: ignore[return-value]
+    except Exception:
+        return logging.getLogger("ticketsearch")
+
+
+ALLOWED_ORIGINS: List[str] = []
+line_bot_api: Optional["LineBotApi"] = None  # type: ignore[name-defined]
+handler: Optional["WebhookHandler"] = None  # type: ignore[name-defined]
+DEFAULT_PERIOD_SEC: int = 60
+ALWAYS_NOTIFY: bool = False
+FOLLOW_AREAS_PER_CHECK: int = 0
+PROMO_IMAGE_MAP: Dict[str, str] = {}
+PROMO_DETAILS_MAP: Dict[str, str] = {}
+fs_client: Optional["firestore.Client"] = None  # type: ignore[name-defined]
+FS_OK: bool = False
+FS_ERROR_MSG: str = ""
+MAX_PER_TICK: int = 6
+TICK_SOFT_DEADLINE_SEC: int = 50
+COL = "watchers"
+
+
+def _initialize_globals(app: Flask) -> None:
+    global ALLOWED_ORIGINS, line_bot_api, handler, DEFAULT_PERIOD_SEC, ALWAYS_NOTIFY
+    global FOLLOW_AREAS_PER_CHECK, PROMO_IMAGE_MAP, PROMO_DETAILS_MAP
+    global fs_client, FS_OK, FS_ERROR_MSG, MAX_PER_TICK, TICK_SOFT_DEADLINE_SEC
+
+    allowed_env = os.getenv("ALLOWED_ORIGINS", "https://liff.line.me")
+    ALLOWED_ORIGINS = [o.strip() for o in allowed_env.split(",") if o.strip()]
+
+    try:  # pragma: no cover - optional dependency path
+        from flask_cors import CORS  # type: ignore
+
+        CORS(
+            app,
+            resources={r"/liff/*": {"origins": ALLOWED_ORIGINS}},
+            supports_credentials=True,
+        )
+    except Exception as exc:  # pragma: no cover - optional dependency path
+        app.logger.warning(f"flask-cors not available: {exc}")
+        logging.basicConfig(level=os.getenv("LOG_LEVEL", "INFO"))
+        app.logger.setLevel(logging.INFO)
+
+    DEFAULT_PERIOD_SEC = int(os.getenv("DEFAULT_PERIOD_SEC", "60"))
+    ALWAYS_NOTIFY = os.getenv("ALWAYS_NOTIFY", "0") == "1"
+    FOLLOW_AREAS_PER_CHECK = int(os.getenv("FOLLOW_AREAS_PER_CHECK", "0"))
+    MAX_PER_TICK = int(os.getenv("MAX_PER_TICK", "6"))
+    TICK_SOFT_DEADLINE_SEC = int(os.getenv("TICK_SOFT_DEADLINE_SEC", "50"))
+
+    try:
+        PROMO_IMAGE_MAP = json.loads(os.getenv("PROMO_IMAGE_MAP", "{}"))
+    except Exception:
+        PROMO_IMAGE_MAP = {}
+
+    try:
+        PROMO_DETAILS_MAP = json.loads(os.getenv("PROMO_DETAILS_MAP", "{}"))
+    except Exception:
+        PROMO_DETAILS_MAP = {}
+
+    token = os.getenv("LINE_CHANNEL_ACCESS_TOKEN", "")
+    secret = os.getenv("LINE_CHANNEL_SECRET", "")
+    if not token or not secret:
+        app.logger.warning("LINE env not set: LINE_CHANNEL_ACCESS_TOKEN / LINE_CHANNEL_SECRET")
+
+    if HAS_LINE and token:
+        line_bot_api = LineBotApi(token)
+    else:
+        line_bot_api = None
+
+    if HAS_LINE and secret:
+        handler = WebhookHandler(secret)
+    else:
+        handler = None
+
+    FS_ERROR_MSG = ""
+    FS_OK = False
+    fs_client = None
+    try:
+        fs_client = firestore.Client()
+        FS_OK = True
+        FS_ERROR_MSG = ""
+    except (DefaultCredentialsError, Forbidden) as exc:
+        FS_OK = False
+        FS_ERROR_MSG = "watch service unavailable"
+        app.logger.warning(f"Firestore init failed (auth/permission): {exc}")
+    except GoogleAPIError as exc:  # pragma: no cover - optional dependency path
+        FS_OK = False
+        FS_ERROR_MSG = str(exc) or "watch service unavailable"
+        app.logger.warning(f"Firestore init failed: {exc}")
+    except Exception as exc:  # pragma: no cover - defensive fallback
+        FS_OK = False
+        FS_ERROR_MSG = str(exc) or "watch service unavailable"
+        app.logger.warning(f"Firestore init failed: {exc}")
+
+    if HAS_LINE and handler and not getattr(handler, "_ticketsearch_registered", False):
+        _register_line_handlers()
+        setattr(handler, "_ticketsearch_registered", True)
+
+
+def _register_line_handlers() -> None:
+    if not (HAS_LINE and handler):
+        return
+
+    @handler.add(FollowEvent)  # type: ignore[arg-type]
+    def on_follow(ev):
+        try:
+            line_bot_api.reply_message(ev.reply_token, [TextSendMessage(text=WELCOME_TEXT)])
+        except Exception as exc:  # pragma: no cover - push fallback
+            _get_logger().error(f"[follow] reply failed: {exc}")
+
+    @handler.add(JoinEvent)  # type: ignore[arg-type]
+    def on_join(ev):
+        try:
+            line_bot_api.reply_message(ev.reply_token, [TextSendMessage(text=WELCOME_TEXT)])
+        except Exception as exc:  # pragma: no cover - push fallback
+            _get_logger().error(f"[join] reply failed: {exc}")
+
+    @handler.add(MessageEvent, message=TextMessage)  # type: ignore[arg-type]
+    def on_message(ev):
+        raw = getattr(ev.message, "text", "") or ""
+        text = raw.strip()
+        if not is_command(text):
+            _get_logger().info(f"[IGNORED NON-COMMAND] chat={source_id(ev)} text={text!r}")
+            return
+
+        chat = source_id(ev)
+        msgs = handle_command(text, chat)
+        if isinstance(msgs, list) and msgs and not isinstance(msgs[0], str):
+            line_bot_api.reply_message(ev.reply_token, msgs)
+        else:
+            line_bot_api.reply_message(ev.reply_token, [TextSendMessage(text=str(msgs))])
 # --- Browser engines (optional) ---
 try:
     from playwright.sync_api import sync_playwright
@@ -231,7 +364,7 @@ def _prepare_ibon_session() -> Tuple[requests.Session, Optional[str]]:
     try:
         s.get(IBON_ENT_URL, timeout=10)
     except Exception as e:
-        app.logger.info(f"[ibon token] warm-up failed: {e}")
+        _get_logger().info(f"[ibon token] warm-up failed: {e}")
 
     token: Optional[str] = None
     try:
@@ -252,9 +385,9 @@ def _prepare_ibon_session() -> Tuple[requests.Session, Optional[str]]:
                 data = token_resp.text
             token = _extract_xsrf_token(data)
         else:
-            app.logger.info(f"[ibon token] http={token_resp.status_code}")
+            _get_logger().info(f"[ibon token] http={token_resp.status_code}")
     except Exception as e:
-        app.logger.warning(f"[ibon token] err: {e}")
+        _get_logger().warning(f"[ibon token] err: {e}")
 
     if not token:
         token = s.cookies.get("XSRF-TOKEN")
@@ -477,24 +610,24 @@ def fetch_ibon_list_via_api(limit=10, keyword=None, only_concert=False):
                             data = {}
                         status = data.get("StatusCode") if isinstance(data, dict) else None
                         if status not in (None, 0):
-                            app.logger.info(f"[ibon api] status={status} pattern={pattern}")
+                            _get_logger().info(f"[ibon api] status={status} pattern={pattern}")
                         _append_rows(data)
                         break
 
                     if r.status_code in (401, 403, 419):
-                        app.logger.info(f"[ibon api] auth http={r.status_code}, refresh token")
+                        _get_logger().info(f"[ibon api] auth http={r.status_code}, refresh token")
                         session, token = _prepare_ibon_session()
                         continue
 
                     if 500 <= r.status_code < 600:
-                        app.logger.warning(f"[ibon api] http={r.status_code} pattern={pattern} -> open breaker")
+                        _get_logger().warning(f"[ibon api] http={r.status_code} pattern={pattern} -> open breaker")
                         _open_breaker()
                         base_rows = []
                         break
 
-                    app.logger.info(f"[ibon api] http={r.status_code} pattern={pattern}")
+                    _get_logger().info(f"[ibon api] http={r.status_code} pattern={pattern}")
                 except Exception as e:
-                    app.logger.info(f"[ibon api] err: {e}")
+                    _get_logger().info(f"[ibon api] err: {e}")
                 _sleep_backoff(attempt)
 
             if _breaker_open_now():
@@ -585,14 +718,14 @@ def _run_js_with_fallback(url: str, js_func_literal: str):
 
             res = driver.execute_script(f"return ({js_func_literal})();")
             driver.quit()
-            app.logger.info("[browser] Selenium path OK")
+            _get_logger().info("[browser] Selenium path OK")
             return res
         except Exception as e:
             try:
                 driver.quit()
             except Exception:
                 pass
-            app.logger.warning(f"[browser] Selenium failed: {e}")
+            _get_logger().warning(f"[browser] Selenium failed: {e}")
 
     # 2) Playwright fallback
     if _PLAYWRIGHT_AVAILABLE:
@@ -604,10 +737,10 @@ def _run_js_with_fallback(url: str, js_func_literal: str):
                 page.goto(url, wait_until="networkidle")
                 res = page.evaluate(js_func_literal)
                 browser.close()
-            app.logger.info("[browser] Playwright path OK")
+            _get_logger().info("[browser] Playwright path OK")
             return res
         except Exception as e:
-            app.logger.warning(f"[browser] Playwright failed: {e}")
+            _get_logger().warning(f"[browser] Playwright failed: {e}")
 
     # 3) 最後備援：純 requests 抓 HTML 用正則撈 Details（回傳 URL list）
     try:
@@ -622,7 +755,7 @@ def _run_js_with_fallback(url: str, js_func_literal: str):
         seen = set()
         return [u for u in urls if not (u in seen or seen.add(u))]
     except Exception as e:
-        app.logger.error(f"[browser] no engine available and HTML fallback failed: {e}")
+        _get_logger().error(f"[browser] no engine available and HTML fallback failed: {e}")
         return []
 
 def grab_ibon_carousel_urls():
@@ -729,77 +862,10 @@ def _items_from_details_urls(urls: List[str], limit=10, keyword=None, only_conce
             continue
     return items
 
-@app.get("/ibon/carousel")
+@main_bp.get("/ibon/carousel")
 def ibon_carousel():
     urls = grab_ibon_carousel_urls()
     return jsonify({"count": len(urls), "urls": urls})
-
-# 建議：白名單（可多個網域）
-# 建議：白名單用環境變數，逗號分隔
-_ALLOWED_ORIGINS_ENV = os.getenv("ALLOWED_ORIGINS", "https://liff.line.me")
-ALLOWED_ORIGINS = [o.strip() for o in _ALLOWED_ORIGINS_ENV.split(",") if o.strip()]
-
-try:
-    from flask_cors import CORS  # type: ignore
-    CORS(
-        app,
-        resources={r"/liff/*": {"origins": ALLOWED_ORIGINS}},
-        supports_credentials=True,
-    )
-except Exception as e:
-    app.logger.warning(f"flask-cors not available: {e}")
-    logging.basicConfig(level=os.getenv("LOG_LEVEL", "INFO"))
-    app.logger.setLevel(logging.INFO)
-
-# ======== 環境變數 ========
-LINE_CHANNEL_ACCESS_TOKEN = os.getenv("LINE_CHANNEL_ACCESS_TOKEN", "")
-LINE_CHANNEL_SECRET = os.getenv("LINE_CHANNEL_SECRET", "")
-DEFAULT_PERIOD_SEC = int(os.getenv("DEFAULT_PERIOD_SEC", "60"))
-ALWAYS_NOTIFY = os.getenv("ALWAYS_NOTIFY", "0") == "1"
-FOLLOW_AREAS_PER_CHECK = int(os.getenv("FOLLOW_AREAS_PER_CHECK", "0"))
-
-# 可選：手動覆蓋宣傳圖或 Details 連結（通常不需要）
-PROMO_IMAGE_MAP: Dict[str, str] = {}
-PROMO_DETAILS_MAP: Dict[str, str] = {}
-try:
-    PROMO_IMAGE_MAP = json.loads(os.getenv("PROMO_IMAGE_MAP", "{}"))
-except Exception:
-    PROMO_IMAGE_MAP = {}
-try:
-    PROMO_DETAILS_MAP = json.loads(os.getenv("PROMO_DETAILS_MAP", "{}"))
-except Exception:
-    PROMO_DETAILS_MAP = {}
-
-if not LINE_CHANNEL_ACCESS_TOKEN or not LINE_CHANNEL_SECRET:
-    app.logger.warning("LINE env not set: LINE_CHANNEL_ACCESS_TOKEN / LINE_CHANNEL_SECRET")
-
-line_bot_api = LineBotApi(LINE_CHANNEL_ACCESS_TOKEN) if (HAS_LINE and LINE_CHANNEL_ACCESS_TOKEN) else None
-handler = WebhookHandler(LINE_CHANNEL_SECRET) if (HAS_LINE and LINE_CHANNEL_SECRET) else None
-
-MAX_PER_TICK = int(os.getenv("MAX_PER_TICK", "6"))
-TICK_SOFT_DEADLINE_SEC = int(os.getenv("TICK_SOFT_DEADLINE_SEC", "50"))
-
-# Firestore client
-fs_client = None
-FS_ERROR_MSG = ""
-try:
-    fs_client = firestore.Client()
-    FS_OK = True
-    FS_ERROR_MSG = ""
-except (DefaultCredentialsError, Forbidden) as e:
-    FS_OK = False
-    FS_ERROR_MSG = "watch service unavailable"
-    app.logger.warning(f"Firestore init failed (auth/permission): {e}")
-except GoogleAPIError as e:
-    FS_OK = False
-    FS_ERROR_MSG = str(e) or "watch service unavailable"
-    app.logger.warning(f"Firestore init failed: {e}")
-except Exception as e:
-    FS_OK = False
-    FS_ERROR_MSG = str(e) or "watch service unavailable"
-    app.logger.warning(f"Firestore init failed: {e}")
-
-COL = "watchers"
 
 UA = (
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
@@ -990,16 +1056,16 @@ def canonicalize_url(u: str) -> str:
 
 def send_text(to_id: str, text: str):
     if not line_bot_api:
-        app.logger.info(f"[dry-run] send_text to {to_id}: {text}")
+        _get_logger().info(f"[dry-run] send_text to {to_id}: {text}")
         return
     try:
         line_bot_api.push_message(to_id, TextSendMessage(text=text))
     except Exception as e:
-        app.logger.error(f"[LINE] push text failed: {e}")
+        _get_logger().error(f"[LINE] push text failed: {e}")
 
 def send_image(to_id: str, img_url: str):
     if not line_bot_api:
-        app.logger.info(f"[dry-run] send_image to {to_id}: {img_url}")
+        _get_logger().info(f"[dry-run] send_image to {to_id}: {img_url}")
         return
     try:
         line_bot_api.push_message(
@@ -1007,7 +1073,39 @@ def send_image(to_id: str, img_url: str):
             ImageSendMessage(original_content_url=img_url, preview_image_url=img_url)
         )
     except Exception as e:
-        app.logger.error(f"[LINE] push image failed: {e}")
+        _get_logger().error(f"[LINE] push image failed: {e}")
+
+
+def _spawn_background_worker(app_obj: Flask, name: str, target, *args, **kwargs) -> bool:
+    def _runner():
+        with app_obj.app_context():
+            try:
+                target(*args, **kwargs)
+            except Exception as exc:  # pragma: no cover - background logging
+                app_obj.logger.exception(f"[background] {name} crashed: {exc}")
+
+    try:
+        threading.Thread(target=_runner, daemon=True, name=name).start()
+        return True
+    except Exception as exc:
+        _get_logger().exception(f"[background] unable to start {name}: {exc}")
+        return False
+
+
+def _push_detail_to_chat(chat_id: Optional[str], detail: Optional[Dict[str, Any]], fallback: Optional[str] = None, extra_text: Optional[str] = None):
+    if not chat_id:
+        return
+    try:
+        if isinstance(detail, dict):
+            payload = dict(detail)
+            send_text(chat_id, fmt_result_text(payload))
+            if extra_text:
+                send_text(chat_id, extra_text)
+        elif fallback:
+            send_text(chat_id, fallback)
+    except Exception as exc:
+        _get_logger().error(f"[push] failed to deliver result: {exc}")
+
 
 
 def _spawn_background_worker(name: str, target, *args, **kwargs) -> bool:
@@ -1397,7 +1495,6 @@ def fetch_game_info_from_api(perf_id: Optional[str], product_id: Optional[str], 
                 add_payload(ActivityID=act, SystemBrowseType=browse, hasDeadline=has_deadline)
                 add_payload(ActivityId=act, SystemBrowseType=browse, hasDeadline=has_deadline)
 
-
     add_payload()
 
     picked: Dict[str, str] = {}
@@ -1408,14 +1505,14 @@ def fetch_game_info_from_api(perf_id: Optional[str], product_id: Optional[str], 
         try:
             resp = session.post(TICKET_API, json=payload, headers=headers, timeout=12)
         except Exception as e:
-            app.logger.info(f"[api] fetch fail ({params}): {e}")
+            _get_logger().info(f"[api] fetch fail ({params}): {e}")
             continue
 
         if resp.status_code == 200:
             try:
                 data = resp.json()
             except Exception as e:
-                app.logger.info(f"[api] bad json ({params}): {e}")
+                _get_logger().info(f"[api] bad json ({params}): {e}")
                 continue
 
             text_blob = json.dumps(data, ensure_ascii=False)
@@ -1528,11 +1625,11 @@ def fetch_from_ticket_details(details_url: str, sess: requests.Session) -> Dict[
     try:
 
         resp = sess.get(details_url, timeout=6)
-
         if resp.status_code == 200:
             detail_html = _decode_ibon_html(resp)
     except Exception as exc:
-        app.logger.info(f"[details] fetch fail: {exc}")
+        _get_logger().info(f"[details] fetch fail: {exc}")
+
 
     def _abs_url(u: Optional[str]) -> Optional[str]:
         if not u:
@@ -1596,10 +1693,10 @@ def fetch_from_ticket_details(details_url: str, sess: requests.Session) -> Dict[
                     session, token = _prepare_ibon_session()
                     continue
                 if 500 <= resp.status_code < 600:
-                    app.logger.info(f"[details-api] http={resp.status_code}")
+                    _get_logger().info(f"[details-api] http={resp.status_code}")
                     break
             except Exception as e:
-                app.logger.info(f"[details-api] err: {e}")
+                _get_logger().info(f"[details-api] err: {e}")
             _sleep_backoff(attempt)
 
     content_lines: List[str] = []
@@ -1682,7 +1779,7 @@ def fetch_from_ticket_details(details_url: str, sess: requests.Session) -> Dict[
 
                 ticket_urls.extend(_extract_ticket_urls_from_text(content_html))
             except Exception as e:
-                app.logger.info(f"[details-api] content parse err: {e}")
+                _get_logger().info(f"[details-api] content parse err: {e}")
 
     if detail_html:
         try:
@@ -1745,7 +1842,8 @@ def fetch_from_ticket_details(details_url: str, sess: requests.Session) -> Dict[
 
             ticket_urls.extend(_extract_ticket_urls_from_text(detail_html))
         except Exception as e:
-            app.logger.info(f"[details] parse err: {e}")
+
+            _get_logger().info(f"[details] parse err: {e}")
 
     # 透過內容文字補齊場地
     if content_lines:
@@ -1810,7 +1908,6 @@ def fetch_from_ticket_details(details_url: str, sess: requests.Session) -> Dict[
         dt_obj, has_time = _parse_datetime_string(raw)
         if dt_obj:
             dt_candidates.append((priority, dt_obj, has_time))
-
 
     for raw, priority in api_dt_values:
         _add_dt_candidate(raw, priority)
@@ -1954,7 +2051,7 @@ def pick_event_images_from_000(html: str, base_url: str) -> Tuple[str, Optional[
                     if src and any(k in src.lower() for k in ("activityimage","azureedge","adimage")):
                         poster = urljoin(base_url, src); break
     except Exception as e:
-        app.logger.warning(f"[image] pick failed: {e}")
+        _get_logger().warning(f"[image] pick failed: {e}")
     return poster, seatmap
 
 def extract_title_place_from_html(html: str) -> tuple[Optional[str], Optional[str], Optional[str]]:
@@ -2278,15 +2375,17 @@ def try_fetch_livemap_by_perf(perf_id: str, sess: requests.Session, html: Option
             if url in tried: continue
             tried.add(url)
             try:
-                app.logger.info(f"[livemap] try {url}")
+                _get_logger().info(f"[livemap] try {url}")
                 r = sess.get(url, timeout=12)
                 if r.status_code == 200:
                     html = _decode_ibon_html(r)
                     if "<area" in html:
-                        app.logger.info(f"[livemap] hit {url}")
+
+                        _get_logger().info(f"[livemap] hit {url}")
+
                         return _parse_livemap_text(html)
             except Exception as e:
-                app.logger.info(f"[livemap] miss {url}: {e}")
+                _get_logger().info(f"[livemap] miss {url}: {e}")
     return {}, 0
 
 # （可選）進第二步票區頁補抓數字
@@ -2319,7 +2418,7 @@ def fetch_area_left_from_utk0101(base_000_url: str, perf_id: str, product_id: st
                     qty = max(qty or 0, int(v))
         return qty
     except Exception as e:
-        app.logger.info(f"[area-left] fail {area_id}: {e}")
+        _get_logger().info(f"[area-left] fail {area_id}: {e}")
         return None
 
 # --------- 主要解析器 ---------
@@ -2354,7 +2453,7 @@ def parse_UTK0201_000(url: str, sess: requests.Session, referer: Optional[str] =
     try:
         api_info = fetch_game_info_from_api(perf_id, product_id, url, sess)
     except Exception as e:
-        app.logger.info(f"[api] fail: {e}")
+        _get_logger().info(f"[api] fail: {e}")
 
     html_title, html_place, html_dt = extract_title_place_from_html(html)
 
@@ -2376,7 +2475,7 @@ def parse_UTK0201_000(url: str, sess: requests.Session, referer: Optional[str] =
         or LOGO
     )
     if not _url_ok(chosen_img):
-        app.logger.info(f"[image] chosen invalid, fallback: {chosen_img}")
+        _get_logger().info(f"[image] chosen invalid, fallback: {chosen_img}")
         chosen_img = seatmap if seatmap and _url_ok(seatmap) else LOGO
     out["image"] = chosen_img
 
@@ -2666,7 +2765,9 @@ def _probe_activity_details(url: str, sess: requests.Session, trace: Optional[Li
                             "elapsed_ms": int((time.time() - start_parse) * 1000),
                             "reason": str(e),
                         })
-                    app.logger.info(f"[probe] parse ticket fail {ticket_url}: {e}")
+
+                    _get_logger().info(f"[probe] parse ticket fail {ticket_url}: {e}")
+
                     continue
                 if not isinstance(parsed, dict):
                     if trace is not None:
@@ -2860,7 +2961,7 @@ def fs_list(chat_id: str, show: str = "on"):
             rows.append(d.to_dict())
         return rows
     except Exception as e:
-        app.logger.info(f"[fs_list] order_by stream failed, fallback to unsorted: {e}")
+        _get_logger().info(f"[fs_list] order_by stream failed, fallback to unsorted: {e}")
 
     try:
         rows = [d.to_dict() for d in base.stream()]
@@ -2870,7 +2971,7 @@ def fs_list(chat_id: str, show: str = "on"):
         rows.sort(key=_k, reverse=True)
         return rows
     except Exception as e2:
-        app.logger.error(f"[fs_list] fallback stream failed: {e2}")
+        _get_logger().error(f"[fs_list] fallback stream failed: {e2}")
         return []
 
 def fs_disable(chat_id: str, tid: str) -> bool:
@@ -2959,7 +3060,7 @@ def handle_command(text: str, chat_id: str):
                         u      = str(r.get("url", ""))
                         line = f"{rid}｜{state}｜{period}s\n{u}\n\n"
                     except Exception as e:
-                        app.logger.info(f"[list] format row fail: {e}; row={r}")
+                        _get_logger().info(f"[list] format row fail: {e}; row={r}")
                         line = f"{r}\n\n"
 
                     if len(buf) + len(line) > 4800:
@@ -2977,13 +3078,13 @@ def handle_command(text: str, chat_id: str):
                         try:
                             send_text(chat_id, c)
                         except Exception as e:
-                            app.logger.error(f"[list] push remainder failed: {e}")
+                            _get_logger().error(f"[list] push remainder failed: {e}")
                     return msgs
                 else:
                     return chunks
 
             except Exception as e:
-                app.logger.error(f"/list failed: {e}\n{traceback.format_exc()}")
+                _get_logger().error(f"/list failed: {e}\n{traceback.format_exc()}")
                 out = "（讀取任務清單時發生例外）"
                 return [TextSendMessage(text=out)] if HAS_LINE else [out]
 
@@ -3027,70 +3128,39 @@ def handle_command(text: str, chat_id: str):
 
         return [TextSendMessage(text=HELP)] if HAS_LINE else [HELP]
     except Exception as e:
-        app.logger.error(f"handle_command error: {e}\n{traceback.format_exc()}")
+        _get_logger().error(f"handle_command error: {e}\n{traceback.format_exc()}")
         msg = "指令處理發生錯誤，請稍後再試。"
         return [TextSendMessage(text=msg)] if HAS_LINE else [msg]
 
 # ============= Webhook / Scheduler / Diag =============
 
-@app.post("/webhook")
-@app.post("/line/webhook")
-@app.post("/callback")
+@main_bp.post("/webhook")
+@main_bp.post("/line/webhook")
+@main_bp.post("/callback")
 
 def webhook():
     if not (HAS_LINE and handler):
-        app.logger.warning("Webhook invoked but handler not ready")
+
+        _get_logger().warning("Webhook invoked but handler not ready")
         return jsonify({"ok": True}), 200
     signature = request.headers.get("X-Line-Signature", "")
     body = request.get_data(as_text=True)
 
-    def _handle_async():
-        try:
-            handler.handle(body, signature)
-        except InvalidSignatureError:
-            app.logger.warning("InvalidSignature on /webhook")
-        except Exception as exc:
-            app.logger.exception(f"/webhook handler error: {exc}")
 
-    try:
-        threading.Thread(target=_handle_async, daemon=True).start()
-    except Exception as exc:
-        app.logger.exception(f"/webhook thread error: {exc}")
+    def _handle_async(app_obj: Flask, payload: str, sig: str) -> None:
+        try:
+            handler.handle(payload, sig)
+        except InvalidSignatureError:
+            app_obj.logger.warning("InvalidSignature on /webhook")
+        except Exception as exc:
+            app_obj.logger.exception(f"/webhook handler error: {exc}")
+
+    app_obj = current_app._get_current_object()
+    if not _spawn_background_worker(app_obj, "webhook", _handle_async, app_obj, body, signature):
         return jsonify({"ok": False}), 200
     return jsonify({"ok": True}), 200
 
-if HAS_LINE and handler:
-
-    @handler.add(FollowEvent)
-    def on_follow(ev):
-        try:
-            line_bot_api.reply_message(ev.reply_token, [TextSendMessage(text=WELCOME_TEXT)])
-        except Exception as e:
-            app.logger.error(f"[follow] reply failed: {e}")
-
-    @handler.add(JoinEvent)
-    def on_join(ev):
-        try:
-            line_bot_api.reply_message(ev.reply_token, [TextSendMessage(text=WELCOME_TEXT)])
-        except Exception as e:
-            app.logger.error(f"[join] reply failed: {e}")
-
-    @handler.add(MessageEvent, message=TextMessage)
-    def on_message(ev):
-        raw = getattr(ev.message, "text", "") or ""
-        text = raw.strip()
-        if not is_command(text):
-            app.logger.info(f"[IGNORED NON-COMMAND] chat={source_id(ev)} text={text!r}")
-            return
-
-        chat = source_id(ev)
-        msgs = handle_command(text, chat)
-        if isinstance(msgs, list) and msgs and not isinstance(msgs[0], str):
-            line_bot_api.reply_message(ev.reply_token, msgs)
-        else:
-            line_bot_api.reply_message(ev.reply_token, [TextSendMessage(text=str(msgs))])
-
-@app.route("/cron/tick", methods=["GET"])
+@main_bp.route("/cron/tick", methods=["GET"])
 def cron_tick():
     start = time.time()
     resp = {"ok": True, "processed": 0, "skipped": 0, "errors": []}
@@ -3105,7 +3175,7 @@ def cron_tick():
         try:
             docs = list(fs_client.collection(COL).where("enabled", "==", True).stream())
         except Exception as e:
-            app.logger.error(f"[tick] list watchers failed: {e}")
+            _get_logger().error(f"[tick] list watchers failed: {e}")
             resp["ok"] = False
             resp["errors"].append(f"list failed: {e}")
             return jsonify(resp), 200
@@ -3130,7 +3200,7 @@ def cron_tick():
             try:
                 res = probe(url)
             except Exception as e:
-                app.logger.error(f"[tick] probe error for {url}: {e}")
+                _get_logger().error(f"[tick] probe error for {url}: {e}")
                 res = {"ok": False, "msg": f"probe error: {e}", "sig": "NA", "url": url}
 
             try:
@@ -3142,7 +3212,7 @@ def cron_tick():
                     "next_run_at": now + timedelta(seconds=period),
                 })
             except Exception as e:
-                app.logger.error(f"[tick] update doc error: {e}")
+                _get_logger().error(f"[tick] update doc error: {e}")
                 resp["errors"].append(f"update error: {e}")
 
             changed = (res.get("sig", "NA") != r.get("last_sig", ""))
@@ -3159,23 +3229,23 @@ def cron_tick():
                         send_image(chat_id, img)
                     send_text(chat_id, fmt_result_text(res))
                 except Exception as e:
-                    app.logger.error(f"[tick] notify error: {e}")
+                    _get_logger().error(f"[tick] notify error: {e}")
                     resp["errors"].append(f"notify error: {e}")
 
             handled += 1
             resp["processed"] += 1
 
-        app.logger.info(f"[tick] processed={resp['processed']} skipped={resp['skipped']} "
+        _get_logger().info(f"[tick] processed={resp['processed']} skipped={resp['skipped']} "
                         f"errors={len(resp['errors'])} duration={time.time()-start:.1f}s")
         return jsonify(resp), 200
 
     except Exception as e:
-        app.logger.error(f"[tick] fatal: {e}\n{traceback.format_exc()}")
+        _get_logger().error(f"[tick] fatal: {e}\n{traceback.format_exc()}")
         resp["ok"] = False
         resp["errors"].append(str(e))
         return jsonify(resp), 200
 
-@app.route("/diag", methods=["GET"])
+@main_bp.route("/diag", methods=["GET"])
 def diag():
     url = request.args.get("url", "").strip()
     if not url:
@@ -3187,10 +3257,10 @@ def diag():
         return jsonify({"ok": False, "msg": str(e)}), 500
 
 
-@app.get("/diag/routes")
+@main_bp.get("/diag/routes")
 def diag_routes():
     rules = []
-    for rule in app.url_map.iter_rules():
+    for rule in current_app.url_map.iter_rules():
         methods = sorted(m for m in rule.methods if m not in {"HEAD", "OPTIONS"})
         rules.append({
             "rule": rule.rule,
@@ -3200,11 +3270,11 @@ def diag_routes():
     return jsonify({"ok": True, "routes": rules}), 200
 
 
-@app.route("/healthz", methods=["GET"])
+@main_bp.route("/healthz", methods=["GET"])
 def healthz():
     return "ok", 200
 
-@app.route("/check", methods=["GET"])
+@main_bp.route("/check", methods=["GET"])
 def http_check_once():
     url = request.args.get("url", "").strip()
     if not url:
@@ -3364,7 +3434,7 @@ def fetch_ibon_ent_html_hard(limit=10, keyword=None, only_concert=False):
         return items
 
     except Exception as e:
-        app.logger.error(f"[html_hard] failed: {e}")
+        _get_logger().error(f"[html_hard] failed: {e}")
         return []
 
 # --- backward-compat alias（舊名→新實作；一定要放在函式「外面」） ---
@@ -3387,7 +3457,7 @@ def fetch_ibon_carousel_from_api(limit=10, keyword=None, only_concert=False):
     global _API_BREAK_UNTIL
     now = time.time()
     if now < _API_BREAK_UNTIL:
-        app.logger.info("[carousel-api] breaker open -> skip API, go HTML")
+        _get_logger().info("[carousel-api] breaker open -> skip API, go HTML")
         return []
 
     session, token = _prepare_ibon_session()
@@ -3463,7 +3533,7 @@ def fetch_ibon_carousel_from_api(limit=10, keyword=None, only_concert=False):
                 timeout=12,
             )
         except Exception as e:
-            app.logger.warning(f"[carousel-api] POST err {e}")
+            _get_logger().warning(f"[carousel-api] POST err {e}")
             _API_BREAK_UNTIL = time.time() + 1800
             return []
 
@@ -3554,7 +3624,7 @@ def fetch_ibon_carousel_from_api(limit=10, keyword=None, only_concert=False):
                 headers["X-XSRF-TOKEN"] = token
             continue
         else:
-            app.logger.warning(
+            _get_logger().warning(
                 f"[carousel-api] http={resp.status_code} pattern={pattern} -> open breaker"
             )
             _API_BREAK_UNTIL = time.time() + 1800
@@ -3688,16 +3758,16 @@ def _background_unwatch_job(chat_id: Optional[str], url: Optional[str], task_id:
     else:
         _push_detail_to_chat(chat_id, None, fallback=status_line)
 
-
-def _background_quick_check_job(chat_id: Optional[str], url: str, task_id: str) -> None:
-    status_line = f"快速查看任務 {task_id} 已完成。"
+def _background_watch_job(app_obj: Flask, chat_id: Optional[str], url: str, task_id: str, created: bool, period: int) -> None:
+    logger = app_obj.logger
+    status_line = f"任務 {task_id} 已{'建立' if created else '更新'}，每 {period} 秒監看。"
     fallback = f"{status_line} 但目前無法取得票券資訊。"
     try:
         detail = _maybe_probe(url)
     except Exception as exc:  # pragma: no cover - network failure path
-        app.logger.error(f"[quick-bg] probe failed for {url}: {exc}")
+        logger.error(f"[watch-bg] probe failed for {url}: {exc}")
         if chat_id:
-            send_text(chat_id, f"快速查看任務 {task_id} 失敗：{exc}")
+            send_text(chat_id, f"{status_line} 查詢失敗：{exc}")
         return
 
     if isinstance(detail, dict):
@@ -3708,6 +3778,45 @@ def _background_quick_check_job(chat_id: Optional[str], url: str, task_id: str) 
         _push_detail_to_chat(chat_id, None, fallback=fallback)
 
 
+def _background_unwatch_job(app_obj: Flask, chat_id: Optional[str], url: Optional[str], task_id: str) -> None:
+    logger = app_obj.logger
+    status_line = f"任務 {task_id} 已停止監看。"
+    detail = None
+    if url:
+        try:
+            detail = _maybe_probe(url)
+        except Exception as exc:  # pragma: no cover - network failure path
+            logger.info(f"[unwatch-bg] probe failed for {url}: {exc}")
+            detail = None
+    if isinstance(detail, dict):
+        payload = dict(detail)
+        payload.setdefault("task_id", task_id)
+        _push_detail_to_chat(chat_id, payload, extra_text=status_line)
+    else:
+        _push_detail_to_chat(chat_id, None, fallback=status_line)
+
+
+def _background_quick_check_job(app_obj: Flask, chat_id: Optional[str], url: str, task_id: str) -> None:
+    logger = app_obj.logger
+
+    status_line = f"快速查看任務 {task_id} 已完成。"
+    fallback = f"{status_line} 但目前無法取得票券資訊。"
+    try:
+        detail = _maybe_probe(url)
+    except Exception as exc:  # pragma: no cover - network failure path
+
+        logger.error(f"[quick-bg] probe failed for {url}: {exc}")
+
+        if chat_id:
+            send_text(chat_id, f"快速查看任務 {task_id} 失敗：{exc}")
+        return
+
+    if isinstance(detail, dict):
+        payload = dict(detail)
+        payload.setdefault("task_id", task_id)
+        _push_detail_to_chat(chat_id, payload, extra_text=status_line)
+    else:
+        _push_detail_to_chat(chat_id, None, fallback=fallback)
 
 def _collect_liff_items(limit: int, keyword: Optional[str], only_concert: bool, mode: str, debug: bool) -> tuple[List[Dict[str, Any]], str, List[Dict[str, Any]]]:
     trace: List[Dict[str, Any]] = []
@@ -3729,7 +3838,7 @@ def _collect_liff_items(limit: int, keyword: Optional[str], only_concert: bool, 
         try:
             candidate = func() or []
         except Exception as e:
-            app.logger.info(f"[liff_api] {label} error: {e}")
+            _get_logger().info(f"[liff_api] {label} error: {e}")
             candidate = []
         trace.append({"phase": label, "count": len(candidate)})
         if candidate:
@@ -3746,7 +3855,33 @@ def _collect_liff_items(limit: int, keyword: Optional[str], only_concert: bool, 
                 if items:
                     actual_mode = "browser_carousel"
         except Exception as e:
-            app.logger.warning(f"[liff_api] browser fallback failed: {e}")
+            _get_logger().warning(f"[liff_api] browser fallback failed: {e}")
+
+    if items:
+        sess = sess_default()
+        enriched: List[Dict[str, Any]] = []
+        for base in items:
+            details_url = base.get("details_url") or base.get("url")
+            if not isinstance(details_url, str) or not details_url:
+                continue
+            item_trace: Optional[List[Dict[str, Any]]] = [] if debug else None
+            try:
+                data = _probe_activity_details(details_url, sess, trace=item_trace)
+            except Exception as exc:
+                _get_logger().info(f"[liff_api] enrich fail {details_url}: {exc}")
+                if item_trace is not None:
+                    item_trace.append({"phase": "error", "reason": str(exc)})
+                continue
+            base_image = base.get("image_url") or base.get("image")
+            if base_image and not data.get("image"):
+                data["image"] = base_image
+                data["image_url"] = base_image
+            if item_trace:
+                data["trace"] = item_trace
+            enriched.append(data)
+        if enriched:
+            items = enriched
+            trace.append({"phase": "enrich", "count": len(items)})
 
     if items:
         sess = sess_default()
@@ -3817,7 +3952,7 @@ def concerts():
         body = {"ok": True, "mode": actual_mode, "items": items, "trace": trace}
         return jsonify(body), 200
     except Exception as exc:  # pragma: no cover - defensive logging path
-        current_app.logger.error(f"/api/liff/concerts error: {exc}\n{traceback.format_exc()}")
+        _get_logger().error(f"/api/liff/concerts error: {exc}\n{traceback.format_exc()}")
         return jsonify({"ok": False, "error": str(exc)}), 500
 
 @liff_api_bp.post("/watch")
@@ -3842,7 +3977,9 @@ def watch():
     try:
         task_id, created = fs_upsert_watch(chat_id, url, sec)
     except Exception as exc:  # pragma: no cover - Firestore runtime errors
-        current_app.logger.error(f"/api/liff/watch error: {exc}")
+
+        _get_logger().error(f"/api/liff/watch error: {exc}")
+
         return jsonify({"ok": False, "error": str(exc)}), 200
 
     message = f"任務 {task_id} 已{'建立' if created else '更新'}，每 {sec} 秒監看，稍後會推送最新票券資訊。"
@@ -3855,9 +3992,12 @@ def watch():
         "queued": True,
     }
 
+    app_obj = current_app._get_current_object()
     if not _spawn_background_worker(
+        app_obj,
         "watch-probe",
         _background_watch_job,
+        app_obj,
         chat_id,
         url,
         task_id,
@@ -3895,7 +4035,9 @@ def unwatch():
         try:
             doc = fs_get_task_by_canon(chat_id, canonicalize_url(url))
         except Exception as exc:
-            current_app.logger.error(f"/api/liff/unwatch canonicalize fail: {exc}")
+
+            _get_logger().error(f"/api/liff/unwatch canonicalize fail: {exc}")
+
             return jsonify({"ok": False, "error": str(exc)}), 200
 
     if doc is None:
@@ -3911,24 +4053,31 @@ def unwatch():
     try:
         disabled = fs_disable(chat_id, task_id)
     except Exception as exc:  # pragma: no cover - Firestore runtime errors
-        current_app.logger.error(f"/api/liff/unwatch disable error: {exc}")
+
+        _get_logger().error(f"/api/liff/unwatch disable error: {exc}")
+
         return jsonify({"ok": False, "error": str(exc)}), 200
 
     if not disabled:
         return jsonify({"ok": False, "error": "unable to disable task"}), 200
 
+
     message = f"任務 {task_id} 停止監看中，稍後會推送最新狀態。"
     response: Dict[str, Any] = {"ok": True, "task_id": task_id, "message": message, "queued": True}
 
+    app_obj = current_app._get_current_object()
     if not _spawn_background_worker(
+        app_obj,
         "unwatch-probe",
         _background_unwatch_job,
+        app_obj,
         chat_id,
         target_url,
         task_id,
     ):
         response["queued"] = False
         response.setdefault("warning", "背景作業啟動失敗，請稍後再試。")
+
 
     return jsonify(response), 200
 
@@ -3946,9 +4095,14 @@ def _quick_check_impl(url: str, chat_id: Optional[str] = None):
         "queued": True,
     }
 
+
+    app_obj = current_app._get_current_object()
     if not _spawn_background_worker(
+        app_obj,
         "quick-check",
         _background_quick_check_job,
+        app_obj,
+
         chat_id,
         url,
         task_id,
@@ -3972,9 +4126,7 @@ def quick_check_post():
     chat_id = payload.get("chat_id") or payload.get("chatId")
     return _quick_check_impl(payload.get("url"), chat_id)
 
-app.register_blueprint(liff_api_bp)
-
-@app.get("/liff/activities")
+@main_bp.get("/liff/activities")
 def liff_activities():
     want_debug = _truthy(request.args.get("debug"))
     response = concerts()
@@ -3993,15 +4145,15 @@ def liff_activities():
         return response
     return response
 
-@app.post("/liff/watch")
+@main_bp.post("/liff/watch")
 def liff_watch_compat():
     return watch()
 
-@app.post("/liff/unwatch")
+@main_bp.post("/liff/unwatch")
 def liff_unwatch_compat():
     return unwatch()
 
-@app.post("/liff/watch_status")
+@main_bp.post("/liff/watch_status")
 
 def liff_watch_status():
     try:
@@ -4047,7 +4199,7 @@ def liff_watch_status():
             canon = canonicalize_url(url)
             doc = fs_get_task_by_canon(chat_id, canon)
         except Exception as e:
-            app.logger.error(f"[liff_watch_status] lookup failed for {url}: {e}")
+            _get_logger().error(f"[liff_watch_status] lookup failed for {url}: {e}")
             entry["error"] = str(e)
             results[url] = entry
             continue
@@ -4074,11 +4226,11 @@ def liff_watch_status():
     return jsonify({"ok": True, "results": results}), 200
 
 # ✅ 新增這段：提供 /api/liff/status，轉呼叫上面那支
-@app.post("/api/liff/status")
+@main_bp.post("/api/liff/status")
 def liff_status_api():
     return liff_watch_status()
 
-@app.get("/liff/activities_debug")
+@main_bp.get("/liff/activities_debug")
 def liff_activities_debug():
     try:
         limit = int(request.args.get("limit", "10"))
@@ -4101,8 +4253,8 @@ def liff_activities_debug():
 
     return jsonify({"ok": True, "count": 0, "items": [], "trace": trace}), 200
 
-@app.get("/liff")
-@app.get("/liff/")
+@main_bp.get("/liff")
+@main_bp.get("/liff/")
 
 def liff_index():
     try:
@@ -4110,11 +4262,11 @@ def liff_index():
     except Exception:
         return "LIFF OK", 200
 
-@app.route("/liff/ping", methods=["GET"])
+@main_bp.route("/liff/ping", methods=["GET"])
 def liff_ping():
     return jsonify({"ok": True, "time": datetime.utcnow().isoformat()+"Z"}), 200
 
-@app.get("/netcheck")
+@main_bp.get("/netcheck")
 def netcheck():
     urls = [
         "https://www.google.com",
@@ -4130,52 +4282,33 @@ def netcheck():
             out.append({"url": u, "error": repr(e)})
     return jsonify({"results": out})
 
-if __name__ == "__main__":
-    app.run(host="0.0.0.0", port=int(os.getenv("PORT", "8080")))
-
-# === debug: dump all routes ===
-try:
-    from flask import jsonify
-    def _dump_routes(flask_app):
-        out=[]
-        for r in flask_app.url_map.iter_rules():
-            methods = sorted(m for m in r.methods if m in ("GET","POST","PUT","DELETE","PATCH"))
-            out.append({"rule": str(r), "endpoint": r.endpoint, "methods": methods})
-        return out
-
-    @_r.get("/__routes")
-    def __routes():
-        return jsonify(routes=_dump_routes(app)), 200
-except Exception:
-    pass
-
-@app.get("/__whoami")
+@main_bp.get("/__whoami")
 def __whoami():
     return jsonify({
         "module": __name__,
-        "strict_slashes": getattr(app.url_map, "strict_slashes", None),
-        "routes": sorted([str(r) for r in app.url_map.iter_rules()])[:80],
+        "strict_slashes": getattr(current_app.url_map, "strict_slashes", None),
+        "routes": sorted([str(r) for r in current_app.url_map.iter_rules()])[:80],
     }), 200
 
-@app.errorhandler(404)
+@main_bp.app_errorhandler(404)
 def __nf(e):  # noqa: D401
     print("[NF]", request.method, request.path)
     return jsonify({"error": "not found", "path": request.path}), 404
 
-def _tick_bg(app):
-    with app.app_context():
-        try:
-            run_tick_jobs()  # 這裡做真正的巡檢/抓票/推播
-        except Exception:
-            current_app.logger.exception("tick job failed")
 
-@app.get("/cron/tick")
-def cron_tick():
-    app_obj = current_app._get_current_object()
-    threading.Thread(target=_tick_bg, args=(app_obj,), daemon=True).start()
-    return "ok", 200
+def create_app() -> Flask:
+    try:
+        flask_app = Flask(__name__)
+        flask_app.url_map.strict_slashes = False
+        _initialize_globals(flask_app)
+        flask_app.register_blueprint(liff_api_bp)
+        flask_app.register_blueprint(main_bp)
+        return flask_app
+    except Exception:
+        print("Failed to create Flask app", file=sys.stderr)
+        traceback.print_exc()
+        raise
 
-def http_get(sess, url, **kw):
-    kw.setdefault("timeout", (3.0, 6.0))  # 連線3s/讀取6s
-    kw.setdefault("headers", UA)
-    return sess.get(url, **kw)
+
+app = create_app()
+
