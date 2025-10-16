@@ -1088,7 +1088,6 @@ def _unwrap_go_ticket_url(u: str) -> Optional[str]:
 
     return None
 
-
 def _resolve_utk_url(
     activity_id: Optional[str],
     pattern: Optional[str],
