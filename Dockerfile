@@ -26,4 +26,4 @@ ENV PORT=8080
 ENV PYTHONUNBUFFERED=1
 
 # 6) 啟動
-CMD ["gunicorn","-w","1","-b","0.0.0.0:8080","wsgi:app"]
+CMD ["gunicorn","-w","1","-b","0.0.0.0:8080","wsgi:application"]
