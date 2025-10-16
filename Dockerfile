@@ -26,4 +26,4 @@ ENV PORT=8080
 ENV PYTHONUNBUFFERED=1
 
 # 6) 啟動
-CMD ["gunicorn", "-w", "1", "-k", "sync", "-b", ":$PORT", "app:app"]
+CMD ["gunicorn", "-w", "1", "-k", "sync", "-b", ":8080", "app:app"]
