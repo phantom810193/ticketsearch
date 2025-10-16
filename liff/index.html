@@ -199,14 +199,39 @@
       const elSec = document.getElementById("sec");
 
       function buildStatusLine(item){
-        if (!item) return "暫時讀不到剩餘數（可能為動態載入）";
+        const fallbackText = "暫時讀不到剩餘數（可能為動態載入）";
+        if (!item) return fallbackText;
+
+        const tickets = Array.isArray(item.tickets) ? item.tickets : [];
+        if (tickets.length){
+          const parts = tickets.slice(0, 3).map(t => {
+            if (!t || typeof t !== "object") return null;
+            const area = t.area || "";
+            const price = (typeof t.price === "number" && Number.isFinite(t.price))
+              ? `NT$${t.price.toLocaleString("zh-TW")}`
+              : "";
+            const remaining = (typeof t.remaining === "number" && Number.isFinite(t.remaining))
+              ? `${t.remaining} 張`
+              : "";
+            const segments = [area, price, remaining].filter(Boolean);
+            return segments.join(" ");
+          }).filter(Boolean);
+          if (parts.length){
+            let line = parts.join("｜");
+            if (tickets.length > parts.length){
+              line += "｜...";
+            }
+            return line;
+          }
+        }
+
         if (typeof item.remain === "number" && Number.isFinite(item.remain)){
           return `剩餘 ${item.remain} 張`;
         }
         if (item.status_text){
           return item.status_text;
         }
-        return "暫時讀不到剩餘數（可能為動態載入）";
+        return fallbackText;
       }
 
       function setStatus(text){
