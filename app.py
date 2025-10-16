@@ -2323,7 +2323,58 @@ def fetch_ibon_carousel_from_api(limit=10, keyword=None, only_concert=False):
                         break
 
             if len(items) >= max_items:
+
                 break
+            headers = {
+                "Origin": "https://ticket.ibon.com.tw",
+                "Referer": IBON_ENT_URL,
+                "X-Requested-With": "XMLHttpRequest",
+            }
+            if token:
+                headers["X-XSRF-TOKEN"] = token
+            continue
+        else:
+            app.logger.warning(f"[carousel-api] http={resp.status_code} pattern={pattern} -> open breaker")
+            _API_BREAK_UNTIL = time.time() + 1800
+            return []
+
+        elif resp.status_code in (401, 403, 419):
+            session, token = _prepare_ibon_session()
+            if session is None:
+                break
+            headers = {
+                "Origin": "https://ticket.ibon.com.tw",
+                "Referer": IBON_ENT_URL,
+                "X-Requested-With": "XMLHttpRequest",
+            }
+            if token:
+                headers["X-XSRF-TOKEN"] = token
+            continue
+        else:
+            app.logger.warning(
+                f"[carousel-api] http={resp.status_code} pattern={pattern} -> open breaker"
+            )
+            _API_BREAK_UNTIL = time.time() + 1800
+            return []
+
+        elif resp.status_code in (401, 403, 419):
+            session, token = _prepare_ibon_session()
+            if session is None:
+                break
+            headers = {
+                "Origin": "https://ticket.ibon.com.tw",
+                "Referer": IBON_ENT_URL,
+                "X-Requested-With": "XMLHttpRequest",
+            }
+            if token:
+                headers["X-XSRF-TOKEN"] = token
+            continue
+        else:
+            app.logger.warning(
+                f"[carousel-api] http={resp.status_code} pattern={pattern} -> open breaker"
+            )
+            _API_BREAK_UNTIL = time.time() + 1800
+            return []
 
         elif resp.status_code in (401, 403, 419):
             session, token = _prepare_ibon_session()
