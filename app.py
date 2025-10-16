@@ -2609,7 +2609,6 @@ def _maybe_probe(url: str) -> Optional[Dict[str, Any]]:
     detail = _build_probe_detail_payload(probe(url))
     return detail
 
-
 @liff_api_bp.get("/concerts")
 def concerts():
     mode = (request.args.get("mode") or "carousel").strip().lower() or "carousel"
@@ -2632,7 +2631,6 @@ def concerts():
     except Exception as exc:  # pragma: no cover - defensive logging path
         current_app.logger.error(f"/api/liff/concerts error: {exc}\n{traceback.format_exc()}")
         return jsonify({"ok": False, "error": str(exc)}), 500
-
 
 @liff_api_bp.post("/watch")
 def watch():
@@ -2682,7 +2680,6 @@ def watch():
         if isinstance(status_text, str):
             response["status_text"] = status_text
     return jsonify(response), 200
-
 
 @liff_api_bp.post("/unwatch")
 def unwatch():
@@ -2749,7 +2746,6 @@ def unwatch():
             response["status_text"] = status_text
     return jsonify(response), 200
 
-
 def _quick_check_impl(url: str):
     url = (url or "").strip()
     if not url:
@@ -2772,20 +2768,16 @@ def _quick_check_impl(url: str):
         response["message"] = detail.get("msg") or None
     return jsonify(response), 200
 
-
 @liff_api_bp.get("/quick-check")
 def quick_check_get():
     return _quick_check_impl(request.args.get("url"))
-
 
 @liff_api_bp.post("/quick-check")
 def quick_check_post():
     payload = _read_json_payload()
     return _quick_check_impl(payload.get("url"))
 
-
 app.register_blueprint(liff_api_bp)
-
 
 @app.get("/liff/activities")
 def liff_activities():
@@ -2806,11 +2798,9 @@ def liff_activities():
         return response
     return response
 
-
 @app.post("/liff/watch")
 def liff_watch_compat():
     return watch()
-
 
 @app.post("/liff/unwatch")
 def liff_unwatch_compat():
@@ -2925,11 +2915,9 @@ def liff_index():
     except Exception:
         return "LIFF OK", 200
 
-
 @app.route("/liff/ping", methods=["GET"])
 def liff_ping():
     return jsonify({"ok": True, "time": datetime.utcnow().isoformat()+"Z"}), 200
-
 
 @app.get("/netcheck")
 def netcheck():
@@ -2948,57 +2936,7 @@ def netcheck():
     return jsonify({"results": out})
 
 if __name__ == "__main__":
-    app.run(host="0.0.0.0", port=int(os.getenv("PORT", "8080")))# --- Health & Root routes (auto-added) ---
-try:
-    import os, socket, datetime as _datetime_mod, subprocess
-    from flask import jsonify
-    from flask import Flask  # 若已匯入會被覆蓋無害
-    def _git_sha():
-        try:
-            return (os.environ.get("COMMIT_SHA")
-                    or subprocess.check_output(["git","rev-parse","--short","HEAD"], timeout=1).decode().strip())
-        except Exception:
-            return None
-
-    @app.get("/")
-    def _root():
-        return ("ticketsearch backend is running. Try /healthz or /liff/activities?debug=1\n",
-                200, {"Content-Type":"text/plain; charset=utf-8"})
-
-    @app.get("/healthz")
-    def _healthz():
-        return jsonify({
-            "status":"ok",
-            "service":"ticketsearch",
-            "time": _datetime_mod.datetime.utcnow().isoformat()+"Z",
-            "host": socket.gethostname(),
-            "region": os.environ.get("REGION","asia-east1"),
-            "project": os.environ.get("GOOGLE_CLOUD_PROJECT") or os.environ.get("PROJECT_ID"),
-            "revision": os.environ.get("K_REVISION"),
-            "commit": _git_sha(),
-        }), 200
-except Exception as _e:
-    # 不讓健康檢查的附加程式碼阻斷主服務
-    pass
-
-# === minimal health & root ===
-try:
-    from flask import jsonify
-except Exception:
-    pass
-
-try:
-    _r = app  # 若你的 app 實例叫 app
-    @_r.get("/healthz")
-    def _healthz():
-        return jsonify(status="ok", source="app.py"), 200
-
-    @_r.get("/")
-    def _root():
-        return jsonify(ok=True, source="app.py"), 200
-except Exception as _e:
-    # 若此檔沒有 app 實例而是用 create_app()，可忽略這段
-    pass
+    app.run(host="0.0.0.0", port=int(os.getenv("PORT", "8080")))
 
 # === debug: dump all routes ===
 try:
@@ -3016,7 +2954,6 @@ try:
 except Exception:
     pass
 
-
 @app.get("/__whoami")
 def __whoami():
     return jsonify({
@@ -3025,42 +2962,7 @@ def __whoami():
         "routes": sorted([str(r) for r in app.url_map.iter_rules()])[:80],
     }), 200
 
-
 @app.errorhandler(404)
 def __nf(e):  # noqa: D401
     print("[NF]", request.method, request.path)
     return jsonify({"error": "not found", "path": request.path}), 404
-
-
-# === debug helper: attach __routes onto whichever app actually runs ===
-def _attach_debug_routes(flask_app):
-    try:
-        from flask import jsonify
-    except Exception:
-        return
-    def _routes():
-        out=[]
-        for r in flask_app.url_map.iter_rules():
-            ms = sorted(m for m in r.methods if m in ("GET","POST","PUT","DELETE","PATCH"))
-            out.append({"rule": str(r), "endpoint": r.endpoint, "methods": ms})
-        return jsonify(routes=out), 200
-    # idempotent: avoid double-register
-    if "__routes" not in flask_app.view_functions:
-        flask_app.add_url_rule("/__routes", "__routes", _routes, methods=["GET"])
-
-# 1) 若模組層就有 app 實例，先掛一次
-try:
-    _attach_debug_routes(app)  # noqa: F821
-except Exception:
-    pass
-
-# 2) 若專案採用 create_app()，把它包起來：在 app 建好後掛上 __routes
-try:
-    _orig_create_app = create_app  # noqa: F821
-    def create_app(*args, **kwargs):  # type: ignore[no-redef]
-        a = _orig_create_app(*args, **kwargs)
-        try: _attach_debug_routes(a)
-        except Exception: pass
-        return a
-except Exception:
-    pass
