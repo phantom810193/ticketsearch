@@ -436,8 +436,6 @@ except Exception as e:
 # --------- Firestore（可失敗不致命）---------
 from google.cloud import firestore
 
-# ===== Flask & CORS =====
-
 # === Browser helper: Selenium → Playwright fallback ===
 def _run_js_with_fallback(url: str, js_func_literal: str):
     """
@@ -1860,9 +1858,11 @@ def handle_command(text: str, chat_id: str):
         return [TextSendMessage(text=msg)] if HAS_LINE else [msg]
 
 # ============= Webhook / Scheduler / Diag =============
+
 @app.post("/webhook")
 @app.post("/line/webhook")
 @app.post("/callback")
+
 def webhook():
     if not (HAS_LINE and handler):
         app.logger.warning("Webhook invoked but handler not ready")
@@ -2326,7 +2326,22 @@ def fetch_ibon_carousel_from_api(limit=10, keyword=None, only_concert=False):
                         break
 
             if len(items) >= max_items:
+
                 break
+            headers = {
+                "Origin": "https://ticket.ibon.com.tw",
+                "Referer": IBON_ENT_URL,
+                "X-Requested-With": "XMLHttpRequest",
+            }
+            if token:
+                headers["X-XSRF-TOKEN"] = token
+            continue
+        else:
+            app.logger.warning(
+                f"[carousel-api] http={resp.status_code} pattern={pattern} -> open breaker"
+            )
+            _API_BREAK_UNTIL = time.time() + 1800
+            return []
 
         elif resp.status_code in (401, 403, 419):
             session, token = _prepare_ibon_session()
@@ -2475,6 +2490,7 @@ def liff_activities():
         return jsonify({"ok": False, "error": str(e)}), 500
 
 @app.post("/liff/watch_status")
+
 def liff_watch_status():
     try:
         payload = request.get_json(silent=True) or {}
@@ -2546,6 +2562,7 @@ def liff_watch_status():
     return jsonify({"ok": True, "results": results}), 200
 
 @app.get("/liff/activities_debug")
+
 def liff_activities_debug():
     try:
         limit = int(request.args.get("limit", "10"))
@@ -2570,6 +2587,7 @@ def liff_activities_debug():
 
 @app.get("/liff")
 @app.get("/liff/")
+
 def liff_index():
     try:
         return send_from_directory("liff", "index.html")
