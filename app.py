@@ -671,8 +671,57 @@ UA = (
     "(KHTML, like Gecko) Chrome/122.0 Safari/537.36"
 )
 
-_RE_DATE = re.compile(r"(\d{4}/\d{2}/\d{2})\s+(\d{2}:\d{2})")
+_RE_DATE = re.compile(
+    r"(?P<date>\d{4}(?:/|\.)\d{1,2}(?:/|\.)\d{1,2}|\d{4}年\d{1,2}月\d{1,2}日?)"
+    r"(?:\s*[（(][^0-9)]+[)）])?"
+    r"\s*(?P<time>\d{1,2}[：:]\d{2})"
+)
 _RE_AREA_TAG = re.compile(r"<area\b[^>]*>", re.I)
+
+
+def _normalize_date_text(text: Optional[str]) -> Optional[str]:
+    if not text:
+        return None
+    digits = re.findall(r"\d+", text)
+    if len(digits) >= 3:
+        y, m, d = digits[:3]
+        try:
+            return f"{int(y):04d}/{int(m):02d}/{int(d):02d}"
+        except Exception:
+            pass
+    cleaned = str(text).strip()
+    return cleaned or None
+
+
+def _normalize_time_text(text: Optional[str]) -> Optional[str]:
+    if not text:
+        return None
+    digits = re.findall(r"\d+", text)
+    if len(digits) >= 2:
+        h, minute = digits[:2]
+        try:
+            return f"{int(h):02d}:{int(minute):02d}"
+        except Exception:
+            pass
+    cleaned = str(text).strip()
+    return cleaned or None
+
+
+def _format_datetime_match(m: Optional[re.Match]) -> Optional[str]:
+    if not m:
+        return None
+    group_map = m.groupdict() if hasattr(m, "groupdict") else {}
+    raw_date = group_map.get("date")
+    raw_time = group_map.get("time")
+    if raw_date is None and m.lastindex and m.lastindex >= 1:
+        raw_date = m.group(1)
+    if raw_time is None and m.lastindex and m.lastindex >= 2:
+        raw_time = m.group(2)
+    date_text = _normalize_date_text(raw_date)
+    time_text = _normalize_time_text(raw_time)
+    if date_text and time_text:
+        return f"{date_text} {time_text}"
+    return None
 
 LOGO = "https://ticketimg2.azureedge.net/logo.png"
 TICKET_API = "https://ticket.ibon.com.tw/api/ActivityInfo/GetGameInfoList"
@@ -1117,9 +1166,9 @@ def fetch_from_ticket_details(details_url: str, sess: requests.Session) -> Dict[
                         break
         if not out.get("dt"):
             for line in content_lines:
-                m = _RE_DATE.search(line)
-                if m:
-                    out["dt"] = f"{m.group(1)} {m.group(2)}"
+                dt_text = _format_datetime_match(_RE_DATE.search(line))
+                if dt_text:
+                    out["dt"] = dt_text
                     break
 
     # HTML 備援：若關鍵資訊仍缺，才去抓整頁
@@ -1157,9 +1206,9 @@ def fetch_from_ticket_details(details_url: str, sess: requests.Session) -> Dict[
 
                 if not out.get("dt"):
                     tx = soup.get_text(" ", strip=True)
-                    m = re.search(r'(\d{4}/\d{2}/\d{2})\s*(?:([\u4e00-\u9fff]))?\s*(\d{2}:\d{2})', tx)
-                    if m:
-                        out["dt"] = f"{m.group(1)} {m.group(3)}"
+                    dt_text = _format_datetime_match(_RE_DATE.search(tx))
+                    if dt_text:
+                        out["dt"] = dt_text
 
                 if not out.get("place"):
                     title_html, place_html, _ = extract_title_place_from_html(html)
@@ -1242,9 +1291,7 @@ def extract_title_place_from_html(html: str) -> tuple[Optional[str], Optional[st
         if mt and mt.get("content"):
             title = mt["content"].strip()
 
-    m = _RE_DATE.search(html)
-    if m:
-        dt_text = f"{m.group(1)} {m.group(2)}"
+    dt_text = _format_datetime_match(_RE_DATE.search(html)) or dt_text
 
     return title, place, dt_text
 
@@ -2433,6 +2480,229 @@ def _extract_carousel_html_hard(html: str, limit=10, keyword=None, only_concert=
     return items
 
 # ====== 替換：/liff/activities 以多來源 fallback（優先輪播） ======
+
+
+def _build_probe_detail_payload(data: Optional[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
+    if not isinstance(data, dict):
+        return None
+    payload = dict(data)
+    total = payload.get("total")
+    if isinstance(total, int):
+        payload.setdefault("remain", total)
+        payload.setdefault("remaining", total)
+    msg = payload.get("msg")
+    if isinstance(msg, str) and msg and not payload.get("status_text"):
+        payload["status_text"] = msg
+    return payload
+
+
+def _collect_liff_items(limit: int, keyword: Optional[str], only_concert: bool, mode: str) -> tuple[List[Dict[str, Any]], str, List[Dict[str, Any]]]:
+    trace: List[Dict[str, Any]] = []
+    items: List[Dict[str, Any]] = []
+    actual_mode = mode
+
+    if mode == "carousel":
+        items = fetch_ibon_carousel_from_api(limit=limit, keyword=keyword, only_concert=only_concert) or []
+        trace.append({"phase": "carousel", "count": len(items)})
+        return items, actual_mode, trace
+
+    attempts = [
+        ("carousel", lambda: fetch_ibon_carousel_from_api(limit=limit, keyword=keyword, only_concert=only_concert)),
+        ("api_generic", lambda: fetch_ibon_list_via_api(limit=limit, keyword=keyword, only_concert=only_concert)),
+        ("html_fallback", lambda: fetch_ibon_entertainments(limit=limit, keyword=keyword, only_concert=only_concert)),
+    ]
+
+    for label, func in attempts:
+        try:
+            candidate = func() or []
+        except Exception as e:
+            app.logger.info(f"[liff_api] {label} error: {e}")
+            candidate = []
+        trace.append({"phase": label, "count": len(candidate)})
+        if candidate:
+            items = candidate
+            actual_mode = label
+            break
+
+    if not items:
+        try:
+            urls = grab_ibon_carousel_urls() or []
+            trace.append({"phase": "browser_carousel", "count": len(urls)})
+            if urls:
+                items = _items_from_details_urls(urls, limit=limit, keyword=keyword, only_concert=only_concert)
+                if items:
+                    actual_mode = "browser_carousel"
+        except Exception as e:
+            app.logger.warning(f"[liff_api] browser fallback failed: {e}")
+
+    return items or [], actual_mode, trace
+
+
+@app.get("/api/liff/concerts")
+def api_liff_concerts():
+    mode = (request.args.get("mode") or "carousel").strip().lower() or "carousel"
+    try:
+        limit = int(request.args.get("limit", "10"))
+    except Exception:
+        limit = 10
+    keyword = request.args.get("q") or None
+    only_concert = _truthy(request.args.get("onlyConcert"))
+
+    try:
+        items, actual_mode, trace = _collect_liff_items(limit=limit, keyword=keyword, only_concert=only_concert, mode=mode)
+        body = {"ok": True, "mode": actual_mode, "items": items, "trace": trace}
+        return jsonify(body), 200
+    except Exception as e:
+        app.logger.error(f"/api/liff/concerts error: {e}\n{traceback.format_exc()}")
+        return jsonify({"ok": False, "error": str(e)}), 500
+
+
+def _read_json_payload() -> Dict[str, Any]:
+    try:
+        payload = request.get_json(silent=True) or {}
+    except Exception:
+        payload = {}
+    if not isinstance(payload, dict):
+        payload = {}
+    return payload
+
+
+@app.post("/api/liff/watch")
+def api_liff_watch():
+    payload = _read_json_payload()
+    chat_id = str(payload.get("chat_id") or payload.get("chatId") or "").strip()
+    url = str(payload.get("url") or "").strip()
+    period_raw = payload.get("period") or payload.get("sec") or payload.get("seconds")
+    try:
+        sec = int(period_raw)
+    except Exception:
+        sec = DEFAULT_PERIOD_SEC
+    sec = max(15, sec)
+
+    if not chat_id:
+        return jsonify({"ok": False, "error": "missing chat_id"}), 400
+    if not url:
+        return jsonify({"ok": False, "error": "missing url"}), 400
+    if not FS_OK:
+        return jsonify({"ok": False, "error": "watch service unavailable"}), 503
+
+    try:
+        task_id, created = fs_upsert_watch(chat_id, url, sec)
+    except Exception as e:
+        app.logger.error(f"/api/liff/watch error: {e}")
+        return jsonify({"ok": False, "error": str(e)}), 500
+
+    detail = None
+    try:
+        detail = _build_probe_detail_payload(probe(url))
+    except Exception as e:
+        app.logger.info(f"/api/liff/watch probe failed: {e}")
+
+    message = f"任務 {task_id} 已{'建立' if created else '更新'}，每 {sec} 秒監看。"
+    response = {
+        "ok": True,
+        "task_id": task_id,
+        "created": created,
+        "period": sec,
+        "message": message,
+        "detail": detail,
+    }
+    if isinstance(detail, dict):
+        remain_val = detail.get("remain")
+        if isinstance(remain_val, int):
+            response["remain"] = remain_val
+        status_text = detail.get("status_text")
+        if isinstance(status_text, str):
+            response["status_text"] = status_text
+    return jsonify(response), 200
+
+
+@app.post("/api/liff/unwatch")
+def api_liff_unwatch():
+    payload = _read_json_payload()
+    chat_id = str(payload.get("chat_id") or payload.get("chatId") or "").strip()
+    url = str(payload.get("url") or "").strip()
+    task_code = str(payload.get("task_code") or payload.get("taskId") or payload.get("task_id") or "").strip()
+
+    if not chat_id:
+        return jsonify({"ok": False, "error": "missing chat_id"}), 400
+    if not task_code and not url:
+        return jsonify({"ok": False, "error": "missing url"}), 400
+    if not FS_OK:
+        return jsonify({"ok": False, "error": "watch service unavailable"}), 503
+
+    doc = None
+    if task_code:
+        doc = fs_get_task_by_id(chat_id, task_code)
+    if doc is None and url:
+        try:
+            doc = fs_get_task_by_canon(chat_id, canonicalize_url(url))
+        except Exception as e:
+            app.logger.error(f"/api/liff/unwatch canonicalize fail: {e}")
+            return jsonify({"ok": False, "error": str(e)}), 500
+
+    if doc is None:
+        return jsonify({"ok": False, "reason": "no_watch", "message": "此活動目前沒有監看任務。"}), 200
+
+    data = doc.to_dict() if hasattr(doc, "to_dict") else {}
+    task_id = str(data.get("id") or task_code or "").strip()
+    target_url = url or data.get("url") or ""
+
+    if not task_id:
+        return jsonify({"ok": False, "error": "missing task id"}), 500
+
+    try:
+        disabled = fs_disable(chat_id, task_id)
+    except Exception as e:
+        app.logger.error(f"/api/liff/unwatch disable error: {e}")
+        return jsonify({"ok": False, "error": str(e)}), 500
+
+    if not disabled:
+        return jsonify({"ok": False, "error": "unable to disable task"}), 500
+
+    detail = None
+    if target_url:
+        try:
+            detail = _build_probe_detail_payload(probe(target_url))
+        except Exception as e:
+            app.logger.info(f"/api/liff/unwatch probe failed: {e}")
+
+    response = {"ok": True, "task_id": task_id, "message": "stopped", "detail": detail}
+    if isinstance(detail, dict):
+        remain_val = detail.get("remain")
+        if isinstance(remain_val, int):
+            response["remain"] = remain_val
+        status_text = detail.get("status_text")
+        if isinstance(status_text, str):
+            response["status_text"] = status_text
+    return jsonify(response), 200
+
+
+@app.post("/api/liff/quick-check")
+def api_liff_quick_check():
+    payload = _read_json_payload()
+    url = str(payload.get("url") or "").strip()
+    if not url:
+        return jsonify({"ok": False, "error": "missing url"}), 400
+
+    try:
+        detail = _build_probe_detail_payload(probe(url))
+    except Exception as e:
+        app.logger.error(f"/api/liff/quick-check error: {e}")
+        return jsonify({"ok": False, "error": str(e)}), 500
+
+    response = {"ok": True, "detail": detail}
+    if isinstance(detail, dict):
+        remain_val = detail.get("remain")
+        if isinstance(remain_val, int):
+            response["remain"] = remain_val
+        status_text = detail.get("status_text")
+        if isinstance(status_text, str):
+            response["status_text"] = status_text
+        response["message"] = detail.get("msg") or None
+    return jsonify(response), 200
+
+
 @app.get("/liff/activities")
 def liff_activities():
     trace = []
