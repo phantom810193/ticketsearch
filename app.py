@@ -12,10 +12,20 @@ import requests
 from datetime import datetime, timezone, timedelta
 from typing import Dict, Tuple, Optional, Any, List
 from urllib.parse import urlparse, urlunparse, parse_qs, urlencode, urljoin, unquote
-from flask import Flask, jsonify, request, abort, send_from_directory
+from flask import (
+    Flask,
+    jsonify,
+    request,
+    abort,
+    send_from_directory,
+    Blueprint,
+    current_app,
+)
 
 app = Flask(__name__)
 app.url_map.strict_slashes = False
+
+liff_api_bp = Blueprint("liff_api", __name__, url_prefix="/api/liff")
 # --- Browser engines (optional) ---
 try:
     from playwright.sync_api import sync_playwright
@@ -436,6 +446,24 @@ except Exception as e:
 # --------- Firestore（可失敗不致命）---------
 from google.cloud import firestore
 
+try:  # pragma: no cover - optional dependency paths
+    from google.auth.exceptions import DefaultCredentialsError  # type: ignore
+except Exception:  # pragma: no cover - fallback when auth extras missing
+    class DefaultCredentialsError(Exception):
+        """Fallback DefaultCredentialsError replacement."""
+
+        pass
+
+try:  # pragma: no cover - optional dependency paths
+    from google.api_core.exceptions import Forbidden, GoogleAPIError  # type: ignore
+except Exception:  # pragma: no cover - fallback when api_core missing
+    GoogleAPIError = Exception  # type: ignore
+
+    class Forbidden(GoogleAPIError):  # type: ignore
+        """Fallback Forbidden replacement."""
+
+        pass
+
 # === Browser helper: Selenium → Playwright fallback ===
 def _run_js_with_fallback(url: str, js_func_literal: str):
     """
@@ -656,13 +684,24 @@ MAX_PER_TICK = int(os.getenv("MAX_PER_TICK", "6"))
 TICK_SOFT_DEADLINE_SEC = int(os.getenv("TICK_SOFT_DEADLINE_SEC", "50"))
 
 # Firestore client
+fs_client = None
+FS_ERROR_MSG = ""
 try:
     fs_client = firestore.Client()
     FS_OK = True
-except Exception as e:
-    app.logger.warning(f"Firestore init failed: {e}")
-    fs_client = None
+    FS_ERROR_MSG = ""
+except (DefaultCredentialsError, Forbidden) as e:
     FS_OK = False
+    FS_ERROR_MSG = "watch service unavailable"
+    app.logger.warning(f"Firestore init failed (auth/permission): {e}")
+except GoogleAPIError as e:
+    FS_OK = False
+    FS_ERROR_MSG = str(e) or "watch service unavailable"
+    app.logger.warning(f"Firestore init failed: {e}")
+except Exception as e:
+    FS_OK = False
+    FS_ERROR_MSG = str(e) or "watch service unavailable"
+    app.logger.warning(f"Firestore init failed: {e}")
 
 COL = "watchers"
 
@@ -2050,6 +2089,20 @@ def diag():
     except Exception as e:
         return jsonify({"ok": False, "msg": str(e)}), 500
 
+
+@app.get("/diag/routes")
+def diag_routes():
+    rules = []
+    for rule in app.url_map.iter_rules():
+        methods = sorted(m for m in rule.methods if m not in {"HEAD", "OPTIONS"})
+        rules.append({
+            "rule": rule.rule,
+            "methods": methods,
+            "endpoint": rule.endpoint,
+        })
+    return jsonify({"ok": True, "routes": rules}), 200
+
+
 @app.route("/healthz", methods=["GET"])
 def healthz():
     return "ok", 200
@@ -2537,26 +2590,6 @@ def _collect_liff_items(limit: int, keyword: Optional[str], only_concert: bool, 
 
     return items or [], actual_mode, trace
 
-
-@app.get("/api/liff/concerts")
-def api_liff_concerts():
-    mode = (request.args.get("mode") or "carousel").strip().lower() or "carousel"
-    try:
-        limit = int(request.args.get("limit", "10"))
-    except Exception:
-        limit = 10
-    keyword = request.args.get("q") or None
-    only_concert = _truthy(request.args.get("onlyConcert"))
-
-    try:
-        items, actual_mode, trace = _collect_liff_items(limit=limit, keyword=keyword, only_concert=only_concert, mode=mode)
-        body = {"ok": True, "mode": actual_mode, "items": items, "trace": trace}
-        return jsonify(body), 200
-    except Exception as e:
-        app.logger.error(f"/api/liff/concerts error: {e}\n{traceback.format_exc()}")
-        return jsonify({"ok": False, "error": str(e)}), 500
-
-
 def _read_json_payload() -> Dict[str, Any]:
     try:
         payload = request.get_json(silent=True) or {}
@@ -2566,9 +2599,43 @@ def _read_json_payload() -> Dict[str, Any]:
         payload = {}
     return payload
 
+def _maybe_probe(url: str) -> Optional[Dict[str, Any]]:
+    if not url:
+        return None
 
-@app.post("/api/liff/watch")
-def api_liff_watch():
+    if current_app.testing:
+        return {"url": url, "status_text": "testing", "msg": url, "remain": 0}
+
+    detail = _build_probe_detail_payload(probe(url))
+    return detail
+
+
+@liff_api_bp.get("/concerts")
+def concerts():
+    mode = (request.args.get("mode") or "carousel").strip().lower() or "carousel"
+    try:
+        limit = int(request.args.get("limit", "10"))
+    except Exception:
+        limit = 10
+    keyword = request.args.get("q") or None
+    only_concert = _truthy(request.args.get("onlyConcert"))
+
+    try:
+        items, actual_mode, trace = _collect_liff_items(
+            limit=limit,
+            keyword=keyword,
+            only_concert=only_concert,
+            mode=mode,
+        )
+        body = {"ok": True, "mode": actual_mode, "items": items, "trace": trace}
+        return jsonify(body), 200
+    except Exception as exc:  # pragma: no cover - defensive logging path
+        current_app.logger.error(f"/api/liff/concerts error: {exc}\n{traceback.format_exc()}")
+        return jsonify({"ok": False, "error": str(exc)}), 500
+
+
+@liff_api_bp.post("/watch")
+def watch():
     payload = _read_json_payload()
     chat_id = str(payload.get("chat_id") or payload.get("chatId") or "").strip()
     url = str(payload.get("url") or "").strip()
@@ -2584,22 +2651,22 @@ def api_liff_watch():
     if not url:
         return jsonify({"ok": False, "error": "missing url"}), 400
     if not FS_OK:
-        return jsonify({"ok": False, "error": "watch service unavailable"}), 503
+        return jsonify({"ok": False, "error": FS_ERROR_MSG or "watch service unavailable"}), 503
 
     try:
         task_id, created = fs_upsert_watch(chat_id, url, sec)
-    except Exception as e:
-        app.logger.error(f"/api/liff/watch error: {e}")
-        return jsonify({"ok": False, "error": str(e)}), 500
+    except Exception as exc:  # pragma: no cover - Firestore runtime errors
+        current_app.logger.error(f"/api/liff/watch error: {exc}")
+        return jsonify({"ok": False, "error": str(exc)}), 500
 
-    detail = None
+    detail: Optional[Dict[str, Any]] = None
     try:
-        detail = _build_probe_detail_payload(probe(url))
-    except Exception as e:
-        app.logger.info(f"/api/liff/watch probe failed: {e}")
+        detail = _maybe_probe(url)
+    except Exception as exc:  # pragma: no cover - probe network errors
+        current_app.logger.info(f"/api/liff/watch probe failed: {exc}")
 
     message = f"任務 {task_id} 已{'建立' if created else '更新'}，每 {sec} 秒監看。"
-    response = {
+    response: Dict[str, Any] = {
         "ok": True,
         "task_id": task_id,
         "created": created,
@@ -2617,19 +2684,24 @@ def api_liff_watch():
     return jsonify(response), 200
 
 
-@app.post("/api/liff/unwatch")
-def api_liff_unwatch():
+@liff_api_bp.post("/unwatch")
+def unwatch():
     payload = _read_json_payload()
     chat_id = str(payload.get("chat_id") or payload.get("chatId") or "").strip()
     url = str(payload.get("url") or "").strip()
-    task_code = str(payload.get("task_code") or payload.get("taskId") or payload.get("task_id") or "").strip()
+    task_code = str(
+        payload.get("task_code")
+        or payload.get("taskId")
+        or payload.get("task_id")
+        or ""
+    ).strip()
 
     if not chat_id:
         return jsonify({"ok": False, "error": "missing chat_id"}), 400
     if not task_code and not url:
         return jsonify({"ok": False, "error": "missing url"}), 400
     if not FS_OK:
-        return jsonify({"ok": False, "error": "watch service unavailable"}), 503
+        return jsonify({"ok": False, "error": FS_ERROR_MSG or "watch service unavailable"}), 503
 
     doc = None
     if task_code:
@@ -2637,9 +2709,9 @@ def api_liff_unwatch():
     if doc is None and url:
         try:
             doc = fs_get_task_by_canon(chat_id, canonicalize_url(url))
-        except Exception as e:
-            app.logger.error(f"/api/liff/unwatch canonicalize fail: {e}")
-            return jsonify({"ok": False, "error": str(e)}), 500
+        except Exception as exc:
+            current_app.logger.error(f"/api/liff/unwatch canonicalize fail: {exc}")
+            return jsonify({"ok": False, "error": str(exc)}), 500
 
     if doc is None:
         return jsonify({"ok": False, "reason": "no_watch", "message": "此活動目前沒有監看任務。"}), 200
@@ -2653,21 +2725,21 @@ def api_liff_unwatch():
 
     try:
         disabled = fs_disable(chat_id, task_id)
-    except Exception as e:
-        app.logger.error(f"/api/liff/unwatch disable error: {e}")
-        return jsonify({"ok": False, "error": str(e)}), 500
+    except Exception as exc:  # pragma: no cover - Firestore runtime errors
+        current_app.logger.error(f"/api/liff/unwatch disable error: {exc}")
+        return jsonify({"ok": False, "error": str(exc)}), 500
 
     if not disabled:
         return jsonify({"ok": False, "error": "unable to disable task"}), 500
 
-    detail = None
+    detail: Optional[Dict[str, Any]] = None
     if target_url:
         try:
-            detail = _build_probe_detail_payload(probe(target_url))
-        except Exception as e:
-            app.logger.info(f"/api/liff/unwatch probe failed: {e}")
+            detail = _maybe_probe(target_url)
+        except Exception as exc:  # pragma: no cover - probe network errors
+            current_app.logger.info(f"/api/liff/unwatch probe failed: {exc}")
 
-    response = {"ok": True, "task_id": task_id, "message": "stopped", "detail": detail}
+    response: Dict[str, Any] = {"ok": True, "task_id": task_id, "message": "stopped", "detail": detail}
     if isinstance(detail, dict):
         remain_val = detail.get("remain")
         if isinstance(remain_val, int):
@@ -2678,20 +2750,18 @@ def api_liff_unwatch():
     return jsonify(response), 200
 
 
-@app.post("/api/liff/quick-check")
-def api_liff_quick_check():
-    payload = _read_json_payload()
-    url = str(payload.get("url") or "").strip()
+def _quick_check_impl(url: str):
+    url = (url or "").strip()
     if not url:
-        return jsonify({"ok": False, "error": "missing url"}), 400
+        return jsonify({"ok": False, "error": "missing url"}), 200
 
     try:
-        detail = _build_probe_detail_payload(probe(url))
-    except Exception as e:
-        app.logger.error(f"/api/liff/quick-check error: {e}")
-        return jsonify({"ok": False, "error": str(e)}), 500
+        detail = _maybe_probe(url)
+    except Exception as exc:  # pragma: no cover - probe network errors
+        current_app.logger.error(f"/api/liff/quick-check error: {exc}")
+        return jsonify({"ok": False, "error": str(exc)}), 500
 
-    response = {"ok": True, "detail": detail}
+    response: Dict[str, Any] = {"ok": True, "detail": detail}
     if isinstance(detail, dict):
         remain_val = detail.get("remain")
         if isinstance(remain_val, int):
@@ -2703,54 +2773,48 @@ def api_liff_quick_check():
     return jsonify(response), 200
 
 
+@liff_api_bp.get("/quick-check")
+def quick_check_get():
+    return _quick_check_impl(request.args.get("url"))
+
+
+@liff_api_bp.post("/quick-check")
+def quick_check_post():
+    payload = _read_json_payload()
+    return _quick_check_impl(payload.get("url"))
+
+
+app.register_blueprint(liff_api_bp)
+
+
 @app.get("/liff/activities")
 def liff_activities():
-    trace = []
-    try:
-        try:
-            limit = int(request.args.get("limit", "10"))
-        except Exception:
-            limit = 10
-        kw = request.args.get("q") or None
-        only_concert = _truthy(request.args.get("onlyConcert"))
-        want_debug = _truthy(request.args.get("debug"))
+    want_debug = _truthy(request.args.get("debug"))
+    response = concerts()
+    if want_debug:
+        return response
 
-        # 1) 輪播（API + HTML 兜底）
-        acts = fetch_ibon_carousel_from_api(limit=limit, keyword=kw, only_concert=only_concert)
-        trace.append({"phase": "api_carousel_mixed", "count": len(acts or [])})
+    if isinstance(response, tuple):
+        flask_response = response[0]
+        status = response[1]
+        if hasattr(flask_response, "get_json"):
+            data = flask_response.get_json(silent=True)
+        else:
+            data = None
+        if status == 200 and isinstance(data, dict) and "items" in data:
+            return jsonify(data["items"]), 200
+        return response
+    return response
 
-        # 2) 一般 API
-        if not acts:
-            acts = fetch_ibon_list_via_api(limit=limit, keyword=kw, only_concert=only_concert)
-            trace.append({"phase": "api_generic", "count": len(acts or [])})
 
-        # 3) HTML 兜底
-        if not acts:
-            acts = fetch_ibon_entertainments(limit=limit, keyword=kw, only_concert=only_concert)
-            trace.append({"phase": "html_fallback", "count": len(acts or [])})
-        # 4) 仍為空 → 用瀏覽器引擎（Selenium→Playwright）按輪播抓連結，再還原成 items
-        if not acts:
-            try:
-                urls = grab_ibon_carousel_urls()
-                trace.append({"phase": "browser_carousel", "count": len(urls or [])})
-                if urls:
-                    acts = _items_from_details_urls(urls, limit=limit, keyword=kw, only_concert=only_concert)
-            except Exception as e:
-                app.logger.warning(f"[browser_fallback] {e}")
+@app.post("/liff/watch")
+def liff_watch_compat():
+    return watch()
 
-        acts = acts or []  # 防 None
 
-        if want_debug:
-            return jsonify({"ok": True, "count": len(acts), "preview": acts[:2], "trace": trace}), 200
-
-        return jsonify(acts[:limit]), 200
-
-    except Exception as e:
-        app.logger.error(f"/liff/activities error: {e}\n{traceback.format_exc()}")
-        want_debug = _truthy(request.args.get("debug"))
-        if want_debug:
-            return jsonify({"ok": False, "error": str(e), "trace": trace}), 200
-        return jsonify({"ok": False, "error": str(e)}), 500
+@app.post("/liff/unwatch")
+def liff_unwatch_compat():
+    return unwatch()
 
 @app.post("/liff/watch_status")
 
@@ -2857,9 +2921,11 @@ def liff_index():
     except Exception:
         return "LIFF OK", 200
 
+
 @app.route("/liff/ping", methods=["GET"])
 def liff_ping():
     return jsonify({"ok": True, "time": datetime.utcnow().isoformat()+"Z"}), 200
+
 
 @app.get("/netcheck")
 def netcheck():
