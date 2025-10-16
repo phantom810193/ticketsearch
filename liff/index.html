@@ -199,14 +199,49 @@
       const elSec = document.getElementById("sec");
 
       function buildStatusLine(item){
-        if (!item) return "暫時讀不到剩餘數（可能為動態載入）";
+        const fallbackText = "暫時讀不到剩餘數（可能為動態載入）";
+        if (!item) return fallbackText;
+
+        const tickets = Array.isArray(item.tickets) ? item.tickets : [];
+        if (tickets.length){
+          const parts = tickets.slice(0, 3).map(t => {
+            if (!t || typeof t !== "object") return null;
+            const area = t.area || "";
+            const price = (typeof t.price === "number" && Number.isFinite(t.price))
+              ? `NT$${t.price.toLocaleString("zh-TW")}`
+              : "";
+            const status = typeof t.status === "string" ? t.status.trim() : "";
+            let remaining = "";
+            if (typeof t.remaining === "number" && Number.isFinite(t.remaining)){
+              if (t.remaining > 0){
+                remaining = `${t.remaining} 張`;
+              } else if (t.remaining === 0 && status){
+                remaining = status;
+              } else {
+                remaining = `${t.remaining} 張`;
+              }
+            } else if (status){
+              remaining = status;
+            }
+            const segments = [area, price, remaining].filter(Boolean);
+            return segments.join(" ");
+          }).filter(Boolean);
+          if (parts.length){
+            let line = parts.join("｜");
+            if (tickets.length > parts.length){
+              line += "｜...";
+            }
+            return line;
+          }
+        }
+
         if (typeof item.remain === "number" && Number.isFinite(item.remain)){
           return `剩餘 ${item.remain} 張`;
         }
         if (item.status_text){
           return item.status_text;
         }
-        return "暫時讀不到剩餘數（可能為動態載入）";
+        return fallbackText;
       }
 
       function setStatus(text){
@@ -392,14 +427,11 @@
           }
           updateWatchState(item.url, { watching: true, enabled: true, taskId: body.task_id, found: true });
           updateCardWatchInfo(item.url, watchInfo);
-          setCardFeedback(feedback, body.message || "已開始監看。");
-
-          if (body.detail){
-            statusText.textContent = buildStatusLine({
-              remain: body.detail.remain ?? body.detail.remaining,
-              status_text: body.detail.status_text,
-            });
-
+          const ackMessage = body.message || "已送出監看請求，稍後會推送結果。";
+          if (body.queued === false && body.warning){
+            setCardFeedback(feedback, `${ackMessage}（${body.warning}）`);
+          } else {
+            setCardFeedback(feedback, ackMessage);
           }
         } catch (err) {
           console.error("watch failed", err);
@@ -459,13 +491,11 @@
           }
           updateWatchState(item.url, { watching: false, enabled: false, taskId: body.task_id || current.taskId, found: true });
           updateCardWatchInfo(item.url, watchInfo);
-          const stopMessage = body.message === "stopped" ? "已停止監看。" : (body.message || "已停止監看。");
-          setCardFeedback(feedback, stopMessage);
-          if (body.detail){
-            statusText.textContent = buildStatusLine({
-              remain: body.detail.remain ?? body.detail.remaining,
-              status_text: body.detail.status_text,
-            });
+          const ackMessage = body.message || "已送出停止監看請求，稍後會推送結果。";
+          if (body.queued === false && body.warning){
+            setCardFeedback(feedback, `${ackMessage}（${body.warning}）`);
+          } else {
+            setCardFeedback(feedback, ackMessage);
           }
 
         } catch (err) {
@@ -489,36 +519,27 @@
         setButtonsDisabled(card, true);
         setCardFeedback(feedback, "快速查看中…");
         try {
+          const payload = { url: item.url };
+          if (state.chatId){
+            payload.chat_id = state.chatId;
+          }
           const res = await fetch(`${API_ROOT}/quick-check`, {
             method: "POST",
             headers: { "Content-Type": "application/json" },
             credentials: "include",
-            body: JSON.stringify({ url: item.url }),
+            body: JSON.stringify(payload),
           });
           const body = await res.json();
           if (!res.ok || !body.ok){
             throw new Error(body.error || `HTTP ${res.status}`);
           }
-
-          const detail = body.detail || {};
-          if (detail){
-            statusText.textContent = buildStatusLine({
-              remain: body.remain ?? detail.remain ?? detail.remaining,
-              status_text: body.status_text || detail.status_text,
-            });
+          const ackMessage = body.message || "已送出快速查看請求，稍後會推送結果。";
+          if (body.queued === false && body.warning){
+            setCardFeedback(feedback, `${ackMessage}（${body.warning}）`);
+          } else {
+            setCardFeedback(feedback, ackMessage);
           }
-          setCardFeedback(feedback, body.message || "已取得最新票數資訊。");
-
-          if (body.message){
-            if (state.isClient){
-              try {
-                await liff.sendMessages([{ type: "text", text: body.message }]);
-              } catch (e) {
-                console.warn("sendMessages failed", e);
-              }
-            }
-            alert(body.message);
-          }
+          alert(ackMessage);
         } catch (err) {
           console.error("quick-check failed", err);
           alert(`快速查看失敗：${err.message || err}`);
