@@ -436,8 +436,6 @@ except Exception as e:
 # --------- Firestore（可失敗不致命）---------
 from google.cloud import firestore
 
-# ===== Flask & CORS =====
-
 # === Browser helper: Selenium → Playwright fallback ===
 def _run_js_with_fallback(url: str, js_func_literal: str):
     """
@@ -1863,6 +1861,7 @@ def handle_command(text: str, chat_id: str):
 @app.post("/webhook")
 @app.post("/line/webhook")
 @app.post("/callback")
+
 def webhook():
     if not (HAS_LINE and handler):
         app.logger.warning("Webhook invoked but handler not ready")
@@ -2326,7 +2325,9 @@ def fetch_ibon_carousel_from_api(limit=10, keyword=None, only_concert=False):
                         break
 
             if len(items) >= max_items:
+
                 break
+
         elif resp.status_code in (401, 403, 419):
             session, token = _prepare_ibon_session()
             if session is None:

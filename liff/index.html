@@ -107,8 +107,104 @@ function attachExternalHandler(node, url){
 function fetchActs(){
   var url = buildActivitiesUrl();
   return fetch(url, { credentials: "include", mode: "cors" }).then(function(res){
+
     if (!res.ok) throw new Error("HTTP " + res.status);
     return res.json();
+  }).then(function(body){
+    return body && body.results ? body.results : {};
+  }).catch(function(err){
+    console.error("watch_status error", err);
+    return {};
+  });
+}
+
+function fetchWatchStatus(chatId, urls){
+  if (!chatId || !Array.isArray(urls) || urls.length === 0) return Promise.resolve({});
+  var unique = [];
+  var seen = {};
+  urls.forEach(function(u){
+    if (typeof u !== "string") return;
+    var val = u.trim();
+    if (!val || seen[val]) return;
+    seen[val] = true;
+    unique.push(val);
+  });
+  if (unique.length === 0) return Promise.resolve({});
+
+  return fetch(STATUS_API, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    credentials: "include",
+    mode: "cors",
+    body: JSON.stringify({ chatId: chatId, urls: unique })
+  }).then(function(res){
+    if (!res.ok) throw new Error("HTTP " + res.status);
+    return res.json();
+  }).then(function(body){
+    return body && body.results ? body.results : {};
+  }).catch(function(err){
+    console.error("watch_status error", err);
+    return {};
+  });
+}
+
+function fetchWatchStatus(chatId, urls){
+  if (!chatId || !Array.isArray(urls) || urls.length === 0) return Promise.resolve({});
+  var unique = [];
+  var seen = {};
+  urls.forEach(function(u){
+    if (typeof u !== "string") return;
+    var val = u.trim();
+    if (!val || seen[val]) return;
+    seen[val] = true;
+    unique.push(val);
+  });
+  if (unique.length === 0) return Promise.resolve({});
+
+  return fetch(STATUS_API, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    credentials: "include",
+    mode: "cors",
+    body: JSON.stringify({ chatId: chatId, urls: unique })
+  }).then(function(res){
+    if (!res.ok) throw new Error("HTTP " + res.status);
+    return res.json();
+  }).then(function(body){
+    return body && body.results ? body.results : {};
+  }).catch(function(err){
+    console.error("watch_status error", err);
+    return {};
+  });
+}
+
+function fetchWatchStatus(chatId, urls){
+  if (!chatId || !Array.isArray(urls) || urls.length === 0) return Promise.resolve({});
+  var unique = [];
+  var seen = {};
+  urls.forEach(function(u){
+    if (typeof u !== "string") return;
+    var val = u.trim();
+    if (!val || seen[val]) return;
+    seen[val] = true;
+    unique.push(val);
+  });
+  if (unique.length === 0) return Promise.resolve({});
+
+  return fetch(STATUS_API, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    credentials: "include",
+    mode: "cors",
+    body: JSON.stringify({ chatId: chatId, urls: unique })
+  }).then(function(res){
+    if (!res.ok) throw new Error("HTTP " + res.status);
+    return res.json();
+  }).then(function(body){
+    return body && body.results ? body.results : {};
+  }).catch(function(err){
+    console.error("watch_status error", err);
+    return {};
   });
 }
 
@@ -195,10 +291,12 @@ function render(acts, ctx){
       var img = el("img", "poster", "");
       img.src = it.image;
       img.alt = title;
+
       if (url){
         img.style.cursor = "pointer";
         attachExternalHandler(img, url);
       }
+
       card.appendChild(img);
     }
 
@@ -228,7 +326,6 @@ function render(acts, ctx){
     }
 
     var buttons = el("div", "row buttons", "");
-
     var btnWatch = el("button", null, "✅ 監看");
     btnWatch.onclick = function(){
       if (!url){ alert("此活動沒有可用的 URL，無法監看。"); return; }
@@ -251,11 +348,13 @@ function render(acts, ctx){
         }
         status.enabled = true;
         status.watching = true;
+
         try {
           liff.openWindow({ url: url, external: true });
         } catch (err) {
           console.warn("openWindow failed", err);
         }
+
       }).catch(function(e){
         alert("送訊息或開啟頁面失敗：" + e);
         console.error(e);
