@@ -4,6 +4,7 @@ import re
 import json
 import time
 import uuid
+import base64
 import hashlib
 import logging
 import traceback
@@ -50,8 +51,8 @@ def _sleep_backoff(attempt: int):
 def _as_list(x):
     return x if isinstance(x, list) else []
 
-IBON_API = "https://ticketapi.ibon.com.tw/api/ActivityInfo/GetIndexData"
-IBON_TOKEN_API = "https://ticketapi.ibon.com.tw/api/ActivityInfo/GetToken"
+IBON_API = "https://ticket.ibon.com.tw/api/ActivityInfo/GetIndexData"
+IBON_TOKEN_API = "https://ticket.ibon.com.tw/api/ActivityInfo/GetToken"
 IBON_BASE = "https://ticket.ibon.com.tw/"
 # NEW: 首頁輪播 URL 抽成環境變數（可覆寫）
 IBON_ENT_URL = os.getenv("IBON_ENT_URL", "https://ticket.ibon.com.tw/Index/entertainment")
@@ -60,11 +61,26 @@ IBON_ENT_URL = os.getenv("IBON_ENT_URL", "https://ticket.ibon.com.tw/Index/enter
 _cache = {"ts": 0, "data": []}
 _CACHE_TTL = 300  # 秒
 
-_CONCERT_WORDS = ("演唱會", "演場會", "音樂會", "演唱", "演出", "LIVE", "Live")
+_CONCERT_WORDS = (
+    "演唱會",
+    "演場會",
+    "音樂會",
+    "音樂節",
+    "音樂祭",
+    "演唱",
+    "演出",
+    "巡演",
+    "演奏",
+    "見面會",
+    "Fan Meeting",
+    "LIVE",
+    "Live",
+)
 
 def _looks_like_concert(title: str) -> bool:
     t = title or ""
-    return any(w.lower() in t.lower() for w in _CONCERT_WORDS)
+    low = t.lower()
+    return any(w.lower() in low for w in _CONCERT_WORDS)
 
 
 def _extract_xsrf_token(payload: Any) -> Optional[str]:
@@ -73,17 +89,17 @@ def _extract_xsrf_token(payload: Any) -> Optional[str]:
     def _collect_tokens(src: Any) -> List[str]:
         out: List[str] = []
         if isinstance(src, dict):
-            for key in ("token", "Token", "xsrfToken", "XSRFToken", "XsrfToken", "Xsrf", "XSRF"):
+            for key in ("token", "Token", "xsrfToken", "XSRFToken", "XsrfToken", "Xsrf", "XSRF", "Message", "message"):
                 val = src.get(key)
                 if isinstance(val, str) and val.strip():
                     out.append(val.strip())
-            # Item 內有 Message / Token
             item = src.get("Item") or src.get("item")
             if isinstance(item, dict):
                 out.extend(_collect_tokens(item))
-            # 其它巢狀結構
             for v in src.values():
                 if isinstance(v, dict):
+                    out.extend(_collect_tokens(v))
+                elif isinstance(v, list):
                     out.extend(_collect_tokens(v))
         elif isinstance(src, list):
             for v in src:
@@ -92,14 +108,33 @@ def _extract_xsrf_token(payload: Any) -> Optional[str]:
             out.append(src.strip())
         return out
 
+    def _maybe_decode(candidate: str) -> Optional[str]:
+        cand = candidate.strip()
+        if not cand:
+            return None
+        if "|" in cand:
+            parts = [p.strip() for p in cand.split("|") if p.strip()]
+            if parts:
+                return parts[-1]
+        # Base64 (新版 API Message)
+        b64_charset = set("ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/=_-")
+        if all((ch in b64_charset) for ch in cand):
+            padded = cand + "=" * ((4 - len(cand) % 4) % 4)
+            try:
+                decoded = base64.b64decode(padded).decode("utf-8", errors="ignore")
+                if decoded:
+                    return _maybe_decode(decoded)
+            except Exception:
+                pass
+        return cand
+
     candidates = _collect_tokens(payload)
     for cand in candidates:
-        token = cand
-        if "|" in token:
-            parts = [p.strip() for p in token.split("|") if p.strip()]
-            if parts:
-                token = parts[-1]
+        token = _maybe_decode(cand)
+        if not token:
+            continue
         token = unquote(token)
+        token = token.strip()
         if token:
             return token
     return None
@@ -167,24 +202,27 @@ def _normalize_item(row):
     兼容不同欄位名稱（含 ActivityInfoId / Link 等）。
     """
     # title
-    title = (row.get("Title") or row.get("ActivityTitle") or row.get("GameName")
-             or row.get("Name") or row.get("Subject") or "活動")
+    title = (row.get("Title") or row.get("ActivityTitle") or row.get("ActivityName")
+             or row.get("GameName") or row.get("Name") or row.get("Subject") or "活動")
 
     # image
     img = (row.get("ImgUrl") or row.get("ImageUrl") or row.get("Image")
-           or row.get("PicUrl") or row.get("PictureUrl") or "").strip() or None
+           or row.get("PicUrl") or row.get("PictureUrl")
+           or row.get("ActivityImage") or row.get("ActivityImageUrl")
+           or row.get("ActivityImageURL") or "").strip() or None
 
     # url / id
-    url = (row.get("Url") or row.get("URL") or row.get("LinkUrl")
+    url = (row.get("GameTicketURL") or row.get("GameTicketUrl")
+           or row.get("Url") or row.get("URL") or row.get("LinkUrl")
            or row.get("LinkURL") or row.get("Link") or "").strip()
 
     if not url:
-        act_id = (row.get("ActivityInfoId") or row.get("ActivityInfoID")
-                  or row.get("ActivityId") or row.get("ActivityID")
+        act_id = (row.get("ActivityID") or row.get("ActivityId")
+                  or row.get("ActivityInfoId") or row.get("ActivityInfoID")
                   or row.get("GameId") or row.get("GameID")
                   or row.get("Id") or row.get("ID"))
         if act_id:
-            url = urljoin(IBON_BASE, f"/ActivityInfo/Details/{act_id}")
+            url = urljoin(IBON_BASE, f"/ActivityInfo/Details?id={act_id}")
 
     # 統一為絕對網址
     if url and not url.lower().startswith("http"):
@@ -195,6 +233,22 @@ def _normalize_item(row):
         img = urljoin(IBON_BASE, img)
 
     return {"title": str(title).strip(), "url": url, "image": img}
+
+
+def _activity_id_from_url(url: str) -> Optional[str]:
+    try:
+        parsed = urlparse(url)
+        q = parse_qs(parsed.query)
+        for key in ("id", "ID", "activityId", "ActivityId"):
+            vals = q.get(key)
+            if vals:
+                return str(vals[0])
+        m = re.search(r"/ActivityInfo/Details/(\d+)", parsed.path or "")
+        if m:
+            return m.group(1)
+    except Exception:
+        pass
+    return None
 
 # --------- 直接打 API 拉清單 ---------
 def fetch_ibon_list_via_api(limit=10, keyword=None, only_concert=False):
@@ -213,78 +267,149 @@ def fetch_ibon_list_via_api(limit=10, keyword=None, only_concert=False):
 
         session: Optional[requests.Session] = None
         token: Optional[str] = None
-        base_rows = []
-        for attempt in range(3):
-            if session is None:
-                session, token = _prepare_ibon_session()
+        base_rows: List[Dict[str, Optional[str]]] = []
+        seen_urls: set[str] = set()
 
-            try:
-                headers = {
-                    "Origin": "https://ticket.ibon.com.tw",
-                    "Referer": IBON_ENT_URL,
-                    "X-Requested-With": "XMLHttpRequest",
-                }
-                if token:
-                    headers["X-XSRF-TOKEN"] = token
+        patterns = ["ENTERTAINMENT", "CONCERT", "LEISURE"]
 
-                files = {"pattern": (None, "")}
+        def _extract_lists(data: Any) -> List[Dict[str, Any]]:
+            buckets: List[Dict[str, Any]] = []
 
-                r = session.post(
-                    IBON_API,
-                    headers=headers,
-                    files=files,
-                    timeout=10,
-                )
-                if r.status_code == 200:
-                    data = r.json()
-                    blobs = []
-                    root = data.get("Data") or data.get("data") or data
-                    if isinstance(root, dict):
-                        for v in root.values():
-                            if isinstance(v, list):
-                                blobs.extend(v)
-                            elif isinstance(v, dict) and isinstance(v.get("ActivityList"), list):
-                                blobs.extend(v["ActivityList"])
-                    elif isinstance(root, list):
-                        blobs = root
-                    if not blobs and isinstance(data, dict):
-                        for v in data.values():
-                            if isinstance(v, list):
-                                blobs.extend(v)
+            def walk(node: Any):
+                if isinstance(node, list):
+                    for it in node:
+                        if isinstance(it, dict):
+                            buckets.append(it)
+                        walk(it)
+                elif isinstance(node, dict):
+                    for v in node.values():
+                        if isinstance(v, list):
+                            walk(v)
+                        elif isinstance(v, dict):
+                            walk(v)
 
-                    for r0 in blobs or []:
-                        try:
-                            item = _normalize_item(r0 if isinstance(r0, dict) else {})
-                            if item.get("url"):
-                                base_rows.append(item)
-                        except Exception:
-                            continue
-                    break  # 成功就離開重試迴圈
+            if isinstance(data, dict):
+                item = data.get("Item") or data.get("item")
+                if item is not None:
+                    walk(item)
+                else:
+                    walk(data)
+            elif isinstance(data, list):
+                walk(data)
+            return buckets
 
-                if r.status_code in (401, 403, 419):
-                    app.logger.info(f"[ibon api] auth http={r.status_code}, refresh token")
+        def _append_rows(payload: Any):
+            nonlocal base_rows
+
+            container: Any = payload.get("Item") if isinstance(payload, dict) else payload
+            candidate_lists: List[List[Dict[str, Any]]] = []
+
+            if isinstance(container, dict):
+                for key in ("List", "HotList", "ActivityList"):
+                    val = container.get(key)
+                    if isinstance(val, list) and val:
+                        candidate_lists.append(val)
+
+            if not candidate_lists:
+                candidate_lists.append(_extract_lists(container))
+
+            for arr in candidate_lists:
+                for raw in arr or []:
+                    if not isinstance(raw, dict):
+                        continue
+                    try:
+                        item = _normalize_item(raw)
+                    except Exception:
+                        continue
+
+                    act_id = (
+                        raw.get("ActivityID")
+                        or raw.get("ActivityId")
+                        or raw.get("ActivityInfoId")
+                        or raw.get("GameId")
+                        or raw.get("GameID")
+                    )
+                    if act_id:
+                        act_id = str(act_id)
+                    url = item.get("url")
+                    if not url and act_id:
+                        url = urljoin(IBON_BASE, f"/ActivityInfo/Details?id={act_id}")
+                        item["url"] = url
+
+                    if not url:
+                        continue
+
+                    canon = canonicalize_url(url)
+                    if canon in seen_urls:
+                        continue
+
+                    seen_urls.add(canon)
+                    base_rows.append(item)
+
+        for pattern in patterns:
+            for attempt in range(3):
+                if session is None:
                     session, token = _prepare_ibon_session()
-                    continue
 
-                if 500 <= r.status_code < 600:
-                    app.logger.warning(f"[ibon api] http={r.status_code} -> open breaker")
-                    _open_breaker()
-                    base_rows = []
+                if session is None:
                     break
-                app.logger.info(f"[ibon api] http={r.status_code}")
-            except Exception as e:
-                app.logger.info(f"[ibon api] err: {e}")
-            _sleep_backoff(attempt)
+
+                try:
+                    headers = {
+                        "Origin": "https://ticket.ibon.com.tw",
+                        "Referer": IBON_ENT_URL,
+                        "X-Requested-With": "XMLHttpRequest",
+                    }
+                    if token:
+                        headers["X-XSRF-TOKEN"] = token
+
+                    r = session.post(
+                        IBON_API,
+                        headers=headers,
+                        data={"pattern": pattern or ""},
+                        timeout=10,
+                    )
+                    if r.status_code == 200:
+                        try:
+                            data = r.json()
+                        except Exception:
+                            data = {}
+                        status = data.get("StatusCode") if isinstance(data, dict) else None
+                        if status not in (None, 0):
+                            app.logger.info(f"[ibon api] status={status} pattern={pattern}")
+                        _append_rows(data)
+                        break
+
+                    if r.status_code in (401, 403, 419):
+                        app.logger.info(f"[ibon api] auth http={r.status_code}, refresh token")
+                        session, token = _prepare_ibon_session()
+                        continue
+
+                    if 500 <= r.status_code < 600:
+                        app.logger.warning(f"[ibon api] http={r.status_code} pattern={pattern} -> open breaker")
+                        _open_breaker()
+                        base_rows = []
+                        break
+
+                    app.logger.info(f"[ibon api] http={r.status_code} pattern={pattern}")
+                except Exception as e:
+                    app.logger.info(f"[ibon api] err: {e}")
+                _sleep_backoff(attempt)
+
+            if _breaker_open_now():
+                break
 
         _cache = {"ts": now, "data": base_rows}
 
     # 過濾 + 截斷（這個 return 要在迴圈外！）
     out = []
     kw = (keyword or "").strip()
+    kw_lower = kw.lower()
     for it in base_rows or []:
-        if kw and kw not in it["title"]:
+        title = it.get("title", "")
+        if kw and kw_lower not in title.lower():
             continue
-        if only_concert and not _looks_like_concert(it["title"]):
+        if only_concert and not _looks_like_concert(title):
             continue
         out.append(it)
         if len(out) >= max(1, int(limit)):
@@ -311,6 +436,10 @@ from google.cloud import firestore
 
 # ===== Flask & CORS =====
 app = Flask(__name__)
+try:
+    app.url_map.strict_slashes = False
+except Exception:
+    pass
 
 # === Browser helper: Selenium → Playwright fallback ===
 def _run_js_with_fallback(url: str, js_func_literal: str):
@@ -389,7 +518,7 @@ def grab_ibon_carousel_urls():
     script = r"""
     () => {
       try {
-        const url = "https://ticketapi.ibon.com.tw/api/ActivityInfo/GetIndexData";
+        const url = "https://ticket.ibon.com.tw/api/ActivityInfo/GetIndexData";
         const token = (() => {
           const raw = document.cookie.split(";").map(v => v.trim()).find(v => v.startsWith("XSRF-TOKEN="));
           if (!raw) return null;
@@ -418,9 +547,9 @@ def grab_ibon_carousel_urls():
 
         const norm = (obj) => {
           if (!obj || typeof obj !== "object") return;
-          const title = obj.Title || obj.ActivityTitle || obj.GameName || obj.Name || obj.Subject;
-          const link  = obj.Url || obj.URL || obj.LinkUrl || obj.LinkURL || obj.Link;
-          const id    = obj.ActivityInfoId || obj.ActivityInfoID || obj.ActivityId || obj.ActivityID ||
+          const title = obj.Title || obj.ActivityTitle || obj.ActivityName || obj.GameName || obj.Name || obj.Subject;
+          const link  = obj.GameTicketURL || obj.GameTicketUrl || obj.Url || obj.URL || obj.LinkUrl || obj.LinkURL || obj.Link;
+          const id    = obj.ActivityID || obj.ActivityId || obj.ActivityInfoId || obj.ActivityInfoID ||
                         obj.GameId || obj.GameID || obj.Id || obj.ID;
 
           let href = null;
@@ -551,7 +680,8 @@ _RE_DATE = re.compile(r"(\d{4}/\d{2}/\d{2})\s+(\d{2}:\d{2})")
 _RE_AREA_TAG = re.compile(r"<area\b[^>]*>", re.I)
 
 LOGO = "https://ticketimg2.azureedge.net/logo.png"
-TICKET_API = "https://ticketapi.ibon.com.tw/api/ActivityInfo/GetGameInfoList"
+TICKET_API = "https://ticket.ibon.com.tw/api/ActivityInfo/GetGameInfoList"
+IBON_DETAIL_API = "https://ticket.ibon.com.tw/api/ActivityInfo/GetDetailData"
 
 # ================= 小工具 =================
 def soup_parse(html: str) -> BeautifulSoup:
@@ -698,8 +828,12 @@ def _deep_pick_activity_info(data: Any) -> Dict[str, str]:
     return {k: v for k, v in out.items() if v}
 
 def fetch_game_info_from_api(perf_id: Optional[str], product_id: Optional[str], referer_url: str, sess: requests.Session) -> Dict[str, str]:
+    session, token = _prepare_ibon_session()
+    if session is None:
+        return {}
+
     headers = {
-        "Origin": "https://orders.ibon.com.tw",
+        "Origin": "https://ticket.ibon.com.tw",
         "Referer": referer_url,
         "User-Agent": UA,
         "Accept": "application/json, text/plain, */*",
@@ -707,108 +841,341 @@ def fetch_game_info_from_api(perf_id: Optional[str], product_id: Optional[str], 
         "X-Requested-With": "XMLHttpRequest",
         "Accept-Language": "zh-TW,zh;q=0.9,en;q=0.6",
     }
-    tries: List[Tuple[str, Dict[str, Optional[str]]]] = []
+    if token:
+        headers["X-XSRF-TOKEN"] = token
+
+    params_list: List[Dict[str, Any]] = []
     if perf_id or product_id:
-        tries += [
-            ("GET",  {"Performance_ID": perf_id, "Product_ID": product_id}),
-            ("GET",  {"PerformanceId": perf_id,  "ProductId":  product_id}),
-            ("GET",  {"PERFORMANCE_ID": perf_id,"PRODUCT_ID": product_id}),
-            ("POST", {"Performance_ID": perf_id, "Product_ID": product_id}),
-            ("POST", {"PerformanceId": perf_id,  "ProductId":  product_id}),
-        ]
-    tries.append(("GET", {}))  # 無參數也試
+        params_list.extend([
+            {"Performance_ID": perf_id, "Product_ID": product_id},
+            {"PerformanceId": perf_id, "ProductId": product_id},
+            {"PERFORMANCE_ID": perf_id, "PRODUCT_ID": product_id},
+        ])
+
+    activity_ids: List[str] = []
+    if referer_url:
+        act = _activity_id_from_url(referer_url)
+        if act:
+            activity_ids.append(act)
+    if perf_id and perf_id in PROMO_DETAILS_MAP:
+        act = _activity_id_from_url(PROMO_DETAILS_MAP[perf_id])
+        if act:
+            activity_ids.append(act)
+
+    for act in activity_ids:
+        try:
+            params_list.insert(0, {"id": int(act)})
+        except Exception:
+            params_list.insert(0, {"id": act})
+
+    params_list.append({})
 
     picked: Dict[str, str] = {}
-    for method, params in tries:
+
+    for params in params_list:
+        payload = {k: v for k, v in params.items() if v}
         try:
-            if method == "GET":
-                r = sess.get(TICKET_API, params={k: v for k, v in (params or {}).items() if v}, headers=headers, timeout=12)
-            else:
-                r = sess.post(TICKET_API, json={k: v for k, v in (params or {}).items() if v}, headers=headers, timeout=12)
-            if r.status_code != 200:
+            resp = session.post(TICKET_API, json=payload, headers=headers, timeout=12)
+        except Exception as e:
+            app.logger.info(f"[api] fetch fail ({params}): {e}")
+            continue
+
+        if resp.status_code == 200:
+            try:
+                data = resp.json()
+            except Exception as e:
+                app.logger.info(f"[api] bad json ({params}): {e}")
                 continue
 
-            data = r.json()
-            s = json.dumps(data, ensure_ascii=False)
-
+            text_blob = json.dumps(data, ensure_ascii=False)
             info = _deep_pick_activity_info(data)
 
-            m = re.search(r'https?://ticket\.ibon\.com\.tw/ActivityInfo/Details/(\d+)', s)
+            act_id = None
+            m = re.search(r'"ActivityID"\s*:\s*(\d+)', text_blob)
             if m:
-                info["details"] = m.group(0)
-            else:
-                m = (re.search(r'"ActivityInfoId"\s*:\s*(\d+)', s) or
-                     re.search(r'"ActivityId"\s*:\s*(\d+)', s) or
-                     re.search(r'"Id"\s*:\s*(\d+)', s))
+                act_id = m.group(1)
+            elif activity_ids:
+                act_id = activity_ids[0]
+
+            if act_id:
+                info.setdefault("details", f"https://ticket.ibon.com.tw/ActivityInfo/Details?id={act_id}")
+                info.setdefault("activity_id", act_id)
+
+            if not info.get("details"):
+                m = re.search(r'https?://ticket\.ibon\.com\.tw/ActivityInfo/Details/(\d+)', text_blob)
                 if m:
-                    info["details"] = f"https://ticket.ibon.com.tw/ActivityInfo/Details/{m.group(1)}"
+                    info["details"] = m.group(0)
+                    info.setdefault("activity_id", m.group(1))
 
             if not info.get("poster"):
-                promo = find_activity_image_any(s)
+                promo = find_activity_image_any(text_blob)
                 if promo:
                     info["poster"] = promo
 
-            def match_obj(obj):
-                text = json.dumps(obj, ensure_ascii=False)
+            def match_obj(obj: Any) -> bool:
+                if not isinstance(obj, (dict, list)):
+                    return False
+                blob = json.dumps(obj, ensure_ascii=False)
                 ok = True
-                if perf_id: ok = ok and (perf_id in text)
-                if product_id: ok = ok and (product_id in text)
+                if perf_id:
+                    ok = ok and (perf_id in blob)
+                if product_id:
+                    ok = ok and (product_id in blob)
                 return ok
+
             if isinstance(data, list):
                 for it in data:
-                    if match_obj(it): info.update(_deep_pick_activity_info(it)); break
+                    if match_obj(it):
+                        info.update(_deep_pick_activity_info(it))
+                        break
             elif isinstance(data, dict):
                 for v in data.values():
                     if isinstance(v, list):
                         for it in v:
-                            if match_obj(it): info.update(_deep_pick_activity_info(it)); break
+                            if match_obj(it):
+                                info.update(_deep_pick_activity_info(it))
+                                break
 
             if info:
                 picked = info
                 break
 
-        except Exception as e:
-            app.logger.info(f"[api] fetch fail ({method} {params}): {e}")
+        elif resp.status_code in (401, 403, 419):
+            session, token = _prepare_ibon_session()
+            if session is None:
+                break
+            headers = {
+                "Origin": "https://ticket.ibon.com.tw",
+                "Referer": referer_url,
+                "User-Agent": UA,
+                "Accept": "application/json, text/plain, */*",
+                "Content-Type": "application/json;charset=UTF-8",
+                "X-Requested-With": "XMLHttpRequest",
+                "Accept-Language": "zh-TW,zh;q=0.9,en;q=0.6",
+            }
+            if token:
+                headers["X-XSRF-TOKEN"] = token
             continue
 
     return picked
 
 def fetch_from_ticket_details(details_url: str, sess: requests.Session) -> Dict[str, str]:
     out: Dict[str, str] = {}
-    try:
-        r = sess.get(details_url, timeout=12)
-        if r.status_code != 200:
-            return out
-        html = r.text
-        soup = soup_parse(html)
 
-        for sel in [
-            'meta[property="og:image:secure_url"]',
-            'meta[property="og:image"]',
-            'meta[name="twitter:image"]',
-        ]:
-            m = soup.select_one(sel)
-            if m and m.get("content"):
-                out["poster"] = urljoin(details_url, m["content"].strip())
+    def _abs_url(u: Optional[str]) -> Optional[str]:
+        if not u:
+            return None
+        try:
+            return urljoin(details_url, u)
+        except Exception:
+            return u
+
+    def _format_api_dt(val: Optional[str]) -> Optional[str]:
+        if not val or not isinstance(val, str):
+            return None
+        raw = val.strip()
+        if not raw:
+            return None
+        clean = raw.replace("Z", "")
+        if "+" in clean:
+            clean = clean.split("+")[0]
+        for fmt in ("%Y-%m-%dT%H:%M:%S.%f", "%Y-%m-%dT%H:%M:%S"):
+            try:
+                dt = datetime.strptime(clean, fmt)
+                return dt.strftime("%Y/%m/%d %H:%M")
+            except ValueError:
+                continue
+        return None
+
+    activity_id = _activity_id_from_url(details_url)
+    if activity_id:
+        out.setdefault("activity_id", str(activity_id))
+
+    api_item: Optional[Dict[str, Any]] = None
+    if activity_id:
+        session: Optional[requests.Session] = None
+        token: Optional[str] = None
+        for attempt in range(3):
+            if session is None:
+                session, token = _prepare_ibon_session()
+            if session is None:
                 break
-        if not out.get("poster"):
-            for img in soup.find_all("img"):
-                src = (img.get("src") or "").strip()
-                if src and any(k in src.lower() for k in ("activityimage","azureedge","banner","cover","adimage")):
-                    out["poster"] = urljoin(details_url, src); break
+            headers = {
+                "Origin": "https://ticket.ibon.com.tw",
+                "Referer": details_url,
+                "X-Requested-With": "XMLHttpRequest",
+            }
+            if token:
+                headers["X-XSRF-TOKEN"] = token
+            try:
+                resp = session.post(
+                    IBON_DETAIL_API,
+                    files={"id": (None, str(activity_id))},
+                    headers=headers,
+                    timeout=10,
+                )
+                if resp.status_code == 200:
+                    data = resp.json()
+                    item = data.get("Item") if isinstance(data, dict) else None
+                    if isinstance(item, dict):
+                        api_item = item
+                    break
+                if resp.status_code in (401, 403, 419):
+                    session, token = _prepare_ibon_session()
+                    continue
+                if 500 <= resp.status_code < 600:
+                    app.logger.info(f"[details-api] http={resp.status_code}")
+                    break
+            except Exception as e:
+                app.logger.info(f"[details-api] err: {e}")
+            _sleep_backoff(attempt)
 
-        h1 = soup.select_one("h1")
-        if h1:
-            t = h1.get_text(" ", strip=True)
-            if t: out["title"] = t
+    content_lines: List[str] = []
+    content_html = ""
 
-        tx = soup.get_text(" ", strip=True)
-        m = re.search(r'(\d{4}/\d{2}/\d{2})\s*(?:([\u4e00-\u9fff]))?\s*(\d{2}:\d{2})', tx)
-        if m: out["dt"] = f"{m.group(1)} {m.group(3)}"
+    if api_item:
+        if api_item.get("ActivityID"):
+            activity_id = str(api_item.get("ActivityID"))
+            out.setdefault("activity_id", activity_id)
 
-    except Exception as e:
-        app.logger.info(f"[details] fetch fail: {e}")
-    return out
+        title = (api_item.get("ActivityName") or api_item.get("ActivityTitle") or "").strip()
+        if title:
+            out.setdefault("title", title)
+
+        poster = (
+            api_item.get("ActivityImageURL")
+            or api_item.get("ActivityImage")
+            or api_item.get("PlatformImageURL")
+        )
+        poster = _abs_url(str(poster).strip()) if poster else None
+        if poster:
+            out.setdefault("poster", poster)
+
+        place = (api_item.get("ActivityLocation") or api_item.get("ActivityPlace") or "").strip()
+        if place:
+            out.setdefault("place", place)
+
+        start_dt = (
+            _format_api_dt(api_item.get("ActivityShowFrom"))
+            or _format_api_dt(api_item.get("ActivityTicketSDate"))
+            or _format_api_dt(api_item.get("ActivitySDate"))
+        )
+        end_dt = (
+            _format_api_dt(api_item.get("ActivityShowTo"))
+            or _format_api_dt(api_item.get("ActivityTicketEDate"))
+            or _format_api_dt(api_item.get("ActivityEDate"))
+        )
+        if start_dt and end_dt and start_dt != end_dt:
+            out.setdefault("dt", f"{start_dt} ~ {end_dt}")
+        elif start_dt:
+            out.setdefault("dt", start_dt)
+        elif end_dt:
+            out.setdefault("dt", end_dt)
+
+        content_html = api_item.get("ActivityContent") or ""
+        if content_html:
+            try:
+                regex_place = None
+                m = re.search(r'(?:演出|活動)?地點[：:]+\s*([^<\n\r]+)', content_html, flags=re.I)
+                if m:
+                    regex_place = re.sub(r"\s+", " ", m.group(1)).strip()
+                if not regex_place:
+                    m = re.search(r'(?:演出|活動)?地點[：:][^<]*<[^>]*>([^<]+)', content_html, flags=re.I)
+                    if m:
+                        regex_place = re.sub(r"\s+", " ", m.group(1)).strip()
+                if regex_place:
+                    out.setdefault("place", regex_place)
+
+                soup = soup_parse(content_html)
+                content_lines = [ln.strip() for ln in soup.get_text("\n").split("\n") if ln.strip()]
+                if not out.get("poster"):
+                    img = soup.find("img")
+                    if img and img.get("src"):
+                        out["poster"] = _abs_url(img.get("src")) or out.get("poster")
+                if not out.get("poster"):
+                    promo = find_activity_image_any(content_html)
+                    if promo:
+                        out["poster"] = promo
+            except Exception as e:
+                app.logger.info(f"[details-api] content parse err: {e}")
+
+    # 透過內容文字補齊場地與時間
+    if content_lines:
+        if not out.get("place"):
+            for idx, line in enumerate(content_lines):
+                if any(key in line for key in ("地點", "場地", "地址")):
+                    candidate = line.split("：", 1)[-1].strip()
+                    if candidate and candidate != line and len(candidate) > 2:
+                        out["place"] = candidate
+                        break
+                    for j in range(idx + 1, len(content_lines)):
+                        nxt = content_lines[j].strip()
+                        if not nxt:
+                            continue
+                        if nxt.endswith("："):
+                            continue
+                        if any(key in nxt for key in ("日期", "時間", "票價", "售票")):
+                            continue
+                        out["place"] = nxt
+                        break
+                    if out.get("place"):
+                        break
+        if not out.get("dt"):
+            for line in content_lines:
+                m = _RE_DATE.search(line)
+                if m:
+                    out["dt"] = f"{m.group(1)} {m.group(2)}"
+                    break
+
+    # HTML 備援：若關鍵資訊仍缺，才去抓整頁
+    need_html = not all(out.get(k) for k in ("title", "poster", "dt", "place"))
+    if need_html:
+        try:
+            r = sess.get(details_url, timeout=12)
+            if r.status_code == 200:
+                html = r.text
+                soup = soup_parse(html)
+
+                if not out.get("poster"):
+                    for sel in [
+                        'meta[property="og:image:secure_url"]',
+                        'meta[property="og:image"]',
+                        'meta[name="twitter:image"]',
+                    ]:
+                        m = soup.select_one(sel)
+                        if m and m.get("content"):
+                            out["poster"] = urljoin(details_url, m["content"].strip())
+                            break
+                    if not out.get("poster"):
+                        for img in soup.find_all("img"):
+                            src = (img.get("src") or "").strip()
+                            if src and any(k in src.lower() for k in ("activityimage", "azureedge", "banner", "cover", "adimage")):
+                                out["poster"] = urljoin(details_url, src)
+                                break
+
+                if not out.get("title"):
+                    h1 = soup.select_one("h1")
+                    if h1:
+                        t = h1.get_text(" ", strip=True)
+                        if t:
+                            out["title"] = t
+
+                if not out.get("dt"):
+                    tx = soup.get_text(" ", strip=True)
+                    m = re.search(r'(\d{4}/\d{2}/\d{2})\s*(?:([\u4e00-\u9fff]))?\s*(\d{2}:\d{2})', tx)
+                    if m:
+                        out["dt"] = f"{m.group(1)} {m.group(3)}"
+
+                if not out.get("place"):
+                    title_html, place_html, _ = extract_title_place_from_html(html)
+                    if place_html:
+                        out["place"] = place_html
+                    if title_html and not out.get("title"):
+                        out["title"] = title_html
+        except Exception as e:
+            app.logger.info(f"[details] fetch fail: {e}")
+
+    return {k: v for k, v in out.items() if v}
 
 # ---- 圖片（宣傳圖 + 座位圖）----
 def pick_event_images_from_000(html: str, base_url: str) -> Tuple[str, Optional[str]]:
@@ -1497,6 +1864,8 @@ def handle_command(text: str, chat_id: str):
 
 # ============= Webhook / Scheduler / Diag =============
 @app.route("/webhook", methods=["POST"])
+@app.route("/line/webhook", methods=["POST"])
+@app.route("/callback", methods=["POST"])
 def webhook():
     if not (HAS_LINE and handler):
         app.logger.warning("Webhook invoked but handler not ready")
@@ -1798,6 +2167,9 @@ def fetch_ibon_ent_html_hard(limit=10, keyword=None, only_concert=False):
 
 # --- backward-compat alias（舊名→新實作；一定要放在函式「外面」） ---
 def fetch_ibon_entertainments(limit=10, keyword=None, only_concert=False):
+    items = fetch_ibon_list_via_api(limit=limit, keyword=keyword, only_concert=only_concert)
+    if items:
+        return items
     return fetch_ibon_ent_html_hard(limit=limit, keyword=keyword, only_concert=only_concert)
 
 def _truthy(v: Optional[str]) -> bool:
@@ -1816,84 +2188,169 @@ def fetch_ibon_carousel_from_api(limit=10, keyword=None, only_concert=False):
         app.logger.info("[carousel-api] breaker open -> skip API, go HTML")
         return []
 
-    url = IBON_API
-    s = requests.Session()
-    s.headers.update({
-        "User-Agent": UA,
-        "Accept-Language": "zh-TW,zh;q=0.9,en;q=0.6",
-        "Accept": "application/json, text/plain, */*",
-        "Connection": "close",
-    })
-    try:
-        s.get(IBON_ENT_URL, timeout=12)
-    except Exception:
-        pass
+    session, token = _prepare_ibon_session()
+    if session is None:
+        return []
 
     headers = {
         "Origin": "https://ticket.ibon.com.tw",
-        "Referer": "https://ticket.ibon.com.tw/Index/entertainment",
-        "Content-Type": "application/json;charset=UTF-8",
+        "Referer": IBON_ENT_URL,
+        "X-Requested-With": "XMLHttpRequest",
     }
+    if token:
+        headers["X-XSRF-TOKEN"] = token
 
-    data = None
-    try:
-        r = s.post(url, json={}, headers=headers, timeout=12)
-        if r.status_code == 200:
-            data = r.json()
-        else:
-            app.logger.warning(f"[carousel-api] POST http={r.status_code} -> open breaker")
-            _API_BREAK_UNTIL = time.time() + 1800  # 30 分鐘
-            return []
-    except Exception as e:
-        app.logger.warning(f"[carousel-api] POST {e} -> open breaker")
-        _API_BREAK_UNTIL = time.time() + 1800
+    kw = (keyword or "").strip()
+    kw_lower = kw.lower()
+    max_items = max(1, int(limit))
+    items: List[Dict[str, Optional[str]]] = []
+    seen_urls: set[str] = set()
+
+    def _should_keep(title: str) -> bool:
+        if kw and kw_lower not in title.lower():
+            return False
+        if only_concert and not _looks_like_concert(title):
+            return False
+        return True
+
+    def _try_append(raw: Dict[str, Any]) -> bool:
+        if not isinstance(raw, dict):
+            return False
+        try:
+            item = _normalize_item(raw)
+        except Exception:
+            return False
+
+        url = item.get("url")
+        if not url:
+            return False
+
+        canon = canonicalize_url(url)
+        if canon in seen_urls:
+            return False
+
+        title = item.get("title", "")
+        if not _should_keep(title):
+            return False
+
+        seen_urls.add(canon)
+        items.append(item)
+        return len(items) >= max_items
+
+    def _parse_activity_list(val: Any) -> List[Dict[str, Any]]:
+        if isinstance(val, list):
+            return [it for it in val if isinstance(it, (dict, str, int))]
+        if isinstance(val, str) and val.strip():
+            try:
+                parsed = json.loads(val)
+                if isinstance(parsed, list):
+                    return [it for it in parsed if isinstance(it, (dict, str, int))]
+            except Exception:
+                pass
+            return [{"ActivityID": x.strip()} for x in val.split(",") if x.strip()]
         return []
 
-    items, seen = [], set()
+    patterns = ["ENTERTAINMENT", "CONCERT"]
 
-    def _append_from_list(arr):
-        nonlocal items, seen
-        for r in arr or []:
+    for pattern in patterns:
+        try:
+            resp = session.post(
+                IBON_API,
+                data={"pattern": pattern},
+                headers=headers,
+                timeout=12,
+            )
+        except Exception as e:
+            app.logger.warning(f"[carousel-api] POST err {e}")
+            _API_BREAK_UNTIL = time.time() + 1800
+            return []
+
+        if resp.status_code == 200:
             try:
-                it = _normalize_item(r if isinstance(r, dict) else {})
-                if not it.get("url"):
-                    continue
-                if keyword and keyword not in it["title"]:
-                    continue
-                if only_concert and not _looks_like_concert(it["title"]):
-                    continue
-                if it["url"] in seen:
-                    continue
-                seen.add(it["url"])
-                items.append(it)
-                if len(items) >= max(1, int(limit)):
-                    return True
+                payload = resp.json()
             except Exception:
-                continue
-        return False
+                payload = {}
 
-    def _iter_lists(obj, path=""):
-        if isinstance(obj, list):
-            yield (path, obj)
-        elif isinstance(obj, dict):
-            for k, v in obj.items():
-                p = f"{path}.{k}" if path else str(k)
-                yield from _iter_lists(v, p)
+            container: Any = payload.get("Item") if isinstance(payload, dict) else payload
+            if not isinstance(container, dict):
+                container = {}
 
-    car_lists, other_lists = [], []
-    for path, arr in _iter_lists(data):
-        if isinstance(arr, list) and arr:
-            (car_lists if any(k in path.lower() for k in ("banner","carousel","ad","focus","slider","swiper"))
-             else other_lists).append((path, arr))
-    for _, arr in car_lists:
-        if _append_from_list(arr):
-            break
-    if len(items) < limit:
-        for _, arr in other_lists:
-            if _append_from_list(arr):
+            base_list = _as_list(container.get("List"))
+            activity_by_id: Dict[str, Dict[str, Any]] = {}
+            for raw in base_list:
+                if isinstance(raw, dict):
+                    act_id = (
+                        raw.get("ActivityID")
+                        or raw.get("ActivityId")
+                        or raw.get("Id")
+                        or raw.get("ID")
+                    )
+                    if act_id is not None:
+                        activity_by_id[str(act_id)] = raw
+
+            atap_entries = _as_list(container.get("ATAP"))
+            ordered_refs: List[tuple[int, int, str]] = []  # (bucket_idx, order, act_id)
+            for bucket_idx, bucket in enumerate(atap_entries):
+                if not isinstance(bucket, dict):
+                    continue
+                parsed_list = _parse_activity_list(bucket.get("ActivityList"))
+                if not parsed_list:
+                    parsed_list = _parse_activity_list(bucket.get("Activitys"))
+                for idx, entry in enumerate(parsed_list):
+                    act_id = None
+                    order_val = idx
+                    if isinstance(entry, dict):
+                        act_id = (
+                            entry.get("ActivityID")
+                            or entry.get("ActivityId")
+                            or entry.get("ID")
+                            or entry.get("Id")
+                        )
+                        try:
+                            order_val = int(entry.get("ActivityNo", idx))
+                        except Exception:
+                            order_val = idx
+                    elif isinstance(entry, (str, int)):
+                        act_id = entry
+                    if act_id is None:
+                        continue
+                    ordered_refs.append((bucket_idx, order_val, str(act_id)))
+
+            ordered_refs.sort(key=lambda x: (x[0], x[1]))
+
+            for _, _, act_id in ordered_refs:
+                row = activity_by_id.get(act_id)
+                if row and _try_append(row):
+                    break
+
+            if len(items) < max_items:
+                for raw in base_list:
+                    if _try_append(raw):
+                        break
+
+            if len(items) >= max_items:
                 break
 
-    return items[:limit] if items else []
+        elif resp.status_code in (401, 403, 419):
+            session, token = _prepare_ibon_session()
+            if session is None:
+                break
+            headers = {
+                "Origin": "https://ticket.ibon.com.tw",
+                "Referer": IBON_ENT_URL,
+                "X-Requested-With": "XMLHttpRequest",
+            }
+            if token:
+                headers["X-XSRF-TOKEN"] = token
+            continue
+        else:
+            app.logger.warning(
+                f"[carousel-api] http={resp.status_code} pattern={pattern} -> open breaker"
+            )
+            _API_BREAK_UNTIL = time.time() + 1800
+            return []
+
+    return items[:max_items] if items else []
 
 def _extract_carousel_html_hard(html: str, limit=10, keyword=None, only_concert=False):
     """
@@ -2020,6 +2477,77 @@ def liff_activities():
             return jsonify({"ok": False, "error": str(e), "trace": trace}), 200
         return jsonify({"ok": False, "error": str(e)}), 500
 
+@app.route("/liff/watch_status", methods=["POST"])
+def liff_watch_status():
+    try:
+        payload = request.get_json(silent=True) or {}
+        if not isinstance(payload, dict):
+            payload = {}
+    except Exception:
+        payload = {}
+
+    chat_id = str(payload.get("chatId") or payload.get("userId") or "").strip()
+    urls_raw = payload.get("urls")
+    if isinstance(urls_raw, str):
+        urls_list = [urls_raw]
+    elif isinstance(urls_raw, list):
+        urls_list = urls_raw
+    else:
+        urls_list = []
+
+    clean_urls: List[str] = []
+    for u in urls_list:
+        if not isinstance(u, str):
+            continue
+        val = u.strip()
+        if val:
+            clean_urls.append(val)
+
+    if not chat_id:
+        return jsonify({"ok": False, "error": "missing chatId"}), 400
+
+    if not clean_urls:
+        return jsonify({"ok": True, "results": {}}), 200
+
+    results: Dict[str, Dict[str, Any]] = {}
+
+    for url in clean_urls:
+        entry = {"watching": False, "enabled": False, "taskId": None, "found": False}
+
+        if not FS_OK:
+            results[url] = entry
+            continue
+
+        try:
+            canon = canonicalize_url(url)
+            doc = fs_get_task_by_canon(chat_id, canon)
+        except Exception as e:
+            app.logger.error(f"[liff_watch_status] lookup failed for {url}: {e}")
+            entry["error"] = str(e)
+            results[url] = entry
+            continue
+
+        if doc:
+            data = doc.to_dict()
+            tid = str(data.get("id", "")).strip() or None
+            enabled = bool(data.get("enabled"))
+            entry.update({
+                "found": True,
+                "taskId": tid,
+                "enabled": enabled,
+                "watching": enabled,
+            })
+            period = data.get("period")
+            if period is not None:
+                try:
+                    entry["period"] = int(period)
+                except Exception:
+                    entry["period"] = period
+
+        results[url] = entry
+
+    return jsonify({"ok": True, "results": results}), 200
+
 @app.route("/liff/activities_debug", methods=["GET"])
 def liff_activities_debug():
     try:
@@ -2043,6 +2571,7 @@ def liff_activities_debug():
 
     return jsonify({"ok": True, "count": 0, "items": [], "trace": trace}), 200
 
+@app.route("/liff", methods=["GET"])
 @app.route("/liff/", methods=["GET"])
 def liff_index():
     return send_from_directory("liff", "index.html")
@@ -2056,7 +2585,7 @@ def netcheck():
     urls = [
         "https://www.google.com",
         "https://ticket.ibon.com.tw/Index/entertainment",
-        "https://ticketapi.ibon.com.tw/api/ActivityInfo/GetIndexData",
+        "https://ticket.ibon.com.tw/api/ActivityInfo/GetIndexData",
     ]
     out = []
     for u in urls:
@@ -2070,7 +2599,7 @@ def netcheck():
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=int(os.getenv("PORT", "8080")))# --- Health & Root routes (auto-added) ---
 try:
-    import os, socket, datetime, subprocess
+    import os, socket, datetime as _datetime_mod, subprocess
     from flask import jsonify
     from flask import Flask  # 若已匯入會被覆蓋無害
     def _git_sha():
@@ -2090,7 +2619,7 @@ try:
         return jsonify({
             "status":"ok",
             "service":"ticketsearch",
-            "time": datetime.datetime.utcnow().isoformat()+"Z",
+            "time": _datetime_mod.datetime.utcnow().isoformat()+"Z",
             "host": socket.gethostname(),
             "region": os.environ.get("REGION","asia-east1"),
             "project": os.environ.get("GOOGLE_CLOUD_PROJECT") or os.environ.get("PROJECT_ID"),
