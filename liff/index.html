@@ -12,9 +12,14 @@
     .card { border:1px solid #ddd; border-radius:12px; padding:12px; margin:10px 0; }
     .title { font-weight:700; }
     .hint { color:#666; }
-    button { padding:8px 12px; border-radius:10px; border:1px solid #ccc; cursor:pointer; }
+    button { padding:8px 12px; border-radius:10px; border:1px solid #ccc; cursor:pointer; background:#fff; }
+    button.secondary { background:#f5f5f5; }
+    button.danger { background:#ffeaea; border-color:#ffbcbc; }
     input { padding:6px 8px; border-radius:8px; border:1px solid #ccc; width:90px; }
     #out { margin:8px 0; color:#999; }
+    .poster { width:100%; max-width:360px; border-radius:10px; margin:12px 0 6px; object-fit:cover; }
+    .buttons { gap:10px; }
+    .status { margin-top:6px; font-size:0.92em; }
   </style>
 </head>
 <body>
@@ -30,6 +35,7 @@
 var LIFF_ID = "2008066018-EMmpzmKo";  // 你的 LIFF ID
 var API     = "https://ticketsearch-933798663509.asia-east1.run.app/liff/activities"; // ← 改成你的完整網址
 var MIN_SEC = 15;
+var ACT_LIMIT = 30;
 /** ===================================== */
 
 function ensureSec(v){
@@ -38,11 +44,76 @@ function ensureSec(v){
   return n;
 }
 
+function buildActivitiesUrl(){
+  var u;
+  try {
+    u = new URL(API);
+  } catch (e) {
+    u = new URL(API, window.location.href);
+  }
+  u.searchParams.set("onlyConcert", "1");
+  if (ACT_LIMIT && !isNaN(ACT_LIMIT)) {
+    u.searchParams.set("limit", String(ACT_LIMIT));
+  }
+  return u.toString();
+}
+
+function computeStatusApi(){
+  var u;
+  try {
+    u = new URL(API);
+  } catch (e) {
+    u = new URL(API, window.location.href);
+  }
+  var parts = u.pathname.split("/").filter(function(p){ return p; });
+  if (parts.length === 0){
+    parts = ["liff", "watch_status"];
+  } else {
+    parts[parts.length - 1] = "watch_status";
+  }
+  u.pathname = "/" + parts.join("/");
+  u.search = "";
+  u.hash = "";
+  return u.toString();
+}
+
+var STATUS_API = computeStatusApi();
+
 function fetchActs(){
-  // 用完整網域時，建議帶上 credentials，後端需允許 CORS
-  return fetch(API, { credentials: "include", mode: "cors" }).then(function(res){
+  var url = buildActivitiesUrl();
+  return fetch(url, { credentials: "include", mode: "cors" }).then(function(res){
     if (!res.ok) throw new Error("HTTP " + res.status);
     return res.json();
+  });
+}
+
+function fetchWatchStatus(chatId, urls){
+  if (!chatId || !Array.isArray(urls) || urls.length === 0) return Promise.resolve({});
+  var unique = [];
+  var seen = {};
+  urls.forEach(function(u){
+    if (typeof u !== "string") return;
+    var val = u.trim();
+    if (!val || seen[val]) return;
+    seen[val] = true;
+    unique.push(val);
+  });
+  if (unique.length === 0) return Promise.resolve({});
+
+  return fetch(STATUS_API, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    credentials: "include",
+    mode: "cors",
+    body: JSON.stringify({ chatId: chatId, urls: unique })
+  }).then(function(res){
+    if (!res.ok) throw new Error("HTTP " + res.status);
+    return res.json();
+  }).then(function(body){
+    return body && body.results ? body.results : {};
+  }).catch(function(err){
+    console.error("watch_status error", err);
+    return {};
   });
 }
 
@@ -53,7 +124,24 @@ function el(tag, cls, html){
   return d;
 }
 
-function render(acts){
+function resolveChatId(){
+  if (!liff.isInClient()) return Promise.resolve(null);
+  try {
+    var ctx = liff.getContext();
+    if (ctx) {
+      if (ctx.type === "group" && ctx.groupId) return Promise.resolve(ctx.groupId);
+      if (ctx.type === "room" && ctx.roomId) return Promise.resolve(ctx.roomId);
+      if (ctx.userId) return Promise.resolve(ctx.userId);
+    }
+  } catch (e) {
+    console.warn("getContext failed", e);
+  }
+  return liff.getProfile().then(function(p){
+    return p && p.userId ? p.userId : null;
+  }).catch(function(){ return null; });
+}
+
+function render(acts, ctx){
   var elList = document.getElementById("list");
   elList.innerHTML = "";
 
@@ -62,12 +150,28 @@ function render(acts){
     return;
   }
 
+  ctx = ctx || {};
+  var statusMap = ctx.statusMap || {};
+  var chatId = ctx.chatId || null;
+
   acts.forEach(function(it, i){
     var title = it.title || ("活動 " + (i + 1));
-    var url   = it.url || "";
+    var url   = (it.url || "").trim();
+    var normUrl = url;
+    var status = statusMap[normUrl];
+    if (!status) {
+      status = statusMap[normUrl] = { watching: false, enabled: false, taskId: null };
+    }
 
     var card = el("div", "card", "");
     card.appendChild(el("div", "title", String(i+1).padStart(2,"0") + ". " + title));
+
+    if (it.image){
+      var img = el("img", "poster", "");
+      img.src = it.image;
+      img.alt = title;
+      card.appendChild(img);
+    }
 
     var row  = el("div", "row", "");
     var link = el("a", null, "活動頁面");
@@ -81,32 +185,123 @@ function render(acts){
     }
     row.appendChild(link);
 
-    var btn = el("button", null, "✅ 監看");
-    btn.onclick = function(){
+    card.appendChild(row);
+
+    var statusLabel = null;
+    if (status.taskId){
+      var text = status.enabled ? ("狀態：監看中｜任務 " + status.taskId) : ("狀態：任務 " + status.taskId + " 已停用");
+      statusLabel = el("div", "hint status", text);
+      card.appendChild(statusLabel);
+    } else if (status.found){
+      statusLabel = el("div", "hint status", "狀態：此活動已建立任務但目前未啟用");
+      card.appendChild(statusLabel);
+    }
+
+    var buttons = el("div", "row buttons", "");
+
+    var btnWatch = el("button", null, "✅ 監看");
+    btnWatch.onclick = function(){
       if (!url){ alert("此活動沒有可用的 URL，無法監看。"); return; }
       var s = ensureSec(document.getElementById("sec").value);
-      var text = "/watch " + url + " " + s;
-
-      btn.disabled = true; btn.textContent = "送出中…";
-      var finish = function(){ btn.disabled = false; btn.textContent = "✅ 監看"; };
-
       if (!liff.isInClient()){
         alert("提示：目前不是從 LINE 內開啟，將僅開啟活動頁面。");
         window.open(url, "_blank");
-        finish();
         return;
       }
+      var text = "/watch " + url + " " + s;
+      var original = btnWatch.textContent;
+      btnWatch.disabled = true; btnWatch.textContent = "送出中…";
       liff.sendMessages([{ type:"text", text:text }]).then(function(){
         alert("已送出監看指令到聊天室！");
-        return liff.openWindow({ url: url, external: false });
+        if (statusLabel){
+          statusLabel.textContent = "狀態：已送出監看指令，請留意聊天室回覆任務代碼。";
+        } else {
+          statusLabel = el("div", "hint status", "狀態：已送出監看指令，請留意聊天室回覆任務代碼。");
+          card.appendChild(statusLabel);
+        }
+        status.enabled = true;
+        status.watching = true;
+        try {
+          liff.openWindow({ url: url, external: true });
+        } catch (err) {
+          console.warn("openWindow failed", err);
+        }
       }).catch(function(e){
         alert("送訊息或開啟頁面失敗：" + e);
         console.error(e);
-      }).finally(finish);
+      }).finally(function(){
+        btnWatch.disabled = false;
+        btnWatch.textContent = original;
+      });
     };
+    buttons.appendChild(btnWatch);
 
-    row.appendChild(btn);
-    card.appendChild(row);
+    var btnStop = el("button", "danger", "⏹ 停止監看");
+    btnStop.onclick = function(){
+      if (!url){ alert("此活動沒有可用的 URL。"); return; }
+      if (!liff.isInClient()){
+        alert("請於 LINE 內使用停止監看功能。");
+        return;
+      }
+      if (!chatId){
+        alert("未取得聊天室識別，請重新開啟 LIFF 後再試一次。");
+        return;
+      }
+      if (!status.taskId || !status.enabled){
+        alert("此活動無監看");
+        return;
+      }
+      var original = btnStop.textContent;
+      btnStop.disabled = true; btnStop.textContent = "送出中…";
+      liff.sendMessages([{ type:"text", text:"/unwatch " + status.taskId }]).then(function(){
+        alert("已送出停止監看指令！");
+        status.enabled = false;
+        status.watching = false;
+        if (statusLabel){
+          statusLabel.textContent = "狀態：已送出停止監看指令，請留意聊天室回覆。";
+        } else {
+          statusLabel = el("div", "hint status", "狀態：已送出停止監看指令，請留意聊天室回覆。");
+          card.appendChild(statusLabel);
+        }
+      }).catch(function(e){
+        alert("送出停止監看失敗：" + e);
+        console.error(e);
+      }).finally(function(){
+        btnStop.disabled = false;
+        btnStop.textContent = original;
+      });
+    };
+    buttons.appendChild(btnStop);
+
+    var btnCheck = el("button", "secondary", "👀 快速查看");
+    btnCheck.onclick = function(){
+      if (!url){ alert("此活動沒有可用的 URL。"); return; }
+      if (!liff.isInClient()){
+        alert("提示：目前不是從 LINE 內開啟，將直接開啟活動頁面。");
+        window.open(url, "_blank");
+        return;
+      }
+      var original = btnCheck.textContent;
+      btnCheck.disabled = true; btnCheck.textContent = "送出中…";
+      liff.sendMessages([{ type:"text", text:"/check " + url }]).then(function(){
+        alert("已送出快速查看指令！");
+        if (statusLabel){
+          statusLabel.textContent = "狀態：已送出快速查看指令，請於聊天室查看回覆。";
+        } else {
+          statusLabel = el("div", "hint status", "狀態：已送出快速查看指令，請於聊天室查看回覆。");
+          card.appendChild(statusLabel);
+        }
+      }).catch(function(e){
+        alert("送出快速查看失敗：" + e);
+        console.error(e);
+      }).finally(function(){
+        btnCheck.disabled = false;
+        btnCheck.textContent = original;
+      });
+    };
+    buttons.appendChild(btnCheck);
+
+    card.appendChild(buttons);
     elList.appendChild(card);
   });
 }
@@ -122,13 +317,28 @@ function boot(){
   var out = document.getElementById("out");
   out.textContent = "LIFF 初始化中…";
 
+  var activities = [];
+
   liff.init({ liffId: LIFF_ID }).then(function(){
-    if (!liff.isInClient()){
+    var inClient = liff.isInClient();
+    if (!inClient){
       out.textContent = "提示：請從 LINE 內開啟此頁，以便直接把指令送回聊天室。";
     }else{
       out.textContent = "";
     }
-    return fetchActs().then(render).catch(function(e){
+
+    return fetchActs().then(function(acts){
+      activities = Array.isArray(acts) ? acts : [];
+      if (!inClient){
+        render(activities, { statusMap: {} });
+        return;
+      }
+      return resolveChatId().then(function(chatId){
+        return fetchWatchStatus(chatId, activities.map(function(it){ return it && it.url ? it.url : ""; })).then(function(status){
+          render(activities, { statusMap: status, chatId: chatId });
+        });
+      });
+    }).catch(function(e){
       console.error(e); showApiError();
     });
   }).catch(function(e){
