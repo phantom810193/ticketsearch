@@ -2212,6 +2212,7 @@ def fetch_ibon_entertainments(limit=10, keyword=None, only_concert=False):
 
 _EVENT_DETAIL_CACHE: Dict[str, Dict[str, Any]] = {}
 _EVENT_DETAIL_CACHE_TTL = int(os.getenv("EVENT_DETAIL_CACHE_TTL", "600"))
+
 _LIFF_CONCERT_CACHE: Dict[Tuple[str, int], Dict[str, Any]] = {}
 _LIFF_CONCERT_CACHE_TTL = int(os.getenv("LIFF_CONCERT_CACHE_TTL", "20"))
 
@@ -2437,7 +2438,6 @@ def parse_event_detail(url: str, sess: Optional[requests.Session] = None) -> Dic
     _detail_cache_set(url, result)
     return result
 
-
 def _prepare_enrich_session() -> Optional[requests.Session]:
     session, token = _prepare_ibon_session()
     if session is None:
@@ -2493,6 +2493,7 @@ def get_ibon_concerts(mode: str, limit: int = 30) -> List[Dict[str, Any]]:
         limit_val = int(limit)
     except Exception:
         limit_val = 20
+
     limit_val = max(1, min(50, limit_val))
 
     mode_clean = (mode or "carousel").lower()
@@ -2533,6 +2534,7 @@ def get_ibon_concerts(mode: str, limit: int = 30) -> List[Dict[str, Any]]:
             session = sess_default()
         except Exception:
             session = None
+
 
     results: List[Dict[str, Any]] = []
     seen_urls: set[str] = set()
@@ -2594,6 +2596,7 @@ def get_ibon_concerts(mode: str, limit: int = 30) -> List[Dict[str, Any]]:
         if len(results) >= limit_val:
             break
 
+
     return results
 
 
@@ -2608,6 +2611,7 @@ def _json_with_cache(payload: Dict[str, Any], ttl: int):
     resp = jsonify(payload)
     resp.headers["Cache-Control"] = f"public, max-age={ttl}"
     resp.headers["Content-Type"] = "application/json; charset=utf-8"
+
     return resp
 
 
@@ -2615,6 +2619,7 @@ def _json_no_cache(payload: Dict[str, Any], status: int = 200):
     resp = jsonify(payload)
     resp.headers["Cache-Control"] = "no-store"
     resp.headers["Content-Type"] = "application/json; charset=utf-8"
+
     return resp, status
 
 # 簡單保險絲（30 分鐘）
@@ -2893,6 +2898,7 @@ def api_liff_concerts():
             _concert_cache_set(("all", limit), {"items": items, "mode": "all"})
 
     payload = {"items": items, "mode": final_mode}
+
     _concert_cache_set(cache_key, payload)
     resp = _json_with_cache(payload, _LIFF_CONCERT_CACHE_TTL)
     resp.headers["X-Cache"] = "MISS"
@@ -2916,6 +2922,7 @@ def api_liff_watch():
     period = max(15, int(period))
 
     if not chat_id:
+
         chat_id = (
             request.headers.get("X-Chat-Id")
             or request.headers.get("X-Line-UserId")
@@ -2945,6 +2952,7 @@ def api_liff_watch():
     detail = parse_event_detail(url)
     message = "已開始監看" if created else "已更新監看"
 
+
     resp_payload = {
         "ok": True,
         "task_id": tid,
@@ -2953,8 +2961,8 @@ def api_liff_watch():
         "message": message,
         "detail": detail,
     }
-    return _json_with_cache(resp_payload, 15)
 
+    return _json_with_cache(resp_payload, 15)
 
 @app.post("/api/liff/unwatch")
 @cross_origin()
@@ -2968,6 +2976,7 @@ def api_liff_unwatch():
     url = str(payload.get("url") or "").strip()
 
     if not chat_id:
+
         chat_id = (
             request.headers.get("X-Chat-Id")
             or request.headers.get("X-Line-UserId")
@@ -2985,6 +2994,7 @@ def api_liff_unwatch():
         resp = _json_with_cache({"ok": False, "error": "firestore_unavailable"}, 15)
         resp.status_code = 503
         return resp
+
 
     detail = parse_event_detail(url) if url else None
 
@@ -3010,12 +3020,13 @@ def api_liff_unwatch():
         return resp
 
     resp_payload = {"ok": True, "message": "stopped"}
+
     if tid:
         resp_payload["task_id"] = tid
     if detail:
         resp_payload["detail"] = detail
-    return _json_with_cache(resp_payload, 15)
 
+    return _json_with_cache(resp_payload, 15)
 
 @app.post("/api/liff/quick-check")
 @cross_origin()
@@ -3046,6 +3057,7 @@ def api_liff_quick_check():
         "remain": remain,
         "message": message,
         "status_text": status_text,
+
         "detail": detail,
     }
     ttl = max(15, min(30, _LIFF_CONCERT_CACHE_TTL))
@@ -3213,6 +3225,14 @@ def liff_index():
             return send_from_directory("liff", "index.html")
         except Exception:
             return "LIFF OK", 200
+
+
+@app.get("/liff/<path:filename>")
+def liff_static(filename: str):
+    try:
+        return send_from_directory("liff", filename)
+    except Exception:
+        abort(404)
 
 
 @app.get("/liff/<path:filename>")

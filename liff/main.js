@@ -78,6 +78,7 @@
     const img = document.createElement("img");
     const cover = item.image || item.image_url || item.cover || "";
     img.src = cover || PLACEHOLDER_IMAGE;
+
     img.alt = item.title || "活動圖片";
     img.onerror = () => {
       if (img.src !== PLACEHOLDER_IMAGE) {
@@ -88,6 +89,7 @@
 
     const meta = document.createElement("div");
     meta.className = "meta";
+
     const dateLine = createMetaLine("📅", item.datetime || item.date_text || item.date || "");
     const placeLine = createMetaLine("📍", item.venue || item.place || "");
     const remainLine = (typeof item.remain === "number" && Number.isFinite(item.remain))
@@ -96,6 +98,7 @@
     if (dateLine) meta.appendChild(dateLine);
     if (placeLine) meta.appendChild(placeLine);
     if (remainLine) meta.appendChild(remainLine);
+
     card.appendChild(meta);
 
     const links = document.createElement("div");
@@ -113,6 +116,7 @@
     const statusText = document.createElement("div");
     statusText.className = "status-text";
     statusText.textContent = buildStatusLine(item);
+
     card.appendChild(statusText);
 
     const watchInfo = document.createElement("div");
@@ -133,6 +137,7 @@
     btnStop.className = "danger btn-stop";
     btnStop.type = "button";
     btnStop.textContent = "⛔️ 停止監看";
+
     btnStop.addEventListener("click", () => handleUnwatch(item, card, statusText, watchInfo, feedback));
     buttons.appendChild(btnStop);
 
@@ -140,6 +145,7 @@
     btnQuick.className = "secondary btn-quick";
     btnQuick.type = "button";
     btnQuick.textContent = "👁 快速查看";
+
     btnQuick.addEventListener("click", () => handleQuickCheck(item, card, statusText, feedback));
     buttons.appendChild(btnQuick);
 
@@ -209,11 +215,13 @@
       updateWatchState(item.url, { watching: true, enabled: true, taskId: body.task_id, found: true });
       updateCardWatchInfo(item.url, watchInfo);
       setCardFeedback(feedback, body.message || "已開始監看。");
+
       if (body.detail){
         statusText.textContent = buildStatusLine({
           remain: body.detail.remain ?? body.detail.remaining,
           status_text: body.detail.status_text,
         });
+
       }
     } catch (err) {
       console.error("watch failed", err);
@@ -260,6 +268,7 @@
       if (!res.ok){
         throw new Error(body.error || `HTTP ${res.status}`);
       }
+
       if (!body.ok && body.reason === "no_watch"){
         updateWatchState(item.url, { watching: false, enabled: false, taskId: current.taskId || null, found: false });
         updateCardWatchInfo(item.url, watchInfo);
@@ -280,6 +289,7 @@
           status_text: body.detail.status_text,
         });
       }
+
     } catch (err) {
       console.error("unwatch failed", err);
       alert(`停止監看失敗：${err.message || err}`);
@@ -288,6 +298,7 @@
       if (btn){
         btn.disabled = false;
         btn.textContent = original || "⛔️ 停止監看";
+
       }
     }
   }
@@ -310,6 +321,7 @@
       if (!res.ok || !body.ok){
         throw new Error(body.error || `HTTP ${res.status}`);
       }
+
       const detail = body.detail || {};
       if (detail){
         statusText.textContent = buildStatusLine({
@@ -318,6 +330,7 @@
         });
       }
       setCardFeedback(feedback, body.message || "已取得最新票數資訊。");
+
       if (body.message){
         if (state.isClient){
           try {
@@ -406,6 +419,7 @@
           sourceMode = fallback.mode || "all";
         }
       }
+
       state.items = items;
       const urls = items.map(it => it.url).filter(Boolean);
       try {
