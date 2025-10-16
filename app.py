@@ -61,11 +61,26 @@ IBON_ENT_URL = os.getenv("IBON_ENT_URL", "https://ticket.ibon.com.tw/Index/enter
 _cache = {"ts": 0, "data": []}
 _CACHE_TTL = 300  # 秒
 
-_CONCERT_WORDS = ("演唱會", "演場會", "音樂會", "演唱", "演出", "LIVE", "Live")
+_CONCERT_WORDS = (
+    "演唱會",
+    "演場會",
+    "音樂會",
+    "音樂節",
+    "音樂祭",
+    "演唱",
+    "演出",
+    "巡演",
+    "演奏",
+    "見面會",
+    "Fan Meeting",
+    "LIVE",
+    "Live",
+)
 
 def _looks_like_concert(title: str) -> bool:
     t = title or ""
-    return any(w.lower() in t.lower() for w in _CONCERT_WORDS)
+    low = t.lower()
+    return any(w.lower() in low for w in _CONCERT_WORDS)
 
 
 def _extract_xsrf_token(payload: Any) -> Optional[str]:
@@ -255,7 +270,8 @@ def fetch_ibon_list_via_api(limit=10, keyword=None, only_concert=False):
         base_rows: List[Dict[str, Optional[str]]] = []
         seen_urls: set[str] = set()
 
-        patterns = ["Concert", "Leisure", "Other"]
+        patterns = ["ENTERTAINMENT", "CONCERT", "LEISURE"]
+
 
         def _extract_lists(data: Any) -> List[Dict[str, Any]]:
             buckets: List[Dict[str, Any]] = []
@@ -285,16 +301,51 @@ def fetch_ibon_list_via_api(limit=10, keyword=None, only_concert=False):
 
         def _append_rows(payload: Any):
             nonlocal base_rows
-            for raw in _extract_lists(payload):
-                try:
-                    item = _normalize_item(raw)
-                except Exception:
-                    continue
-                url = item.get("url")
-                if not url or url in seen_urls:
-                    continue
-                seen_urls.add(url)
-                base_rows.append(item)
+
+            container: Any = payload.get("Item") if isinstance(payload, dict) else payload
+            candidate_lists: List[List[Dict[str, Any]]] = []
+
+            if isinstance(container, dict):
+                for key in ("List", "HotList", "ActivityList"):
+                    val = container.get(key)
+                    if isinstance(val, list) and val:
+                        candidate_lists.append(val)
+
+            if not candidate_lists:
+                candidate_lists.append(_extract_lists(container))
+
+            for arr in candidate_lists:
+                for raw in arr or []:
+                    if not isinstance(raw, dict):
+                        continue
+                    try:
+                        item = _normalize_item(raw)
+                    except Exception:
+                        continue
+
+                    act_id = (
+                        raw.get("ActivityID")
+                        or raw.get("ActivityId")
+                        or raw.get("ActivityInfoId")
+                        or raw.get("GameId")
+                        or raw.get("GameID")
+                    )
+                    if act_id:
+                        act_id = str(act_id)
+                    url = item.get("url")
+                    if not url and act_id:
+                        url = urljoin(IBON_BASE, f"/ActivityInfo/Details?id={act_id}")
+                        item["url"] = url
+
+                    if not url:
+                        continue
+
+                    canon = canonicalize_url(url)
+                    if canon in seen_urls:
+                        continue
+
+                    seen_urls.add(canon)
+                    base_rows.append(item)
 
         for pattern in patterns:
             for attempt in range(3):
@@ -313,12 +364,10 @@ def fetch_ibon_list_via_api(limit=10, keyword=None, only_concert=False):
                     if token:
                         headers["X-XSRF-TOKEN"] = token
 
-                    files = {"pattern": (None, pattern or "")}
-
                     r = session.post(
                         IBON_API,
                         headers=headers,
-                        files=files,
+                        data={"pattern": pattern or ""},
                         timeout=10,
                     )
                     if r.status_code == 200:
@@ -356,10 +405,12 @@ def fetch_ibon_list_via_api(limit=10, keyword=None, only_concert=False):
     # 過濾 + 截斷（這個 return 要在迴圈外！）
     out = []
     kw = (keyword or "").strip()
+    kw_lower = kw.lower()
     for it in base_rows or []:
-        if kw and kw not in it["title"]:
+        title = it.get("title", "")
+        if kw and kw_lower not in title.lower():
             continue
-        if only_concert and not _looks_like_concert(it["title"]):
+        if only_concert and not _looks_like_concert(title):
             continue
         out.append(it)
         if len(out) >= max(1, int(limit)):
@@ -2136,41 +2187,6 @@ def fetch_ibon_carousel_from_api(limit=10, keyword=None, only_concert=False):
     if session is None:
         return []
 
-    def _iter_lists(obj: Any, path: str = ""):
-        if isinstance(obj, list):
-            yield path, obj
-            for idx, it in enumerate(obj):
-                yield from _iter_lists(it, f"{path}[{idx}]")
-        elif isinstance(obj, dict):
-            for k, v in obj.items():
-                sub_path = f"{path}.{k}" if path else str(k)
-                yield from _iter_lists(v, sub_path)
-
-    items: List[Dict[str, Optional[str]]] = []
-    seen: set[str] = set()
-
-    def _append(arr: List[Any]) -> bool:
-        nonlocal items
-        for row in arr or []:
-            if not isinstance(row, dict):
-                continue
-            try:
-                it = _normalize_item(row)
-            except Exception:
-                continue
-            url = it.get("url")
-            if not url or url in seen:
-                continue
-            if keyword and keyword not in it["title"]:
-                continue
-            if only_concert and not _looks_like_concert(it["title"]):
-                continue
-            seen.add(url)
-            items.append(it)
-            if len(items) >= max(1, int(limit)):
-                return True
-        return False
-
     headers = {
         "Origin": "https://ticket.ibon.com.tw",
         "Referer": IBON_ENT_URL,
@@ -2179,13 +2195,63 @@ def fetch_ibon_carousel_from_api(limit=10, keyword=None, only_concert=False):
     if token:
         headers["X-XSRF-TOKEN"] = token
 
-    patterns = ["Concert", "Leisure"]
+    kw = (keyword or "").strip()
+    kw_lower = kw.lower()
+    max_items = max(1, int(limit))
+    items: List[Dict[str, Optional[str]]] = []
+    seen_urls: set[str] = set()
+
+    def _should_keep(title: str) -> bool:
+        if kw and kw_lower not in title.lower():
+            return False
+        if only_concert and not _looks_like_concert(title):
+            return False
+        return True
+
+    def _try_append(raw: Dict[str, Any]) -> bool:
+        if not isinstance(raw, dict):
+            return False
+        try:
+            item = _normalize_item(raw)
+        except Exception:
+            return False
+
+        url = item.get("url")
+        if not url:
+            return False
+
+        canon = canonicalize_url(url)
+        if canon in seen_urls:
+            return False
+
+        title = item.get("title", "")
+        if not _should_keep(title):
+            return False
+
+        seen_urls.add(canon)
+        items.append(item)
+        return len(items) >= max_items
+
+    def _parse_activity_list(val: Any) -> List[Dict[str, Any]]:
+        if isinstance(val, list):
+            return [it for it in val if isinstance(it, (dict, str, int))]
+        if isinstance(val, str) and val.strip():
+            try:
+                parsed = json.loads(val)
+                if isinstance(parsed, list):
+                    return [it for it in parsed if isinstance(it, (dict, str, int))]
+            except Exception:
+                pass
+            return [{"ActivityID": x.strip()} for x in val.split(",") if x.strip()]
+        return []
+
+    patterns = ["ENTERTAINMENT", "CONCERT"]
 
     for pattern in patterns:
         try:
             resp = session.post(
                 IBON_API,
-                files={"pattern": (None, pattern)},
+                data={"pattern": pattern},
                 headers=headers,
                 timeout=12,
             )
@@ -2200,36 +2266,65 @@ def fetch_ibon_carousel_from_api(limit=10, keyword=None, only_concert=False):
             except Exception:
                 payload = {}
 
-            item = payload.get("Item") if isinstance(payload, dict) else None
-            lists_with_path: List[tuple[str, List[Any]]] = []
-            if item:
-                for path, arr in _iter_lists(item):
-                    if isinstance(arr, list) and arr:
-                        lists_with_path.append((path, arr))
-            else:
-                for path, arr in _iter_lists(payload):
-                    if isinstance(arr, list) and arr:
-                        lists_with_path.append((path, arr))
+            container: Any = payload.get("Item") if isinstance(payload, dict) else payload
+            if not isinstance(container, dict):
+                container = {}
 
-            priority = []
-            secondary = []
-            for path, arr in lists_with_path:
-                lowered = path.lower()
-                if any(key in lowered for key in ("atap", "banner", "carousel", "focus", "slider", "swiper")):
-                    priority.append(arr)
-                else:
-                    secondary.append(arr)
+            base_list = _as_list(container.get("List"))
+            activity_by_id: Dict[str, Dict[str, Any]] = {}
+            for raw in base_list:
+                if isinstance(raw, dict):
+                    act_id = (
+                        raw.get("ActivityID")
+                        or raw.get("ActivityId")
+                        or raw.get("Id")
+                        or raw.get("ID")
+                    )
+                    if act_id is not None:
+                        activity_by_id[str(act_id)] = raw
 
-            for arr in priority + secondary:
-                if _append(arr):
+            atap_entries = _as_list(container.get("ATAP"))
+            ordered_refs: List[tuple[int, int, str]] = []  # (bucket_idx, order, act_id)
+            for bucket_idx, bucket in enumerate(atap_entries):
+                if not isinstance(bucket, dict):
+                    continue
+                parsed_list = _parse_activity_list(bucket.get("ActivityList"))
+                if not parsed_list:
+                    parsed_list = _parse_activity_list(bucket.get("Activitys"))
+                for idx, entry in enumerate(parsed_list):
+                    act_id = None
+                    order_val = idx
+                    if isinstance(entry, dict):
+                        act_id = (
+                            entry.get("ActivityID")
+                            or entry.get("ActivityId")
+                            or entry.get("ID")
+                            or entry.get("Id")
+                        )
+                        try:
+                            order_val = int(entry.get("ActivityNo", idx))
+                        except Exception:
+                            order_val = idx
+                    elif isinstance(entry, (str, int)):
+                        act_id = entry
+                    if act_id is None:
+                        continue
+                    ordered_refs.append((bucket_idx, order_val, str(act_id)))
+
+            ordered_refs.sort(key=lambda x: (x[0], x[1]))
+
+            for _, _, act_id in ordered_refs:
+                row = activity_by_id.get(act_id)
+                if row and _try_append(row):
                     break
 
-            if len(items) >= limit:
-                break
+            if len(items) < max_items:
+                for raw in base_list:
+                    if _try_append(raw):
+                        break
 
-        elif resp.status_code in (401, 403, 419):
-            session, token = _prepare_ibon_session()
-            if session is None:
+            if len(items) >= max_items:
+
                 break
             headers = {
                 "Origin": "https://ticket.ibon.com.tw",
@@ -2244,7 +2339,26 @@ def fetch_ibon_carousel_from_api(limit=10, keyword=None, only_concert=False):
             _API_BREAK_UNTIL = time.time() + 1800
             return []
 
-    return items[:limit] if items else []
+        elif resp.status_code in (401, 403, 419):
+            session, token = _prepare_ibon_session()
+            if session is None:
+                break
+            headers = {
+                "Origin": "https://ticket.ibon.com.tw",
+                "Referer": IBON_ENT_URL,
+                "X-Requested-With": "XMLHttpRequest",
+            }
+            if token:
+                headers["X-XSRF-TOKEN"] = token
+            continue
+        else:
+            app.logger.warning(
+                f"[carousel-api] http={resp.status_code} pattern={pattern} -> open breaker"
+            )
+            _API_BREAK_UNTIL = time.time() + 1800
+            return []
+
+    return items[:max_items] if items else []
 
 def _extract_carousel_html_hard(html: str, limit=10, keyword=None, only_concert=False):
     """
@@ -2370,6 +2484,77 @@ def liff_activities():
         if want_debug:
             return jsonify({"ok": False, "error": str(e), "trace": trace}), 200
         return jsonify({"ok": False, "error": str(e)}), 500
+
+@app.route("/liff/watch_status", methods=["POST"])
+def liff_watch_status():
+    try:
+        payload = request.get_json(silent=True) or {}
+        if not isinstance(payload, dict):
+            payload = {}
+    except Exception:
+        payload = {}
+
+    chat_id = str(payload.get("chatId") or payload.get("userId") or "").strip()
+    urls_raw = payload.get("urls")
+    if isinstance(urls_raw, str):
+        urls_list = [urls_raw]
+    elif isinstance(urls_raw, list):
+        urls_list = urls_raw
+    else:
+        urls_list = []
+
+    clean_urls: List[str] = []
+    for u in urls_list:
+        if not isinstance(u, str):
+            continue
+        val = u.strip()
+        if val:
+            clean_urls.append(val)
+
+    if not chat_id:
+        return jsonify({"ok": False, "error": "missing chatId"}), 400
+
+    if not clean_urls:
+        return jsonify({"ok": True, "results": {}}), 200
+
+    results: Dict[str, Dict[str, Any]] = {}
+
+    for url in clean_urls:
+        entry = {"watching": False, "enabled": False, "taskId": None, "found": False}
+
+        if not FS_OK:
+            results[url] = entry
+            continue
+
+        try:
+            canon = canonicalize_url(url)
+            doc = fs_get_task_by_canon(chat_id, canon)
+        except Exception as e:
+            app.logger.error(f"[liff_watch_status] lookup failed for {url}: {e}")
+            entry["error"] = str(e)
+            results[url] = entry
+            continue
+
+        if doc:
+            data = doc.to_dict()
+            tid = str(data.get("id", "")).strip() or None
+            enabled = bool(data.get("enabled"))
+            entry.update({
+                "found": True,
+                "taskId": tid,
+                "enabled": enabled,
+                "watching": enabled,
+            })
+            period = data.get("period")
+            if period is not None:
+                try:
+                    entry["period"] = int(period)
+                except Exception:
+                    entry["period"] = period
+
+        results[url] = entry
+
+    return jsonify({"ok": True, "results": results}), 200
 
 @app.route("/liff/activities_debug", methods=["GET"])
 def liff_activities_debug():
