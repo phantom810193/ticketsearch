@@ -12,8 +12,10 @@ import requests
 from datetime import datetime, timezone, timedelta
 from typing import Dict, Tuple, Optional, Any, List
 from urllib.parse import urlparse, urlunparse, parse_qs, urlencode, urljoin, unquote
-from flask import send_from_directory
-from flask import jsonify, Flask, request, abort
+from flask import Flask, jsonify, request, abort, send_from_directory
+
+app = Flask(__name__)
+app.url_map.strict_slashes = False
 # --- Browser engines (optional) ---
 try:
     from playwright.sync_api import sync_playwright
@@ -433,13 +435,6 @@ except Exception as e:
 
 # --------- Firestore（可失敗不致命）---------
 from google.cloud import firestore
-
-# ===== Flask & CORS =====
-app = Flask(__name__)
-try:
-    app.url_map.strict_slashes = False
-except Exception:
-    pass
 
 # === Browser helper: Selenium → Playwright fallback ===
 def _run_js_with_fallback(url: str, js_func_literal: str):
@@ -1863,9 +1858,11 @@ def handle_command(text: str, chat_id: str):
         return [TextSendMessage(text=msg)] if HAS_LINE else [msg]
 
 # ============= Webhook / Scheduler / Diag =============
-@app.route("/webhook", methods=["POST"])
-@app.route("/line/webhook", methods=["POST"])
-@app.route("/callback", methods=["POST"])
+
+@app.post("/webhook")
+@app.post("/line/webhook")
+@app.post("/callback")
+
 def webhook():
     if not (HAS_LINE and handler):
         app.logger.warning("Webhook invoked but handler not ready")
@@ -1877,7 +1874,7 @@ def webhook():
     except InvalidSignatureError:
         app.logger.warning("InvalidSignature on /webhook")
         abort(400)
-    return "OK"
+    return "OK", 200
 
 if HAS_LINE and handler:
 
@@ -2443,7 +2440,7 @@ def _extract_carousel_html_hard(html: str, limit=10, keyword=None, only_concert=
     return items
 
 # ====== 替換：/liff/activities 以多來源 fallback（優先輪播） ======
-@app.route("/liff/activities", methods=["GET"])
+@app.get("/liff/activities")
 def liff_activities():
     trace = []
     try:
@@ -2492,7 +2489,8 @@ def liff_activities():
             return jsonify({"ok": False, "error": str(e), "trace": trace}), 200
         return jsonify({"ok": False, "error": str(e)}), 500
 
-@app.route("/liff/watch_status", methods=["POST"])
+@app.post("/liff/watch_status")
+
 def liff_watch_status():
     try:
         payload = request.get_json(silent=True) or {}
@@ -2563,7 +2561,8 @@ def liff_watch_status():
 
     return jsonify({"ok": True, "results": results}), 200
 
-@app.route("/liff/activities_debug", methods=["GET"])
+@app.get("/liff/activities_debug")
+
 def liff_activities_debug():
     try:
         limit = int(request.args.get("limit", "10"))
@@ -2586,10 +2585,14 @@ def liff_activities_debug():
 
     return jsonify({"ok": True, "count": 0, "items": [], "trace": trace}), 200
 
-@app.route("/liff", methods=["GET"])
-@app.route("/liff/", methods=["GET"])
+@app.get("/liff")
+@app.get("/liff/")
+
 def liff_index():
-    return send_from_directory("liff", "index.html")
+    try:
+        return send_from_directory("liff", "index.html")
+    except Exception:
+        return "LIFF OK", 200
 
 @app.route("/liff/ping", methods=["GET"])
 def liff_ping():
@@ -2679,6 +2682,22 @@ try:
         return jsonify(routes=_dump_routes(app)), 200
 except Exception:
     pass
+
+
+@app.get("/__whoami")
+def __whoami():
+    return jsonify({
+        "module": __name__,
+        "strict_slashes": getattr(app.url_map, "strict_slashes", None),
+        "routes": sorted([str(r) for r in app.url_map.iter_rules()])[:80],
+    }), 200
+
+
+@app.errorhandler(404)
+def __nf(e):  # noqa: D401
+    print("[NF]", request.method, request.path)
+    return jsonify({"error": "not found", "path": request.path}), 404
+
 
 # === debug helper: attach __routes onto whichever app actually runs ===
 def _attach_debug_routes(flask_app):
