@@ -854,6 +854,109 @@ def find_details_url_candidates_from_html(html: str, base: str) -> List[str]:
         urls.add(urljoin("https://ticket.ibon.com.tw", m.group(0)))
     return list(urls)
 
+def _try_decode_ticket_target(val: str) -> Optional[str]:
+    if not val:
+        return None
+
+    queue: List[str] = [val]
+    seen: set[str] = set()
+
+    while queue:
+        cur = queue.pop(0)
+        if cur in seen:
+            continue
+        seen.add(cur)
+
+        cur = cur.strip()
+        if not cur:
+            continue
+
+        if cur.lower().startswith("http"):
+            return cur
+        if cur.startswith("//"):
+            return "https:" + cur
+        if cur.startswith("/"):
+            return urljoin("https://orders.ibon.com.tw/", cur)
+
+        unquoted = unquote(cur)
+        if unquoted != cur and unquoted not in seen:
+            queue.append(unquoted)
+
+        padded = cur + "=" * ((4 - len(cur) % 4) % 4)
+        try:
+            decoded = base64.b64decode(padded).decode("utf-8", errors="ignore")
+            if decoded and decoded not in seen:
+                queue.append(decoded)
+        except Exception:
+            pass
+
+    return None
+
+def _unwrap_go_ticket_url(u: str) -> Optional[str]:
+    if not u:
+        return None
+
+    abs_url = urljoin(IBON_BASE, u)
+    if "UTK0201_000" in abs_url.upper():
+        return abs_url
+
+    try:
+        parsed = urlparse(abs_url)
+    except Exception:
+        return None
+
+    if "GoTicketURL" not in parsed.path:
+        return abs_url if abs_url.lower().startswith("http") else None
+
+    q = parse_qs(parsed.query, keep_blank_values=True)
+    for key in ("GoUrl", "GoURL", "gourl", "RedirectUrl", "redirectUrl"):
+        vals = q.get(key)
+        if not vals:
+            continue
+        for raw in vals:
+            candidate = _try_decode_ticket_target(raw)
+            if candidate and "UTK0201_000" in candidate.upper():
+                return candidate
+
+    return None
+
+def _extract_ticket_urls_from_text(text: str) -> List[str]:
+    if not text:
+        return []
+
+    found: List[str] = []
+
+    def _append(candidate: Optional[str]):
+        if not candidate:
+            return
+        url = candidate.strip()
+        if not url:
+            return
+        if not url.lower().startswith("http"):
+            url = urljoin("https://orders.ibon.com.tw/", url.lstrip("/"))
+        if "UTK0201_000" not in url.upper():
+            return
+        if url not in found:
+            found.append(url)
+
+    patterns = [
+        r'https?://[^\s"\'<>]+UTK0201_000[^\s"\'<>]*',
+        r'//orders\.ibon\.com\.tw/[^\s"\'<>]*UTK0201_000[^\s"\'<>]*',
+        r'/Application/UTK02/UTK0201_000\.aspx[^\s"\'<>]*',
+        r'/UTK02/UTK0201_000\.aspx[^\s"\'<>]*',
+    ]
+
+    for pat in patterns:
+        for m in re.finditer(pat, text, flags=re.I):
+            _append(m.group(0))
+
+    for m in re.finditer(r'(?:https?://ticket\.ibon\.com\.tw)?/ActivityInfo/GoTicketURL[^\s"\'<>]+', text, flags=re.I):
+        unwrapped = _unwrap_go_ticket_url(m.group(0))
+        if unwrapped:
+            _append(unwrapped)
+
+    return found
+
 def _extract_details_any(html: str) -> List[str]:
     """盡可能把 /ActivityInfo/Details/<id> 都撿出來（避免只靠固定版型）。"""
     urls: List[str] = []
@@ -928,12 +1031,21 @@ def fetch_game_info_from_api(perf_id: Optional[str], product_id: Optional[str], 
         headers["X-XSRF-TOKEN"] = token
 
     params_list: List[Dict[str, Any]] = []
+    payload_keys: set[tuple[tuple[str, Any], ...]] = set()
+
+    def add_payload(**kwargs):
+        payload = {k: v for k, v in kwargs.items() if v not in (None, "", [])}
+        key = tuple(sorted(payload.items()))
+        if key in payload_keys:
+            return
+        payload_keys.add(key)
+        params_list.append(payload)
+
     if perf_id or product_id:
-        params_list.extend([
-            {"Performance_ID": perf_id, "Product_ID": product_id},
-            {"PerformanceId": perf_id, "ProductId": product_id},
-            {"PERFORMANCE_ID": perf_id, "PRODUCT_ID": product_id},
-        ])
+        add_payload(Performance_ID=perf_id, Product_ID=product_id)
+        add_payload(PerformanceId=perf_id, ProductId=product_id)
+        add_payload(PERFORMANCE_ID=perf_id, PRODUCT_ID=product_id)
+        add_payload(PERFORMANCEID=perf_id, PRODUCTID=product_id)
 
     activity_ids: List[str] = []
     if referer_url:
@@ -946,17 +1058,32 @@ def fetch_game_info_from_api(perf_id: Optional[str], product_id: Optional[str], 
             activity_ids.append(act)
 
     for act in activity_ids:
+        numeric_id: Optional[int] = None
         try:
-            params_list.insert(0, {"id": int(act)})
+            numeric_id = int(act)
         except Exception:
-            params_list.insert(0, {"id": act})
+            numeric_id = None
 
-    params_list.append({})
+        if numeric_id is not None:
+            add_payload(id=numeric_id)
+        add_payload(id=act)
+        add_payload(ActivityID=act)
+        add_payload(ActivityId=act)
+        add_payload(ActivityInfoID=act)
+        add_payload(ActivityInfoId=act)
+
+        for browse in (None, 1, 2):
+            for has_deadline in (None, True):
+                add_payload(ActivityID=act, SystemBrowseType=browse, hasDeadline=has_deadline)
+                add_payload(ActivityId=act, SystemBrowseType=browse, hasDeadline=has_deadline)
+
+    add_payload()
 
     picked: Dict[str, str] = {}
+    all_ticket_urls: List[str] = []
 
     for params in params_list:
-        payload = {k: v for k, v in params.items() if v}
+        payload = params
         try:
             resp = session.post(TICKET_API, json=payload, headers=headers, timeout=12)
         except Exception as e:
@@ -994,6 +1121,13 @@ def fetch_game_info_from_api(perf_id: Optional[str], product_id: Optional[str], 
                 promo = find_activity_image_any(text_blob)
                 if promo:
                     info["poster"] = promo
+
+            ticket_urls = _extract_ticket_urls_from_text(text_blob)
+            for t in ticket_urls:
+                if t not in all_ticket_urls:
+                    all_ticket_urls.append(t)
+            if ticket_urls and not info.get("ticket_urls"):
+                info["ticket_urls"] = ticket_urls
 
             def match_obj(obj: Any) -> bool:
                 if not isinstance(obj, (dict, list)):
@@ -1040,10 +1174,22 @@ def fetch_game_info_from_api(perf_id: Optional[str], product_id: Optional[str], 
                 headers["X-XSRF-TOKEN"] = token
             continue
 
+    if all_ticket_urls:
+        existing = picked.get("ticket_urls") if picked else None
+        merged: List[str] = []
+        for src in (existing if isinstance(existing, list) else []) + all_ticket_urls:
+            if src not in merged:
+                merged.append(src)
+        if picked:
+            picked["ticket_urls"] = merged
+        else:
+            picked = {"ticket_urls": merged}
+
     return picked
 
 def fetch_from_ticket_details(details_url: str, sess: requests.Session) -> Dict[str, str]:
     out: Dict[str, str] = {}
+    ticket_urls: List[str] = []
 
     def _abs_url(u: Optional[str]) -> Optional[str]:
         if not u:
@@ -1179,6 +1325,8 @@ def fetch_from_ticket_details(details_url: str, sess: requests.Session) -> Dict[
                     promo = find_activity_image_any(content_html)
                     if promo:
                         out["poster"] = promo
+
+                ticket_urls.extend(_extract_ticket_urls_from_text(content_html))
             except Exception as e:
                 app.logger.info(f"[details-api] content parse err: {e}")
 
@@ -1216,7 +1364,10 @@ def fetch_from_ticket_details(details_url: str, sess: requests.Session) -> Dict[
         try:
             r = sess.get(details_url, timeout=12)
             if r.status_code == 200:
-                r.encoding = "utf-8"
+                if r.apparent_encoding:
+                    r.encoding = r.apparent_encoding
+                else:
+                    r.encoding = "utf-8"
                 html = r.text
                 soup = soup_parse(html)
 
@@ -1256,8 +1407,17 @@ def fetch_from_ticket_details(details_url: str, sess: requests.Session) -> Dict[
                         out["place"] = place_html
                     if title_html and not out.get("title"):
                         out["title"] = title_html
+
+                ticket_urls.extend(_extract_ticket_urls_from_text(html))
         except Exception as e:
             app.logger.info(f"[details] fetch fail: {e}")
+
+    if ticket_urls:
+        uniq: List[str] = []
+        for t in ticket_urls:
+            if t not in uniq:
+                uniq.append(t)
+        out["ticket_urls"] = uniq
 
     return {k: v for k, v in out.items() if v}
 
@@ -1675,7 +1835,102 @@ def probe(url: str) -> dict:
     p = urlparse(url)
     if "orders.ibon.com.tw" in p.netloc and p.path.upper().endswith("/UTK0201_000.ASPX"):
         return parse_UTK0201_000(url, s)
+    if "ticket.ibon.com.tw" in p.netloc and "/ActivityInfo/Details" in p.path:
+        details_info = fetch_from_ticket_details(url, s)
+        api_info = fetch_game_info_from_api(None, None, url, s)
+
+        base_title = (
+            details_info.get("title")
+            or api_info.get("title")
+            or "（未取到標題）"
+        ) if isinstance(details_info, dict) else "（未取到標題）"
+        base_place = (
+            details_info.get("place")
+            or api_info.get("place")
+            or ""
+        ) if isinstance(details_info, dict) else ""
+        base_dt = (
+            details_info.get("dt")
+            or api_info.get("dt")
+            or ""
+        ) if isinstance(details_info, dict) else ""
+        base_img = (
+            details_info.get("poster")
+            or api_info.get("poster")
+            or LOGO
+        ) if isinstance(details_info, dict) else LOGO
+
+        ticket_candidates: List[str] = []
+        for source in (
+            details_info.get("ticket_urls") if isinstance(details_info, dict) else None,
+            api_info.get("ticket_urls") if isinstance(api_info, dict) else None,
+        ):
+            if not source:
+                continue
+            for t in source:
+                if t not in ticket_candidates:
+                    ticket_candidates.append(t)
+
+        result_base = {
+            "ok": False,
+            "sig": "NA",
+            "url": url,
+            "image": base_img,
+            "title": base_title,
+            "place": base_place,
+            "date": base_dt,
+            "msg": url,
+        }
+
+        activity_id = None
+        if isinstance(details_info, dict):
+            activity_id = details_info.get("activity_id")
+        if not activity_id:
+            activity_id = _activity_id_from_url(url)
+        if activity_id:
+            result_base["activity_id"] = activity_id
+
+        if ticket_candidates:
+            for ticket_url in ticket_candidates:
+                try:
+                    parsed = parse_UTK0201_000(ticket_url, s)
+                except Exception as e:
+                    app.logger.info(f"[probe] parse ticket fail {ticket_url}: {e}")
+                    continue
+                if not isinstance(parsed, dict):
+                    continue
+
+                parsed.setdefault("details_url", url)
+                parsed["url"] = ticket_url
+                parsed["image"] = base_img or parsed.get("image", LOGO)
+
+                if base_title and not base_title.startswith("（未取到"):
+                    parsed["title"] = base_title
+                else:
+                    parsed["title"] = parsed.get("title") or base_title
+
+                if base_place:
+                    parsed["place"] = base_place
+                else:
+                    parsed["place"] = parsed.get("place", "")
+
+                if base_dt:
+                    parsed["date"] = base_dt
+                else:
+                    parsed["date"] = parsed.get("date", "")
+
+                if activity_id:
+                    parsed.setdefault("activity_id", activity_id)
+
+                return parsed
+
+        if ticket_candidates:
+            result_base["ticket_urls"] = ticket_candidates
+        return result_base
+
     r = s.get(url, timeout=12)
+    if r.apparent_encoding:
+        r.encoding = r.apparent_encoding
     title = ""
     try:
         soup = soup_parse(r.text)
