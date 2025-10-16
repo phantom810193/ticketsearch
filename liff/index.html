@@ -79,11 +79,42 @@ function computeStatusApi(){
 
 var STATUS_API = computeStatusApi();
 
+function openExternal(url){
+  if (!url) return false;
+  if (!liff.isInClient()) {
+    return false;
+  }
+  try {
+    liff.openWindow({ url: url, external: true });
+    return true;
+  } catch (err) {
+    console.warn("openWindow failed", err);
+    return false;
+  }
+}
+
+function attachExternalHandler(node, url){
+  if (!node || !url) return;
+  node.addEventListener("click", function(ev){
+    if (!liff.isInClient()) return;
+    ev.preventDefault();
+    if (!openExternal(url)) {
+      window.open(url, "_blank");
+    }
+  });
+}
+
 function fetchActs(){
   var url = buildActivitiesUrl();
   return fetch(url, { credentials: "include", mode: "cors" }).then(function(res){
+
     if (!res.ok) throw new Error("HTTP " + res.status);
     return res.json();
+  }).then(function(body){
+    return body && body.results ? body.results : {};
+  }).catch(function(err){
+    console.error("watch_status error", err);
+    return {};
   });
 }
 
@@ -170,6 +201,12 @@ function render(acts, ctx){
       var img = el("img", "poster", "");
       img.src = it.image;
       img.alt = title;
+
+      if (url){
+        img.style.cursor = "pointer";
+        attachExternalHandler(img, url);
+      }
+
       card.appendChild(img);
     }
 
@@ -178,6 +215,7 @@ function render(acts, ctx){
     if (url){
       link.href = url;
       link.target = "_blank";
+      attachExternalHandler(link, url);
     }else{
       link.className = "hint";
       link.href = "javascript:void(0)";
