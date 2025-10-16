@@ -1216,6 +1216,7 @@ def fetch_from_ticket_details(details_url: str, sess: requests.Session) -> Dict[
         try:
             r = sess.get(details_url, timeout=12)
             if r.status_code == 200:
+                r.encoding = "utf-8"
                 html = r.text
                 soup = soup_parse(html)
 
@@ -1521,6 +1522,7 @@ def parse_UTK0201_000(url: str, sess: requests.Session) -> dict:
     if r.status_code != 200:
         out["msg"] = f"讀取失敗（HTTP {r.status_code}）"
         return out
+    r.encoding = "utf-8"    
     html = r.text
 
     q = parse_qs(urlparse(url).query)
@@ -2139,6 +2141,7 @@ def fetch_ibon_ent_html_hard(limit=10, keyword=None, only_concert=False):
     try:
         r = s.get(url, timeout=15)
         r.raise_for_status()
+        r.encoding = "utf-8"
         html = r.text
         soup = soup_parse(html)
 
