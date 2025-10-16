@@ -52,7 +52,9 @@ def _as_list(x):
 
 IBON_API = "https://ticketapi.ibon.com.tw/api/ActivityInfo/GetIndexData"
 IBON_TOKEN_API = "https://ticketapi.ibon.com.tw/api/ActivityInfo/GetToken"
+
 IBON_DETAIL_API = "https://ticketapi.ibon.com.tw/api/ActivityInfo/GetDetailData"
+
 IBON_BASE = "https://ticket.ibon.com.tw/"
 # NEW: 首頁輪播 URL 抽成環境變數（可覆寫）
 IBON_ENT_URL = os.getenv("IBON_ENT_URL", "https://ticket.ibon.com.tw/Index/entertainment")
@@ -93,7 +95,6 @@ _CONCERT_WORDS = ("演唱會", "演場會", "音樂會", "演唱", "演出", "LI
 def _looks_like_concert(title: str) -> bool:
     t = title or ""
     return any(w.lower() in t.lower() for w in _CONCERT_WORDS)
-
 
 def _clean_detail_text(value: Optional[str]) -> Optional[str]:
     if not value:
@@ -202,18 +203,19 @@ def _extract_activity_id_from_url(u: str) -> Optional[str]:
         return m.group(1)
     return None
 
-
 def _extract_xsrf_token(payload: Any) -> Optional[str]:
     """從 ibon 的 GetToken 結構中提取 XSRF token。"""
 
     def _collect_tokens(src: Any) -> List[str]:
         out: List[str] = []
         if isinstance(src, dict):
+
             for val in src.values():
                 if isinstance(val, str) and val.strip():
                     out.append(val.strip())
                 elif isinstance(val, (dict, list)):
                     out.extend(_collect_tokens(val))
+
         elif isinstance(src, list):
             for v in src:
                 out.extend(_collect_tokens(v))
@@ -487,6 +489,7 @@ def fetch_ibon_list_via_api(limit=10, keyword=None, only_concert=False):
 
         session: Optional[requests.Session] = None
         token: Optional[str] = None
+
         patterns = list(_IBON_INDEX_PATTERNS) or ["Entertainment"]
         base_rows: List[Dict[str, Any]] = []
 
@@ -508,6 +511,7 @@ def fetch_ibon_list_via_api(limit=10, keyword=None, only_concert=False):
                     for cand in _iter_activity_dicts(payload):
                         if not isinstance(cand, dict):
                             continue
+
                         try:
                             item = _normalize_item(cand)
                         except Exception:
