@@ -2135,3 +2135,36 @@ try:
         return jsonify(routes=_dump_routes(app)), 200
 except Exception:
     pass
+
+# === debug helper: attach __routes onto whichever app actually runs ===
+def _attach_debug_routes(flask_app):
+    try:
+        from flask import jsonify
+    except Exception:
+        return
+    def _routes():
+        out=[]
+        for r in flask_app.url_map.iter_rules():
+            ms = sorted(m for m in r.methods if m in ("GET","POST","PUT","DELETE","PATCH"))
+            out.append({"rule": str(r), "endpoint": r.endpoint, "methods": ms})
+        return jsonify(routes=out), 200
+    # idempotent: avoid double-register
+    if "__routes" not in flask_app.view_functions:
+        flask_app.add_url_rule("/__routes", "__routes", _routes, methods=["GET"])
+
+# 1) 若模組層就有 app 實例，先掛一次
+try:
+    _attach_debug_routes(app)  # noqa: F821
+except Exception:
+    pass
+
+# 2) 若專案採用 create_app()，把它包起來：在 app 建好後掛上 __routes
+try:
+    _orig_create_app = create_app  # noqa: F821
+    def create_app(*args, **kwargs):  # type: ignore[no-redef]
+        a = _orig_create_app(*args, **kwargs)
+        try: _attach_debug_routes(a)
+        except Exception: pass
+        return a
+except Exception:
+    pass
