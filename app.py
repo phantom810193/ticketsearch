@@ -1,9 +1,11 @@
 # -*- coding: utf-8 -*-
 import os
+import subprocess
 import re
 import json
 import time
 import uuid
+import copy
 import base64
 import hashlib
 import logging
@@ -12,10 +14,28 @@ import requests
 from datetime import datetime, timezone, timedelta
 from typing import Dict, Tuple, Optional, Any, List
 from urllib.parse import urlparse, urlunparse, parse_qs, urlencode, urljoin, unquote
-from flask import Flask, jsonify, request, abort, send_from_directory
+from flask import Flask, jsonify, request, abort, send_from_directory, Response
 
 app = Flask(__name__)
+app.config["JSON_AS_ASCII"] = False
+try:
+    app.json.ensure_ascii = False  # type: ignore[attr-defined]
+except Exception:
+    pass
 app.url_map.strict_slashes = False
+
+
+def _resolve_build_hash() -> str:
+    try:
+        out = subprocess.check_output(
+            ["git", "rev-parse", "--short", "HEAD"], stderr=subprocess.DEVNULL
+        )
+        return out.decode("utf-8").strip()
+    except Exception:
+        return str(int(time.time()))
+
+
+APP_BUILD_HASH = _resolve_build_hash()
 # --- Browser engines (optional) ---
 try:
     from playwright.sync_api import sync_playwright
@@ -616,14 +636,24 @@ _ALLOWED_ORIGINS_ENV = os.getenv("ALLOWED_ORIGINS", "https://liff.line.me")
 ALLOWED_ORIGINS = [o.strip() for o in _ALLOWED_ORIGINS_ENV.split(",") if o.strip()]
 
 try:
-    from flask_cors import CORS  # type: ignore
+    from flask_cors import CORS, cross_origin  # type: ignore
     CORS(
         app,
-        resources={r"/liff/*": {"origins": ALLOWED_ORIGINS}},
+        resources={
+            r"/liff/*": {"origins": ALLOWED_ORIGINS},
+            r"/api/liff/*": {"origins": ALLOWED_ORIGINS},
+        },
         supports_credentials=True,
     )
 except Exception as e:
     app.logger.warning(f"flask-cors not available: {e}")
+
+    def cross_origin(*_args, **_kwargs):  # type: ignore
+        def _decorator(func):
+            return func
+
+        return _decorator
+
     logging.basicConfig(level=os.getenv("LOG_LEVEL", "INFO"))
     app.logger.setLevel(logging.INFO)
 
@@ -680,10 +710,7 @@ IBON_DETAIL_API = "https://ticket.ibon.com.tw/api/ActivityInfo/GetDetailData"
 
 # ================= 小工具 =================
 def soup_parse(html: str) -> BeautifulSoup:
-    try:
-        return BeautifulSoup(html, "lxml")
-    except Exception:
-        return BeautifulSoup(html, "html.parser")
+    return BeautifulSoup(html, "html.parser")
 
 def hash_state(sections: Dict[str, int], selling: List[str]) -> str:
     items = sorted((k, int(v)) for k, v in sections.items())
@@ -1707,6 +1734,21 @@ def fs_disable(chat_id: str, tid: str) -> bool:
     })
     return True
 
+
+def fs_disable_by_url(chat_id: str, url: str) -> Optional[str]:
+    if not FS_OK:
+        return None
+    canon = canonicalize_url(url)
+    doc = fs_get_task_by_canon(chat_id, canon)
+    if not doc:
+        return None
+    tid = str(doc.to_dict().get("id", "")).strip() or None
+    fs_client.collection(COL).document(doc.id).update({
+        "enabled": False,
+        "updated_at": datetime.now(timezone.utc),
+    })
+    return tid
+
 def fmt_result_text(res: dict) -> str:
     lines = []
     if res.get("task_id"):
@@ -2168,11 +2210,412 @@ def fetch_ibon_entertainments(limit=10, keyword=None, only_concert=False):
         return items
     return fetch_ibon_ent_html_hard(limit=limit, keyword=keyword, only_concert=only_concert)
 
+_EVENT_DETAIL_CACHE: Dict[str, Dict[str, Any]] = {}
+_EVENT_DETAIL_CACHE_TTL = int(os.getenv("EVENT_DETAIL_CACHE_TTL", "600"))
+_LIFF_CONCERT_CACHE: Dict[Tuple[str, int], Dict[str, Any]] = {}
+_LIFF_CONCERT_CACHE_TTL = int(os.getenv("LIFF_CONCERT_CACHE_TTL", "20"))
+
+
+def _detail_cache_get(url: str) -> Optional[Dict[str, Any]]:
+    entry = _EVENT_DETAIL_CACHE.get(url)
+    if not entry:
+        return None
+    if time.time() - entry.get("ts", 0) > _EVENT_DETAIL_CACHE_TTL:
+        return None
+    data = entry.get("data") or {}
+    return copy.deepcopy(data)
+
+
+def _detail_cache_set(url: str, data: Dict[str, Any]):
+    _EVENT_DETAIL_CACHE[url] = {"ts": time.time(), "data": copy.deepcopy(data)}
+
+
+def _concert_cache_get(key: Tuple[str, int]) -> Optional[Dict[str, Any]]:
+    entry = _LIFF_CONCERT_CACHE.get(key)
+    if not entry:
+        return None
+    if time.time() - entry.get("ts", 0) > _LIFF_CONCERT_CACHE_TTL:
+        return None
+    data = entry.get("data") or {}
+    return copy.deepcopy(data)
+
+
+def _concert_cache_set(key: Tuple[str, int], payload: Dict[str, Any]):
+    _LIFF_CONCERT_CACHE[key] = {"ts": time.time(), "data": copy.deepcopy(payload)}
+
+
+def _parse_status_from_detail_text(text: str) -> Tuple[Optional[str], Optional[int]]:
+    blob = (text or "").strip()
+    if not blob:
+        return None, None
+
+    num_match = re.search(r"(?:剩餘|尚餘|可售|尚有|尚餘票數)[^\d]{0,6}(\d{1,4})", blob)
+    if not num_match:
+        num_match = re.search(r"(\d{1,4})\s*張", blob)
+    remaining = int(num_match.group(1)) if num_match else None
+
+    normalized = re.sub(r"\s+", " ", blob)
+    lowered = normalized.lower()
+
+    if "售完" in normalized or "完售" in normalized:
+        return "已售完", remaining
+    if "停售" in normalized:
+        return "停售", remaining
+    if remaining is not None:
+        return f"剩餘 {remaining} 張", remaining
+    if any(key in lowered for key in ("熱賣", "開賣", "販售", "可售")):
+        return normalized, remaining
+    return None, remaining
+
+
+def _normalize_date_from_text(text: str) -> Optional[str]:
+    if not text:
+        return None
+    date_match = re.search(r"(\d{4})[年/.-](\d{1,2})[月/.-](\d{1,2})", text)
+    if not date_match:
+        return None
+    year, month, day = date_match.groups()
+    try:
+        month_i = int(month)
+        day_i = int(day)
+    except Exception:
+        return None
+
+    date_part = f"{year}/{month_i:02d}/{day_i:02d}"
+    time_match = re.search(r"(\d{1,2}:\d{2})", text)
+    if time_match:
+        return f"{date_part} {time_match.group(1)}"
+    return date_part
+
+
+def parse_event_detail(url: str, sess: Optional[requests.Session] = None) -> Dict[str, Any]:
+    url = (url or "").strip()
+    base = {
+        "url": url,
+        "title": "",
+        "place": "",
+        "date_text": "",
+        "image_url": None,
+        "status_text": "",
+        "remaining": None,
+        "activity_id": None,
+    }
+    if not url:
+        return base
+
+    cached = _detail_cache_get(url)
+    if cached is not None:
+        return cached
+
+    own_session = False
+    session = sess
+    if session is None:
+        try:
+            session = sess_default()
+        except Exception:
+            session = None
+        else:
+            own_session = True
+
+    result = dict(base)
+
+    if session is None:
+        result["status_text"] = "暫時讀不到剩餘數（可能為動態載入）"
+        _detail_cache_set(url, result)
+        return result
+
+    try:
+        detail_info: Dict[str, Any] = {}
+        try:
+            detail_info = fetch_from_ticket_details(url, session)
+        except Exception as e:
+            app.logger.info(f"[parse_event_detail] details api failed for {url}: {e}")
+
+        if detail_info:
+            result["activity_id"] = detail_info.get("activity_id") or result.get("activity_id")
+            result["title"] = detail_info.get("title") or result["title"]
+            result["place"] = detail_info.get("place") or result["place"]
+            result["date_text"] = detail_info.get("dt") or detail_info.get("date") or result["date_text"]
+            poster = detail_info.get("poster") or detail_info.get("image")
+            if poster:
+                result["image_url"] = poster
+
+        html_text = ""
+        try:
+            resp = session.get(url, timeout=12)
+            if resp.status_code == 200:
+                html_text = resp.text
+        except Exception as e:
+            app.logger.info(f"[parse_event_detail] html fetch failed for {url}: {e}")
+
+        text_blobs: List[str] = []
+        soup = None
+        if html_text:
+            try:
+                soup = soup_parse(html_text)
+            except Exception as e:
+                app.logger.info(f"[parse_event_detail] soup parse failed for {url}: {e}")
+                soup = None
+
+        if soup:
+            if not result["title"]:
+                h1 = soup.select_one("h1")
+                if h1:
+                    t = h1.get_text(" ", strip=True)
+                    if t:
+                        result["title"] = t
+            if not result["image_url"]:
+                for sel in [
+                    'meta[property="og:image"]',
+                    'meta[property="og:image:secure_url"]',
+                    'meta[name="twitter:image"]',
+                ]:
+                    tag = soup.select_one(sel)
+                    if tag and tag.get("content"):
+                        result["image_url"] = urljoin(url, tag["content"].strip())
+                        break
+            meta_desc = soup.select_one('meta[property="og:description"]')
+            if meta_desc and meta_desc.get("content"):
+                text_blobs.append(meta_desc.get("content", ""))
+            meta_desc2 = soup.select_one('meta[name="description"]')
+            if meta_desc2 and meta_desc2.get("content"):
+                text_blobs.append(meta_desc2.get("content", ""))
+            for node in soup.select('.ticket-info, .event-info, .intro, .content, .info'):
+                text_blobs.append(node.get_text(" ", strip=True))
+            text_blobs.append(soup.get_text(" ", strip=True))
+
+        elif html_text:
+            text_blobs.append(html_text)
+
+        seen_status = False
+        for blob in text_blobs:
+            if not blob:
+                continue
+            if not result["place"]:
+                m_place = re.search(r"(?:地點|場地)[：: ]+([^\n\r，,]+)", blob)
+                if m_place:
+                    result["place"] = m_place.group(1).strip()
+            if not result["date_text"]:
+                normalized_dt = _normalize_date_from_text(blob)
+                if normalized_dt:
+                    result["date_text"] = normalized_dt
+            if not seen_status:
+                status_text, remaining = _parse_status_from_detail_text(blob)
+                if status_text:
+                    result["status_text"] = status_text
+                    seen_status = True
+                if remaining is not None and result.get("remaining") is None:
+                    result["remaining"] = remaining
+
+        if not result["title"] and soup and soup.title and soup.title.string:
+            result["title"] = soup.title.string.strip()
+
+        if not result["image_url"] and html_text:
+            img_match = re.search(r"https?://[^\s'\"]+/ActivityImage/[^'\"\s]+", html_text)
+            if img_match:
+                result["image_url"] = img_match.group(0)
+
+        if not result["activity_id"]:
+            result["activity_id"] = _activity_id_from_url(url)
+
+        if not result["status_text"]:
+            result["status_text"] = "暫時讀不到剩餘數（可能為動態載入）"
+
+        if result.get("remaining") is None:
+            remaining_guess = None
+            _, remaining_guess = _parse_status_from_detail_text(result.get("status_text", ""))
+            if remaining_guess is not None:
+                result["remaining"] = remaining_guess
+
+    finally:
+        if own_session and session is not None:
+            try:
+                session.close()
+            except Exception:
+                pass
+
+    _detail_cache_set(url, result)
+    return result
+
+
+def _prepare_enrich_session() -> Optional[requests.Session]:
+    session, token = _prepare_ibon_session()
+    if session is None:
+        return None
+    session.headers.update(
+        {
+            "Origin": "https://ticket.ibon.com.tw",
+            "Referer": IBON_ENT_URL,
+            "X-Requested-With": "XMLHttpRequest",
+        }
+    )
+    if token:
+        session.headers.setdefault("X-XSRF-TOKEN", token)
+    return session
+
+
+def _enrich_ibon_detail(url: str, session: Optional[requests.Session]) -> Dict[str, Any]:
+    base = {
+        "title": "",
+        "venue": "",
+        "datetime": "",
+        "cover": None,
+        "remain": None,
+        "status_text": "",
+        "activity_id": None,
+    }
+    clean_url = (url or "").strip()
+    if not clean_url:
+        return base
+
+    detail = parse_event_detail(clean_url, sess=session)
+    if not detail:
+        return base
+
+    remain = detail.get("remaining")
+    if remain is None:
+        remain = detail.get("remain")
+
+    enriched = {
+        "title": detail.get("title") or base["title"],
+        "venue": detail.get("place") or base["venue"],
+        "datetime": detail.get("date_text") or base["datetime"],
+        "cover": detail.get("image_url") or detail.get("image") or base["cover"],
+        "remain": remain,
+        "status_text": detail.get("status_text") or base["status_text"],
+        "activity_id": detail.get("activity_id") or _activity_id_from_url(clean_url),
+    }
+    return enriched
+
+
+def get_ibon_concerts(mode: str, limit: int = 30) -> List[Dict[str, Any]]:
+    try:
+        limit_val = int(limit)
+    except Exception:
+        limit_val = 20
+    limit_val = max(1, min(50, limit_val))
+
+    mode_clean = (mode or "carousel").lower()
+    if mode_clean not in ("carousel", "all"):
+        mode_clean = "carousel"
+
+    loaders: List[Tuple[str, Any]] = []
+    if mode_clean == "all":
+        loaders.append(
+            (
+                "all",
+                lambda: fetch_ibon_entertainments(
+                    limit=limit_val * 2, only_concert=True
+                ),
+            )
+        )
+    else:
+        loaders.append(
+            (
+                "carousel",
+                lambda: fetch_ibon_carousel_from_api(
+                    limit=limit_val * 2, only_concert=True
+                ),
+            )
+        )
+        loaders.append(
+            (
+                "all",
+                lambda: fetch_ibon_entertainments(
+                    limit=limit_val * 2, only_concert=True
+                ),
+            )
+        )
+
+    session = _prepare_enrich_session()
+    if session is None:
+        try:
+            session = sess_default()
+        except Exception:
+            session = None
+
+    results: List[Dict[str, Any]] = []
+    seen_urls: set[str] = set()
+
+    for source_name, loader in loaders:
+        try:
+            raw_list = loader() or []
+        except Exception as e:
+            app.logger.error(f"[get_ibon_concerts] loader {source_name} failed: {e}")
+            continue
+
+        app.logger.info(
+            f"[get_ibon_concerts] source={source_name} count={len(raw_list)}"
+        )
+
+        for raw in raw_list:
+            if not isinstance(raw, dict):
+                continue
+            url = str(raw.get("url") or raw.get("link") or "").strip()
+            if not url:
+                continue
+            canon = canonicalize_url(url)
+            if canon in seen_urls:
+                continue
+
+            title = str(raw.get("title") or "").strip()
+            if not title:
+                title = ""
+            if not _looks_like_concert(title) and source_name == "all":
+                # 替後備資料再篩一次關鍵字
+                if not _looks_like_concert(raw.get("ActivityName", "")):
+                    continue
+
+            enrich = _enrich_ibon_detail(url, session)
+            app.logger.info(f"[ibon enrich] url={url} venue={enrich.get('venue','')}")
+
+            final_title = enrich.get("title") or title or "演唱會"
+            cover = enrich.get("cover") or raw.get("image") or raw.get("Image")
+            if cover and not str(cover).lower().startswith("http"):
+                cover = urljoin(IBON_BASE, str(cover))
+
+            entry = {
+                "id": enrich.get("activity_id") or _activity_id_from_url(url) or canon,
+                "title": final_title,
+                "url": url,
+                "image": cover,
+                "venue": enrich.get("venue") or raw.get("place") or "",
+                "datetime": enrich.get("datetime") or raw.get("date") or raw.get("date_text") or "",
+                "remain": enrich.get("remain"),
+                "status_text": enrich.get("status_text") or raw.get("status_text") or "",
+                "source": source_name,
+            }
+
+            results.append(entry)
+            seen_urls.add(canon)
+            if len(results) >= limit_val:
+                break
+
+        if len(results) >= limit_val:
+            break
+
+    return results
+
+
 def _truthy(v: Optional[str]) -> bool:
     if v is None:
         return False
     s = str(v).strip().lower()
     return s in ("1", "true", "t", "yes", "y")
+
+
+def _json_with_cache(payload: Dict[str, Any], ttl: int):
+    resp = jsonify(payload)
+    resp.headers["Cache-Control"] = f"public, max-age={ttl}"
+    resp.headers["Content-Type"] = "application/json; charset=utf-8"
+    return resp
+
+
+def _json_no_cache(payload: Dict[str, Any], status: int = 200):
+    resp = jsonify(payload)
+    resp.headers["Cache-Control"] = "no-store"
+    resp.headers["Content-Type"] = "application/json; charset=utf-8"
+    return resp, status
 
 # 簡單保險絲（30 分鐘）
 _API_BREAK_UNTIL = 0
@@ -2261,7 +2704,7 @@ def fetch_ibon_carousel_from_api(limit=10, keyword=None, only_concert=False):
             _API_BREAK_UNTIL = time.time() + 1800
             return []
 
-        if resp.status_code == 200:
+        if resp.ok:
             try:
                 payload = resp.json()
             except Exception:
@@ -2325,7 +2768,6 @@ def fetch_ibon_carousel_from_api(limit=10, keyword=None, only_concert=False):
                         break
 
             if len(items) >= max_items:
-
                 break
 
         elif resp.status_code in (401, 403, 419):
@@ -2423,6 +2865,194 @@ def _extract_carousel_html_hard(html: str, limit=10, keyword=None, only_concert=
             break
 
     return items
+
+# ====== LIFF API ======
+@app.get("/api/liff/concerts")
+@cross_origin()
+def api_liff_concerts():
+    mode = (request.args.get("mode") or "carousel").lower()
+    try:
+        limit = int(request.args.get("limit", "12"))
+    except Exception:
+        limit = 12
+    limit = max(1, min(50, limit))
+
+    cache_key = (mode, limit)
+    cached = _concert_cache_get(cache_key)
+    if cached:
+        resp = _json_with_cache(cached, _LIFF_CONCERT_CACHE_TTL)
+        resp.headers["X-Cache"] = "HIT"
+        return resp
+
+    items = get_ibon_concerts(mode=mode, limit=limit)
+    final_mode = mode
+    if mode == "carousel" and not items:
+        items = get_ibon_concerts(mode="all", limit=limit)
+        final_mode = "all"
+        if items:
+            _concert_cache_set(("all", limit), {"items": items, "mode": "all"})
+
+    payload = {"items": items, "mode": final_mode}
+    _concert_cache_set(cache_key, payload)
+    resp = _json_with_cache(payload, _LIFF_CONCERT_CACHE_TTL)
+    resp.headers["X-Cache"] = "MISS"
+    return resp
+
+
+@app.post("/api/liff/watch")
+@cross_origin()
+def api_liff_watch():
+    payload = request.get_json(silent=True) or {}
+    if not isinstance(payload, dict):
+        payload = {}
+
+    chat_id = str(payload.get("chat_id") or payload.get("chatId") or "").strip()
+    url = str(payload.get("url") or "").strip()
+    period_val = payload.get("period") or payload.get("sec") or payload.get("seconds")
+    try:
+        period = int(period_val)
+    except Exception:
+        period = DEFAULT_PERIOD_SEC
+    period = max(15, int(period))
+
+    if not chat_id:
+        chat_id = (
+            request.headers.get("X-Chat-Id")
+            or request.headers.get("X-Line-UserId")
+            or ""
+        ).strip()
+    if not chat_id:
+        resp = _json_with_cache({"ok": False, "error": "missing_chat"}, 15)
+        resp.status_code = 400
+        return resp
+    if not url:
+        resp = _json_with_cache({"ok": False, "error": "missing_url"}, 15)
+        resp.status_code = 400
+        return resp
+    if not FS_OK:
+        resp = _json_with_cache({"ok": False, "error": "firestore_unavailable"}, 15)
+        resp.status_code = 503
+        return resp
+
+    try:
+        tid, created = fs_upsert_watch(chat_id, url, period)
+    except Exception as e:
+        app.logger.error(f"[api_liff_watch] {e}\n{traceback.format_exc()}")
+        resp = _json_with_cache({"ok": False, "error": str(e)}, 15)
+        resp.status_code = 500
+        return resp
+
+    detail = parse_event_detail(url)
+    message = "已開始監看" if created else "已更新監看"
+
+    resp_payload = {
+        "ok": True,
+        "task_id": tid,
+        "created": created,
+        "period": period,
+        "message": message,
+        "detail": detail,
+    }
+    return _json_with_cache(resp_payload, 15)
+
+
+@app.post("/api/liff/unwatch")
+@cross_origin()
+def api_liff_unwatch():
+    payload = request.get_json(silent=True) or {}
+    if not isinstance(payload, dict):
+        payload = {}
+
+    chat_id = str(payload.get("chat_id") or payload.get("chatId") or "").strip()
+    task_code = str(payload.get("task_code") or payload.get("taskCode") or payload.get("taskId") or "").strip()
+    url = str(payload.get("url") or "").strip()
+
+    if not chat_id:
+        chat_id = (
+            request.headers.get("X-Chat-Id")
+            or request.headers.get("X-Line-UserId")
+            or ""
+        ).strip()
+    if not chat_id:
+        resp = _json_with_cache({"ok": False, "error": "missing_chat"}, 15)
+        resp.status_code = 400
+        return resp
+    if not task_code and not url:
+        resp = _json_with_cache({"ok": False, "error": "missing_target"}, 15)
+        resp.status_code = 400
+        return resp
+    if not FS_OK:
+        resp = _json_with_cache({"ok": False, "error": "firestore_unavailable"}, 15)
+        resp.status_code = 503
+        return resp
+
+    detail = parse_event_detail(url) if url else None
+
+    tid = None
+    ok = False
+    if task_code:
+        ok = fs_disable(chat_id, task_code)
+        tid = task_code if ok else None
+    elif url:
+        tid = fs_disable_by_url(chat_id, url)
+        ok = tid is not None
+
+    if not ok:
+        resp_payload = {
+            "ok": False,
+            "reason": "no_watch",
+            "message": "此活動無監看",
+        }
+        if detail:
+            resp_payload["detail"] = detail
+        resp = _json_with_cache(resp_payload, 15)
+        resp.status_code = 200
+        return resp
+
+    resp_payload = {"ok": True, "message": "stopped"}
+    if tid:
+        resp_payload["task_id"] = tid
+    if detail:
+        resp_payload["detail"] = detail
+    return _json_with_cache(resp_payload, 15)
+
+
+@app.post("/api/liff/quick-check")
+@cross_origin()
+def api_liff_quick_check():
+    payload = request.get_json(silent=True) or {}
+    if not isinstance(payload, dict):
+        payload = {}
+
+    url = str(payload.get("url") or "").strip()
+    if not url:
+        return _json_no_cache({"ok": False, "error": "missing url"}, 400)
+
+    detail = parse_event_detail(url)
+    title = detail.get("title") or ""
+    remain = detail.get("remaining")
+    if remain is None:
+        remain = detail.get("remain")
+
+    status_text = detail.get("status_text") or ""
+    if remain is not None:
+        message = f"剩餘 {remain} 張"
+    else:
+        message = status_text or "暫時讀不到剩餘數（可能為動態載入）"
+
+    resp_payload = {
+        "ok": True,
+        "title": title,
+        "remain": remain,
+        "message": message,
+        "status_text": status_text,
+        "detail": detail,
+    }
+    ttl = max(15, min(30, _LIFF_CONCERT_CACHE_TTL))
+    resp = _json_with_cache(resp_payload, ttl)
+    resp.headers["X-Cache"] = "MISS"
+    return resp
+
 
 # ====== 替換：/liff/activities 以多來源 fallback（優先輪播） ======
 @app.get("/liff/activities")
@@ -2572,9 +3202,25 @@ def liff_activities_debug():
 @app.get("/liff/")
 def liff_index():
     try:
-        return send_from_directory("liff", "index.html")
+        base = os.path.join(os.path.dirname(__file__), "liff")
+        with open(os.path.join(base, "index.html"), "r", encoding="utf-8") as fh:
+            html = fh.read()
+        html = html.replace("__BUILD_HASH__", APP_BUILD_HASH)
+        return Response(html, mimetype="text/html; charset=utf-8")
+    except Exception as e:
+        app.logger.error(f"[liff_index] serve failed: {e}")
+        try:
+            return send_from_directory("liff", "index.html")
+        except Exception:
+            return "LIFF OK", 200
+
+
+@app.get("/liff/<path:filename>")
+def liff_static(filename: str):
+    try:
+        return send_from_directory("liff", filename)
     except Exception:
-        return "LIFF OK", 200
+        abort(404)
 
 @app.route("/liff/ping", methods=["GET"])
 def liff_ping():
