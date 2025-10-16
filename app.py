@@ -2765,7 +2765,8 @@ def _quick_check_impl(url: str):
         status_text = detail.get("status_text")
         if isinstance(status_text, str):
             response["status_text"] = status_text
-        response["message"] = detail.get("msg") or None
+        # 這裡改成回傳 /check <url>，前端就會把這段直接送到聊天室
+        response["message"] = f"/check {detail.get('url') or url}"
     return jsonify(response), 200
 
 @liff_api_bp.get("/quick-check")
