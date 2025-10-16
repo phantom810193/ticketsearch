@@ -221,7 +221,13 @@ function render(acts, ctx){
         }
         status.enabled = true;
         status.watching = true;
-        return liff.openWindow({ url: url, external: false });
+
+        try {
+          liff.openWindow({ url: url, external: true });
+        } catch (err) {
+          console.warn("openWindow failed", err);
+        }
+
       }).catch(function(e){
         alert("送訊息或開啟頁面失敗：" + e);
         console.error(e);
