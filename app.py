@@ -804,7 +804,6 @@ _EVENT_DATE_KEYWORDS = (
     "場次",
 )
 
-
 def _normalize_date_text(text: Optional[str]) -> Optional[str]:
     if not text:
         return None
@@ -908,7 +907,9 @@ def _collect_datetime_candidates(lines: List[str]) -> List[Tuple[datetime, bool,
             pending_date = None
             continue
         compact = re.sub(r"\s+", " ", line)
+
         if any(ch in compact for ch in ("~", "～")):
+
             pending_date = None
             continue
         dt_match = _format_datetime_match(_RE_DATE.search(compact))
@@ -1123,7 +1124,6 @@ def _unwrap_go_ticket_url(u: str) -> Optional[str]:
 
     return None
 
-
 def _resolve_utk_url(
     activity_id: Optional[str],
     pattern: Optional[str],
@@ -1170,6 +1170,7 @@ def _resolve_utk_url(
                     headers=headers,
                     allow_redirects=True,
                     timeout=6,
+
                 )
                 status = resp.status_code
                 request_url = resp.url
@@ -1188,6 +1189,7 @@ def _resolve_utk_url(
                             if candidate and "UTK0201_000" in candidate.upper():
                                 resolved = candidate
                                 break
+
                 else:
                     reason = f"http={status}"
             except Exception as exc:
@@ -1375,6 +1377,7 @@ def fetch_game_info_from_api(perf_id: Optional[str], product_id: Optional[str], 
                 add_payload(ActivityID=act, SystemBrowseType=browse, hasDeadline=has_deadline)
                 add_payload(ActivityId=act, SystemBrowseType=browse, hasDeadline=has_deadline)
 
+
     add_payload()
 
     picked: Dict[str, str] = {}
@@ -1503,7 +1506,9 @@ def fetch_from_ticket_details(details_url: str, sess: requests.Session) -> Dict[
     html_lines: List[str] = []
     api_dt_values: List[Tuple[str, int]] = []
     try:
+
         resp = sess.get(details_url, timeout=6)
+
         if resp.status_code == 200:
             detail_html = _decode_ibon_html(resp)
     except Exception as exc:
@@ -1785,6 +1790,7 @@ def fetch_from_ticket_details(details_url: str, sess: requests.Session) -> Dict[
         dt_obj, has_time = _parse_datetime_string(raw)
         if dt_obj:
             dt_candidates.append((priority, dt_obj, has_time))
+
 
     for raw, priority in api_dt_values:
         _add_dt_candidate(raw, priority)
@@ -2304,12 +2310,16 @@ def parse_UTK0201_000(url: str, sess: requests.Session, referer: Optional[str] =
         "Accept-Language": "zh-TW,zh;q=0.9,en;q=0.6",
     }
     headers["Referer"] = referer or url
+
     r = sess.get(url, headers=headers, timeout=6)
+
     if r.status_code != 200:
         out["msg"] = f"讀取失敗（HTTP {r.status_code}）"
         return out
     html = _decode_ibon_html(r)
+
     summary_info = _extract_utk_summary_from_html(html)
+
 
     q = parse_qs(urlparse(url).query)
     perf_id = (q.get("PERFORMANCE_ID") or [None])[0]
@@ -2496,6 +2506,7 @@ def parse_UTK0201_000(url: str, sess: requests.Session, referer: Optional[str] =
     else:
         out["tickets"] = tickets
 
+
     sig_base = hash_state(human_numeric, selling_names)
     out["sig"] = hashlib.md5((sig_base + ("|SO" if sold_out else "")).encode("utf-8")).hexdigest()
 
@@ -2623,7 +2634,9 @@ def _probe_activity_details(url: str, sess: requests.Session, trace: Optional[Li
             for ticket_url in ticket_candidates:
                 start_parse = time.time()
                 try:
+
                     parsed = parse_UTK0201_000(ticket_url, sess, referer=details_url_clean)
+
                 except Exception as e:
                     if trace is not None:
                         trace.append({
@@ -3620,7 +3633,6 @@ def _build_probe_detail_payload(data: Optional[Dict[str, Any]]) -> Optional[Dict
         payload["status_text"] = msg
     return payload
 
-
 def _background_watch_job(chat_id: Optional[str], url: str, task_id: str, created: bool, period: int) -> None:
     status_line = f"任務 {task_id} 已{'建立' if created else '更新'}，每 {period} 秒監看。"
     fallback = f"{status_line} 但目前無法取得票券資訊。"
@@ -3674,6 +3686,7 @@ def _background_quick_check_job(chat_id: Optional[str], url: str, task_id: str) 
         _push_detail_to_chat(chat_id, payload, extra_text=status_line)
     else:
         _push_detail_to_chat(chat_id, None, fallback=fallback)
+
 
 
 def _collect_liff_items(limit: int, keyword: Optional[str], only_concert: bool, mode: str, debug: bool) -> tuple[List[Dict[str, Any]], str, List[Dict[str, Any]]]:
