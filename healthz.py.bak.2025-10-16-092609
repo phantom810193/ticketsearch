@@ -1,0 +1,31 @@
+from flask import Blueprint, jsonify, current_app
+import os, socket, datetime, subprocess
+
+bp = Blueprint("healthz", __name__, url_prefix="")
+
+def _git_sha():
+    try:
+        return (os.environ.get("COMMIT_SHA")
+                or subprocess.check_output(["git","rev-parse","--short","HEAD"], timeout=1).decode().strip())
+    except Exception:
+        return None
+
+@bp.get("/")
+def root():
+    return ("ticketsearch backend is running. Try /healthz or /liff/activities?debug=1\n",
+            200, {"Content-Type":"text/plain; charset=utf-8"})
+
+@bp.get("/healthz")
+@bp.get("/health")
+def health():
+    return jsonify({
+        "status":"ok",
+        "service":"ticketsearch",
+        "time": datetime.datetime.utcnow().isoformat()+"Z",
+        "host": socket.gethostname(),
+        "region": os.environ.get("REGION","asia-east1"),
+        "project": os.environ.get("GOOGLE_CLOUD_PROJECT") or os.environ.get("PROJECT_ID"),
+        "revision": os.environ.get("K_REVISION"),
+        "commit": _git_sha(),
+        "routes_count": len(list(current_app.url_map.iter_rules())),
+    }), 200

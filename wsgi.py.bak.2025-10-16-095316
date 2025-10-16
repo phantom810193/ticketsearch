@@ -1,0 +1,42 @@
+import os
+import logging
+logging.basicConfig(level=logging.INFO)
+
+# 嘗試用 create_app 工廠建立 app；失敗就退回直接匯出的 app
+app = None
+try:
+    from backend.app import create_app
+    app = create_app()
+    logging.info("Created app via create_app().")
+except Exception as e:
+    logging.info("create_app() not used or failed: %s", e)
+    try:
+        from backend.app import app as _app
+        app = _app
+        logging.info("Imported app instance from backend.app:app.")
+    except Exception as e2:
+        logging.error("Failed to import Flask app: %s", e2)
+        app = None
+
+# 若 app 存在才設定 strict_slashes
+if app is not None and hasattr(app, "url_map"):
+    try:
+        app.url_map.strict_slashes = False
+    except Exception as e:
+        logging.info("skip strict_slashes tweak: %s", e)
+
+# 若 app 建立失敗，使用最小 Flask fallback（至少 /healthz 能通）
+if app is None:
+    from flask import Flask, jsonify
+    app = Flask(__name__)
+
+    @app.get("/healthz")
+    def _healthz_failed():
+        return jsonify(status="fail", reason="app_factory_failed"), 503
+
+    @app.get("/")
+    def _root_failed():
+        return jsonify(ok=False, reason="app_factory_failed"), 503
+
+if __name__ == "__main__":
+    app.run(host="0.0.0.0", port=int(os.getenv("PORT", 8080)))

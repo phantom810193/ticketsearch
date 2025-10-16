@@ -1,0 +1,48 @@
+import importlib
+
+# 1) 嘗試從套件/模組載入現成 app
+candidates_has_app = [
+    "app",           # 套件 app/__init__.py 或模組 app.py
+    "ticketsearch",  # 若你的套件名就是 repo 名稱
+    "server",
+    "main",
+]
+app = None
+app.url_map.strict_slashes = False
+for mod in candidates_has_app:
+    try:
+        m = importlib.import_module(mod)
+        if hasattr(m, "app"):
+            app = getattr(m, "app")
+            break
+    except Exception:
+        pass
+
+# 2) 嘗試工廠模式 create_app()
+if app is None:
+    factories = [
+        ("app", "create_app"),
+        ("ticketsearch", "create_app"),
+        ("server", "create_app"),
+        ("main", "create_app"),
+    ]
+    for mod, fn in factories:
+        try:
+            m = importlib.import_module(mod)
+            if hasattr(m, fn):
+                app = getattr(m, fn)()
+                break
+        except Exception:
+            pass
+
+if app is None:
+    raise RuntimeError("Cannot locate Flask app. Please ensure app = Flask(...) or create_app() exists.")
+
+# 3) 掛上 healthz 藍圖與根路由
+try:
+    from healthz import bp as health_bp
+    # 根路由 "/" 與 "/healthz" 都由這個 blueprint 提供
+    app.register_blueprint(health_bp)
+except Exception as e:
+    # 不讓健康檢查阻擋主服務啟動
+    pass
