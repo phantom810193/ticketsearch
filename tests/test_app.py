@@ -69,7 +69,6 @@ def test_collect_datetime_candidates_filters_sale():
     assert candidates and candidates[0][0].year == 2024
     assert candidates[0][0].month == 6
 
-
 def test_collect_datetime_candidates_skips_ranges():
     lines = [
         "演出日期：2024/07/01 19:30",
@@ -80,7 +79,6 @@ def test_collect_datetime_candidates_skips_ranges():
     assert candidates
     for _, _, raw in candidates:
         assert "~" not in raw and "～" not in raw
-
 
 def test_parse_price_value_handles_currency():
     assert _parse_price_value("票價 NT$2,800") == 2800

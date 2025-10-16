@@ -805,6 +805,7 @@ _EVENT_DATE_KEYWORDS = (
 )
 
 
+
 def _normalize_date_text(text: Optional[str]) -> Optional[str]:
     if not text:
         return None
@@ -908,7 +909,9 @@ def _collect_datetime_candidates(lines: List[str]) -> List[Tuple[datetime, bool,
             pending_date = None
             continue
         compact = re.sub(r"\s+", " ", line)
+
         if any(ch in compact for ch in ("~", "～")):
+
             pending_date = None
             continue
         dt_match = _format_datetime_match(_RE_DATE.search(compact))
@@ -1098,7 +1101,6 @@ def _unwrap_go_ticket_url(u: str) -> Optional[str]:
 
     return None
 
-
 def _resolve_utk_url(
     activity_id: Optional[str],
     pattern: Optional[str],
@@ -1163,6 +1165,7 @@ def _resolve_utk_url(
                             if candidate and "UTK0201_000" in candidate.upper():
                                 resolved = candidate
                                 break
+
                 else:
                     reason = f"http={status}"
             except Exception as exc:
@@ -1484,6 +1487,7 @@ def fetch_from_ticket_details(details_url: str, sess: requests.Session) -> Dict[
     except Exception as exc:
         app.logger.info(f"[details] fetch fail: {exc}")
 
+
     def _abs_url(u: Optional[str]) -> Optional[str]:
         if not u:
             return None
@@ -1750,6 +1754,7 @@ def fetch_from_ticket_details(details_url: str, sess: requests.Session) -> Dict[
         final_image = LOGO
     out["poster"] = final_image
     out["image_url"] = final_image
+
 
     # datetime candidates derived from API values and page text
     dt_candidates: List[Tuple[int, datetime, bool]] = []
@@ -2453,7 +2458,9 @@ def _probe_activity_details(url: str, sess: requests.Session, trace: Optional[Li
             for ticket_url in ticket_candidates:
                 start_parse = time.time()
                 try:
+
                     parsed = parse_UTK0201_000(ticket_url, sess, referer=details_url_clean)
+
                 except Exception as e:
                     if trace is not None:
                         trace.append({
