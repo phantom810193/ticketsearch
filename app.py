@@ -2888,8 +2888,12 @@ def liff_watch_status():
 
     return jsonify({"ok": True, "results": results}), 200
 
-@app.get("/liff/activities_debug")
+# ✅ 新增這段：提供 /api/liff/status，轉呼叫上面那支
+@app.post("/api/liff/status")
+def liff_status_api():
+    return liff_watch_status()
 
+@app.get("/liff/activities_debug")
 def liff_activities_debug():
     try:
         limit = int(request.args.get("limit", "10"))
