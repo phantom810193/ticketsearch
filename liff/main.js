@@ -20,6 +20,17 @@
   const elReload = document.getElementById("reload");
   const elSec = document.getElementById("sec");
 
+  function buildStatusLine(item){
+    if (!item) return "暫時讀不到剩餘數（可能為動態載入）";
+    if (typeof item.remain === "number" && Number.isFinite(item.remain)){
+      return `剩餘 ${item.remain} 張`;
+    }
+    if (item.status_text){
+      return item.status_text;
+    }
+    return "暫時讀不到剩餘數（可能為動態載入）";
+  }
+
   function setStatus(text){
     if (elOut) elOut.textContent = text || "";
   }
@@ -65,7 +76,9 @@
     card.appendChild(title);
 
     const img = document.createElement("img");
-    img.src = item.image_url || PLACEHOLDER_IMAGE;
+    const cover = item.image || item.image_url || item.cover || "";
+    img.src = cover || PLACEHOLDER_IMAGE;
+
     img.alt = item.title || "活動圖片";
     img.onerror = () => {
       if (img.src !== PLACEHOLDER_IMAGE) {
@@ -76,10 +89,16 @@
 
     const meta = document.createElement("div");
     meta.className = "meta";
-    const dateLine = createMetaLine("📅", item.date_text || item.date || "");
-    const placeLine = createMetaLine("📍", item.place || "");
+
+    const dateLine = createMetaLine("📅", item.datetime || item.date_text || item.date || "");
+    const placeLine = createMetaLine("📍", item.venue || item.place || "");
+    const remainLine = (typeof item.remain === "number" && Number.isFinite(item.remain))
+      ? createMetaLine("🎟️ 剩餘", `${item.remain} 張`)
+      : null;
     if (dateLine) meta.appendChild(dateLine);
     if (placeLine) meta.appendChild(placeLine);
+    if (remainLine) meta.appendChild(remainLine);
+
     card.appendChild(meta);
 
     const links = document.createElement("div");
@@ -96,7 +115,8 @@
 
     const statusText = document.createElement("div");
     statusText.className = "status-text";
-    statusText.textContent = item.status_text || "暫時讀不到剩餘數（可能為動態載入）";
+    statusText.textContent = buildStatusLine(item);
+
     card.appendChild(statusText);
 
     const watchInfo = document.createElement("div");
@@ -116,14 +136,16 @@
     const btnStop = document.createElement("button");
     btnStop.className = "danger btn-stop";
     btnStop.type = "button";
-    btnStop.textContent = "⏹ 停止監看";
+    btnStop.textContent = "⛔️ 停止監看";
+
     btnStop.addEventListener("click", () => handleUnwatch(item, card, statusText, watchInfo, feedback));
     buttons.appendChild(btnStop);
 
     const btnQuick = document.createElement("button");
     btnQuick.className = "secondary btn-quick";
     btnQuick.type = "button";
-    btnQuick.textContent = "⚡ 快速查看";
+    btnQuick.textContent = "👁 快速查看";
+
     btnQuick.addEventListener("click", () => handleQuickCheck(item, card, statusText, feedback));
     buttons.appendChild(btnQuick);
 
@@ -193,8 +215,13 @@
       updateWatchState(item.url, { watching: true, enabled: true, taskId: body.task_id, found: true });
       updateCardWatchInfo(item.url, watchInfo);
       setCardFeedback(feedback, body.message || "已開始監看。");
-      if (body.detail && body.detail.status_text){
-        statusText.textContent = body.detail.status_text;
+
+      if (body.detail){
+        statusText.textContent = buildStatusLine({
+          remain: body.detail.remain ?? body.detail.remaining,
+          status_text: body.detail.status_text,
+        });
+
       }
     } catch (err) {
       console.error("watch failed", err);
@@ -219,10 +246,6 @@
     }
     const key = canonicalUrl(item.url);
     const current = state.statusMap[key] || {};
-    if (!current.taskId && !current.enabled){
-      alert("此活動無監看");
-      return;
-    }
     const payload = { chat_id: state.chatId, url: item.url };
     if (current.taskId){
       payload.task_code = current.taskId;
@@ -245,11 +268,28 @@
       if (!res.ok){
         throw new Error(body.error || `HTTP ${res.status}`);
       }
-      if (body.ok){
-        updateWatchState(item.url, { watching: false, enabled: false, taskId: body.task_id || current.taskId, found: true });
+
+      if (!body.ok && body.reason === "no_watch"){
+        updateWatchState(item.url, { watching: false, enabled: false, taskId: current.taskId || null, found: false });
+        updateCardWatchInfo(item.url, watchInfo);
+        setCardFeedback(feedback, body.message || "此活動目前沒有監看任務。");
+        alert(body.message || "此活動目前沒有監看任務。");
+        return;
       }
+      if (!body.ok){
+        throw new Error(body.error || body.message || `HTTP ${res.status}`);
+      }
+      updateWatchState(item.url, { watching: false, enabled: false, taskId: body.task_id || current.taskId, found: true });
       updateCardWatchInfo(item.url, watchInfo);
-      setCardFeedback(feedback, body.message || "已送出停止監看。" );
+      const stopMessage = body.message === "stopped" ? "已停止監看。" : (body.message || "已停止監看。");
+      setCardFeedback(feedback, stopMessage);
+      if (body.detail){
+        statusText.textContent = buildStatusLine({
+          remain: body.detail.remain ?? body.detail.remaining,
+          status_text: body.detail.status_text,
+        });
+      }
+
     } catch (err) {
       console.error("unwatch failed", err);
       alert(`停止監看失敗：${err.message || err}`);
@@ -257,7 +297,8 @@
     } finally {
       if (btn){
         btn.disabled = false;
-        btn.textContent = original || "⏹ 停止監看";
+        btn.textContent = original || "⛔️ 停止監看";
+
       }
     }
   }
@@ -280,10 +321,16 @@
       if (!res.ok || !body.ok){
         throw new Error(body.error || `HTTP ${res.status}`);
       }
-      if (body.detail && body.detail.status_text){
-        statusText.textContent = body.detail.status_text;
+
+      const detail = body.detail || {};
+      if (detail){
+        statusText.textContent = buildStatusLine({
+          remain: body.remain ?? detail.remain ?? detail.remaining,
+          status_text: body.status_text || detail.status_text,
+        });
       }
-      setCardFeedback(feedback, "已取得最新票數資訊，請查看訊息。");
+      setCardFeedback(feedback, body.message || "已取得最新票數資訊。");
+
       if (body.message){
         if (state.isClient){
           try {
@@ -362,15 +409,17 @@
     setStatus("載入活動清單中…");
     try {
       let data = await fetchConcerts("carousel");
-      let sourceMode = data && data.source_mode ? data.source_mode : "carousel";
-      if (!data || !Array.isArray(data.results) || data.results.length === 0){
+      let items = Array.isArray(data.items) ? data.items : [];
+      let sourceMode = data && data.mode ? data.mode : "carousel";
+      if (!items.length){
         const fallback = await fetchConcerts("all");
-        if (fallback && Array.isArray(fallback.results) && fallback.results.length){
+        if (fallback && Array.isArray(fallback.items) && fallback.items.length){
           data = fallback;
-          sourceMode = fallback.source_mode || "all";
+          items = fallback.items;
+          sourceMode = fallback.mode || "all";
         }
       }
-      const items = (data && Array.isArray(data.results)) ? data.results : [];
+
       state.items = items;
       const urls = items.map(it => it.url).filter(Boolean);
       try {
