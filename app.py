@@ -2119,3 +2119,19 @@ try:
 except Exception as _e:
     # 若此檔沒有 app 實例而是用 create_app()，可忽略這段
     pass
+
+# === debug: dump all routes ===
+try:
+    from flask import jsonify
+    def _dump_routes(flask_app):
+        out=[]
+        for r in flask_app.url_map.iter_rules():
+            methods = sorted(m for m in r.methods if m in ("GET","POST","PUT","DELETE","PATCH"))
+            out.append({"rule": str(r), "endpoint": r.endpoint, "methods": methods})
+        return out
+
+    @_r.get("/__routes")
+    def __routes():
+        return jsonify(routes=_dump_routes(app)), 200
+except Exception:
+    pass
