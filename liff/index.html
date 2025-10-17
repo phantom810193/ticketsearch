@@ -210,6 +210,7 @@
             const price = (typeof t.price === "number" && Number.isFinite(t.price))
               ? `NT$${t.price.toLocaleString("zh-TW")}`
               : "";
+
             const status = typeof t.status === "string" ? t.status.trim() : "";
             let remaining = "";
             if (typeof t.remaining === "number" && Number.isFinite(t.remaining)){
@@ -223,6 +224,7 @@
             } else if (status){
               remaining = status;
             }
+
             const segments = [area, price, remaining].filter(Boolean);
             return segments.join(" ");
           }).filter(Boolean);
