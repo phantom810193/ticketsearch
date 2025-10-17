@@ -12,7 +12,6 @@ import traceback
 import sys
 import requests
 from datetime import datetime, timezone, timedelta
-from .globals import _initialize_globals
 from typing import Dict, Tuple, Optional, Any, List, Set
 from urllib.parse import urlparse, urlunparse, parse_qs, urlencode, urljoin, unquote
 from flask import (
@@ -29,8 +28,6 @@ def create_app() -> Flask:
         flask_app = Flask(__name__)
         flask_app.url_map.strict_slashes = False
         _initialize_globals(flask_app)
-        from .blueprints.liff_api import bp as liff_api_bp
-        from .blueprints.main    import bp as main_bp
         flask_app.register_blueprint(liff_api_bp)
         flask_app.register_blueprint(main_bp)
         return flask_app
@@ -202,17 +199,6 @@ def _quick_check_bg(app, payload):
             # do_fetch_and_push(url)
         except Exception as e:
             current_app.logger.exception("quick-bg failed for %s", url)
-
-@app.post("/api/liff/quick-check")
-def quick_check():
-    body = request.get_json(silent=True) or {}
-    if not body.get("url"):
-        return jsonify({"ok": False, "error": "missing url"}), 200
-    # 取出真正 app 物件傳進 thread
-    app_obj = current_app._get_current_object()
-    t = threading.Thread(target=_quick_check_bg, args=(app_obj, body), daemon=True)
-    t.start()
-    return jsonify({"ok": True, "task_id": "QC-XXXXXX"}), 200
 
 def _breaker_open_now() -> bool:
     return (time.time() < _IBON_BREAK_OPEN_UNTIL) or _IBON_API_DISABLED
