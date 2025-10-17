@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-import os
+import os, shutil
 import re
 import json
 import time
@@ -23,6 +23,25 @@ from flask import (
     current_app,
 )
 
+liff_api_bp = Blueprint("liff_api", __name__, url_prefix="/api/liff")
+main_bp = Blueprint("main", __name__)
+
+@app.get("/diag/browser")
+def diag_browser():
+    try:
+        chrome = os.environ.get("CHROME_BIN") or shutil.which("chromium") or shutil.which("chromium-browser")
+        chromedriver = os.environ.get("CHROMEDRIVER_PATH") or shutil.which("chromedriver")
+        use_selenium = str(os.environ.get("USE_SELENIUM", "0")).lower() in ("1", "true", "yes")
+        ok = bool(chrome and chromedriver and use_selenium)
+        return jsonify({
+            "ok": ok,
+            "USE_SELENIUM": use_selenium,
+            "CHROME_BIN": chrome,
+            "CHROMEDRIVER_PATH": chromedriver
+        }), 200
+    except Exception as e:
+        return jsonify({"ok": False, "error": str(e)}), 200
+
 def create_app() -> Flask:
     try:
         flask_app = Flask(__name__)
@@ -34,10 +53,6 @@ def create_app() -> Flask:
     except Exception:
         print("FATAL boot error:\n" + traceback.format_exc(), file=sys.stderr, flush=True)
         raise
-
-liff_api_bp = Blueprint("liff_api", __name__, url_prefix="/api/liff")
-main_bp = Blueprint("main", __name__)
-
 
 def _get_logger() -> logging.Logger:
     try:
