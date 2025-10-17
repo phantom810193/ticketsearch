@@ -4194,9 +4194,26 @@ def quick_check_post():
     chat_id = payload.get("chat_id") or payload.get("chatId")
     return _quick_check_impl(payload.get("url"), chat_id)
 
+# === 修改現有的 /liff/activities ===
 @main_bp.get("/liff/activities")
 def liff_activities():
+    url = request.args.get("url")
     want_debug = _truthy(request.args.get("debug"))
+
+    # 新增：若帶 url，改走單活動「細節解析」邏輯（重用既有 debug handler）
+    if url:
+        # liff_activities_debug 是你已存在的單頁解析路由對應函式（endpoint: main.liff_activities_debug）
+        # 直接呼叫它並取出 JSON；它會使用同一個 request.args（含 url、debug）
+        resp = liff_activities_debug()
+        data = resp.get_json(silent=True) if hasattr(resp, "get_json") else None
+        payload = {
+            "ok": bool((data or {}).get("ok", True)),
+            "mode": "detail",
+            "item": data,   # 內含你 debug 的 trace/tickets 等欄位
+        }
+        return jsonify(payload), 200
+
+    # ↓↓↓ 以下維持你原本的 carousel 流程 ↓↓↓
     response = concerts()
     if want_debug:
         return response
@@ -4363,7 +4380,9 @@ def __nf(e):  # noqa: D401
     print("[NF]", request.method, request.path)
     return jsonify({"error": "not found", "path": request.path}), 404
 
-
+@liff_api_bp.get("/activities")
+def activities_api_alias():
+    # 直接重用上面的 main_bp handler
+    return liff_activities()
 
 app = create_app()
-
