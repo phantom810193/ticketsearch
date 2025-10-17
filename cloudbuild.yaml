@@ -24,7 +24,7 @@ steps:
     - '--image=asia-east1-docker.pkg.dev/$PROJECT_ID/cloud-run-source-deploy/ticketsearch:$SHORT_SHA'
     - '--allow-unauthenticated'
     - '--set-secrets=LINE_CHANNEL_ACCESS_TOKEN=line-channel-token:latest,LINE_CHANNEL_SECRET=line-channel-secret:latest,CRON_KEY=cron-key:latest'
-    - '--update-env-vars=GOOGLE_CLOUD_PROJECT=ticketsearch-475305,DEFAULT_PERIOD_SEC=15,TICK_FANOUT=1,TASKS_QUEUE=tick-queue,TASKS_LOCATION=asia-east1,TASKS_SERVICE_ACCOUNT=tasks-caller@ticketsearch-475305.iam.gserviceaccount.com,TASKS_TARGET_URL=https://ticketsearch-933798663509.asia-east1.run.app,MAX_PER_TICK=20,TICK_SOFT_DEADLINE_SEC=50,FOLLOW_AREAS_PER_CHECK=3,ALLOWED_ORIGINS=https://liff.line.me,https://ticketsearch-933798663509.asia-east1.run.app,DEFAULT_INTERVAL=15,IBON_API_COOLDOWN_SEC=300,IBON_ENT_URL=https://ticket.ibon.com.tw/Index/entertainment,CHROME_BIN=/usr/bin/chromium,CHROMEDRIVER_PATH=/usr/lib/chromium/chromedriver,USE_SELENIUM=1'
+    - '--update-env-vars=GOOGLE_CLOUD_PROJECT=ticketsearch-475305,DEFAULT_PERIOD_SEC=15,TICK_FANOUT=1,TASKS_QUEUE=tick-queue,TASKS_LOCATION=asia-east1,TASKS_SERVICE_ACCOUNT=tasks-caller@ticketsearch-475305.iam.gserviceaccount.com,TASKS_TARGET_URL=https://ticketsearch-933798663509.asia-east1.run.app,MAX_PER_TICK=20,TICK_SOFT_DEADLINE_SEC=50,FOLLOW_AREAS_PER_CHECK=3,ALLOWED_ORIGINS=https://liff.line.me,https://ticketsearch-933798663509.asia-east1.run.app,DEFAULT_INTERVAL=15,IBON_API_COOLDOWN_SEC=300,IBON_ENT_URL=https://ticket.ibon.com.tw/Index/entertainment,CHROME_BIN=/usr/bin/chromium,CHROMEDRIVER_PATH=/usr/lib/chromium/chromedriver,USE_SELENIUM=1,ALWAYS_NOTIFY=1'
     - '--timeout=300'
 
 options:
