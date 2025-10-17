@@ -26,7 +26,8 @@ from flask import (
 liff_api_bp = Blueprint("liff_api", __name__, url_prefix="/api/liff")
 main_bp = Blueprint("main", __name__)
 
-@app.get("/diag/browser")
+
+@main_bp.get("/diag/browser")
 def diag_browser():
     try:
         chrome = os.environ.get("CHROME_BIN") or shutil.which("chromium") or shutil.which("chromium-browser")
