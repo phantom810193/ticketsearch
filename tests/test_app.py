@@ -14,7 +14,6 @@ from app import (  # noqa: E402
     _collect_datetime_candidates,
     _parse_price_value,
     _interpret_utk_status,
-
 )
 
 

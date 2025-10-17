@@ -12,7 +12,7 @@ import traceback
 import sys
 import requests
 from datetime import datetime, timezone, timedelta
-from typing import Dict, Tuple, Optional, Any, List
+from typing import Dict, Tuple, Optional, Any, List, Set
 from urllib.parse import urlparse, urlunparse, parse_qs, urlencode, urljoin, unquote
 from flask import (
     Flask,
@@ -362,7 +362,7 @@ def _prepare_ibon_session() -> Tuple[requests.Session, Optional[str]]:
     })
 
     try:
-        s.get(IBON_ENT_URL, timeout=10)
+        http_get(s, IBON_ENT_URL, timeout=10)
     except Exception as e:
         _get_logger().info(f"[ibon token] warm-up failed: {e}")
 
@@ -746,7 +746,7 @@ def _run_js_with_fallback(url: str, js_func_literal: str):
     try:
         s = requests.Session()
         s.headers.update({"User-Agent": "Mozilla/5.0"})
-        r = s.get(url, timeout=12)
+        r = http_get(s, url, timeout=12)
         html = r.text
         urls = []
         for m in re.finditer(r'(?i)(?:https?://ticket\.ibon\.com\.tw)?/ActivityInfo/Details/(\d+)', html):
@@ -1106,32 +1106,6 @@ def _push_detail_to_chat(chat_id: Optional[str], detail: Optional[Dict[str, Any]
     except Exception as exc:
         _get_logger().error(f"[push] failed to deliver result: {exc}")
 
-
-
-def _spawn_background_worker(name: str, target, *args, **kwargs) -> bool:
-    try:
-        threading.Thread(target=target, args=args, kwargs=kwargs, daemon=True, name=name).start()
-        return True
-    except Exception as exc:
-        app.logger.exception(f"[background] unable to start {name}: {exc}")
-        return False
-
-
-def _push_detail_to_chat(chat_id: Optional[str], detail: Optional[Dict[str, Any]], fallback: Optional[str] = None, extra_text: Optional[str] = None):
-    if not chat_id:
-        return
-    try:
-        if isinstance(detail, dict):
-            payload = dict(detail)
-            send_text(chat_id, fmt_result_text(payload))
-            if extra_text:
-                send_text(chat_id, extra_text)
-        elif fallback:
-            send_text(chat_id, fallback)
-    except Exception as exc:
-        app.logger.error(f"[push] failed to deliver result: {exc}")
-
-
 def sess_default() -> requests.Session:
     s = requests.Session()
     s.headers.update({
@@ -1141,6 +1115,15 @@ def sess_default() -> requests.Session:
         "Connection": "close",
     })
     return s
+
+
+DEFAULT_HTTP_TIMEOUT = (3.0, 6.0)
+
+
+def http_get(sess: requests.Session, url: str, **kwargs) -> requests.Response:
+    kwargs.setdefault("timeout", DEFAULT_HTTP_TIMEOUT)
+    return sess.get(url, **kwargs)
+
 
 def _url_ok(u: str) -> bool:
     if not u or not u.startswith("http"):
@@ -1282,7 +1265,10 @@ def _resolve_utk_url(
             resolved: Optional[str] = None
             request_url: Optional[str] = None
             try:
-                resp = sess.get(
+
+                resp = http_get(
+                    sess,
+
                     base_url,
                     params=query,
                     headers=headers,
@@ -1624,7 +1610,8 @@ def fetch_from_ticket_details(details_url: str, sess: requests.Session) -> Dict[
     api_dt_values: List[Tuple[str, int]] = []
     try:
 
-        resp = sess.get(details_url, timeout=6)
+        resp = http_get(sess, details_url, timeout=6)
+
         if resp.status_code == 200:
             detail_html = _decode_ibon_html(resp)
     except Exception as exc:
@@ -1781,6 +1768,7 @@ def fetch_from_ticket_details(details_url: str, sess: requests.Session) -> Dict[
             except Exception as e:
                 _get_logger().info(f"[details-api] content parse err: {e}")
 
+
     if detail_html:
         try:
             soup = soup_parse(detail_html)
@@ -1842,8 +1830,8 @@ def fetch_from_ticket_details(details_url: str, sess: requests.Session) -> Dict[
 
             ticket_urls.extend(_extract_ticket_urls_from_text(detail_html))
         except Exception as e:
-
             _get_logger().info(f"[details] parse err: {e}")
+
 
     # 透過內容文字補齊場地
     if content_lines:
@@ -2376,11 +2364,11 @@ def try_fetch_livemap_by_perf(perf_id: str, sess: requests.Session, html: Option
             tried.add(url)
             try:
                 _get_logger().info(f"[livemap] try {url}")
-                r = sess.get(url, timeout=12)
+
+                r = http_get(sess, url, timeout=12)
                 if r.status_code == 200:
                     html = _decode_ibon_html(r)
                     if "<area" in html:
-
                         _get_logger().info(f"[livemap] hit {url}")
 
                         return _parse_livemap_text(html)
@@ -2399,7 +2387,7 @@ def fetch_area_left_from_utk0101(base_000_url: str, perf_id: str, product_id: st
             "strItem": "WEB網站入手A1",
         }
         headers = {"Referer": base_000_url, "User-Agent": UA, "Accept-Language": "zh-TW,zh;q=0.9,en;q=0.6"}
-        r = sess.get(url, params=params, headers=headers, timeout=12)
+        r = http_get(sess, url, params=params, headers=headers, timeout=12)
         if r.status_code != 200:
             return None
         html = r.text
@@ -2430,7 +2418,7 @@ def parse_UTK0201_000(url: str, sess: requests.Session, referer: Optional[str] =
     }
     headers["Referer"] = referer or url
 
-    r = sess.get(url, headers=headers, timeout=6)
+    r = http_get(sess, url, headers=headers, timeout=6)
 
     if r.status_code != 200:
         out["msg"] = f"讀取失敗（HTTP {r.status_code}）"
@@ -2860,7 +2848,9 @@ def probe(url: str) -> dict:
     if "ticket.ibon.com.tw" in p.netloc and "/ActivityInfo/Details" in p.path:
         return _probe_activity_details(url, s)
 
-    r = s.get(url, timeout=12)
+
+    r = http_get(s, url, timeout=12)
+
     if r.apparent_encoding:
         r.encoding = r.apparent_encoding
     title = ""
@@ -3155,6 +3145,7 @@ def webhook():
         except Exception as exc:
             app_obj.logger.exception(f"/webhook handler error: {exc}")
 
+
     app_obj = current_app._get_current_object()
     if not _spawn_background_worker(app_obj, "webhook", _handle_async, app_obj, body, signature):
         return jsonify({"ok": False}), 200
@@ -3162,88 +3153,16 @@ def webhook():
 
 @main_bp.route("/cron/tick", methods=["GET"])
 def cron_tick():
-    start = time.time()
-    resp = {"ok": True, "processed": 0, "skipped": 0, "errors": []}
-    try:
-        if not FS_OK:
-            resp["ok"] = False
-            resp["errors"].append("No Firestore client")
-            return jsonify(resp), 200
+    task_id = f"CRON-{uuid.uuid4().hex[:6].upper()}"
+    response: Dict[str, Any] = {"ok": True, "queued": True, "task_id": task_id}
 
-        now = datetime.now(timezone.utc)
+    app_obj = current_app._get_current_object()
+    if not _spawn_background_worker(app_obj, "cron-tick", _background_cron_tick_job, app_obj, task_id):
+        response["ok"] = False
+        response["queued"] = False
 
-        try:
-            docs = list(fs_client.collection(COL).where("enabled", "==", True).stream())
-        except Exception as e:
-            _get_logger().error(f"[tick] list watchers failed: {e}")
-            resp["ok"] = False
-            resp["errors"].append(f"list failed: {e}")
-            return jsonify(resp), 200
+    return jsonify(response), 200
 
-        handled = 0
-        for d in docs:
-            if (time.time() - start) > TICK_SOFT_DEADLINE_SEC:
-                resp["errors"].append("soft-deadline reached; remaining will run next tick")
-                break
-            if handled >= MAX_PER_TICK:
-                resp["errors"].append("max-per-tick reached; remaining will run next tick")
-                break
-
-            r = d.to_dict()
-            period = int(r.get("period", DEFAULT_PERIOD_SEC))
-            next_run_at = r.get("next_run_at") or (now - timedelta(seconds=1))
-            if now < next_run_at:
-                resp["skipped"] += 1
-                continue
-
-            url = r.get("url")
-            try:
-                res = probe(url)
-            except Exception as e:
-                _get_logger().error(f"[tick] probe error for {url}: {e}")
-                res = {"ok": False, "msg": f"probe error: {e}", "sig": "NA", "url": url}
-
-            try:
-                fs_client.collection(COL).document(d.id).update({
-                    "last_sig": res.get("sig", "NA"),
-                    "last_total": res.get("total", 0),
-                    "last_ok": bool(res.get("ok", False)),
-                    "updated_at": now,
-                    "next_run_at": now + timedelta(seconds=period),
-                })
-            except Exception as e:
-                _get_logger().error(f"[tick] update doc error: {e}")
-                resp["errors"].append(f"update error: {e}")
-
-            changed = (res.get("sig", "NA") != r.get("last_sig", ""))
-            if ALWAYS_NOTIFY or changed:
-                try:
-                    res["task_id"] = r.get("id")
-                    chat_id = r.get("chat_id")
-                    sent = set()
-                    sm = res.get("seatmap")
-                    img = res.get("image")
-                    if sm and _url_ok(sm):
-                        send_image(chat_id, sm); sent.add(sm)
-                    if img and _url_ok(img) and img not in sent:
-                        send_image(chat_id, img)
-                    send_text(chat_id, fmt_result_text(res))
-                except Exception as e:
-                    _get_logger().error(f"[tick] notify error: {e}")
-                    resp["errors"].append(f"notify error: {e}")
-
-            handled += 1
-            resp["processed"] += 1
-
-        _get_logger().info(f"[tick] processed={resp['processed']} skipped={resp['skipped']} "
-                        f"errors={len(resp['errors'])} duration={time.time()-start:.1f}s")
-        return jsonify(resp), 200
-
-    except Exception as e:
-        _get_logger().error(f"[tick] fatal: {e}\n{traceback.format_exc()}")
-        resp["ok"] = False
-        resp["errors"].append(str(e))
-        return jsonify(resp), 200
 
 @main_bp.route("/diag", methods=["GET"])
 def diag():
@@ -3272,7 +3191,7 @@ def diag_routes():
 
 @main_bp.route("/healthz", methods=["GET"])
 def healthz():
-    return "ok", 200
+    return jsonify({"ok": True}), 200
 
 @main_bp.route("/check", methods=["GET"])
 def http_check_once():
@@ -3301,10 +3220,10 @@ def fetch_ibon_ent_html_hard(limit=10, keyword=None, only_concert=False):
         "Connection": "close",
     })
     items: List[Dict[str, Any]] = []
-    seen: set = set()
+    seen: Set[str] = set()
 
     try:
-        r = s.get(url, timeout=15)
+        r = http_get(s, url, timeout=15)
         r.raise_for_status()
         html = _decode_ibon_html(r)
         soup = soup_parse(html)
@@ -3818,6 +3737,166 @@ def _background_quick_check_job(app_obj: Flask, chat_id: Optional[str], url: str
     else:
         _push_detail_to_chat(chat_id, None, fallback=fallback)
 
+def _background_watch_job(app_obj: Flask, chat_id: Optional[str], url: str, task_id: str, created: bool, period: int) -> None:
+    logger = app_obj.logger
+    status_line = f"任務 {task_id} 已{'建立' if created else '更新'}，每 {period} 秒監看。"
+    fallback = f"{status_line} 但目前無法取得票券資訊。"
+    try:
+        detail = _maybe_probe(url)
+    except Exception as exc:  # pragma: no cover - network failure path
+        logger.error(f"[watch-bg] probe failed for {url}: {exc}")
+        if chat_id:
+            send_text(chat_id, f"{status_line} 查詢失敗：{exc}")
+        return
+
+    if isinstance(detail, dict):
+        payload = dict(detail)
+        payload.setdefault("task_id", task_id)
+        _push_detail_to_chat(chat_id, payload, extra_text=status_line)
+    else:
+        _push_detail_to_chat(chat_id, None, fallback=fallback)
+
+
+def _background_unwatch_job(app_obj: Flask, chat_id: Optional[str], url: Optional[str], task_id: str) -> None:
+    logger = app_obj.logger
+    status_line = f"任務 {task_id} 已停止監看。"
+    detail = None
+    if url:
+        try:
+            detail = _maybe_probe(url)
+        except Exception as exc:  # pragma: no cover - network failure path
+            logger.info(f"[unwatch-bg] probe failed for {url}: {exc}")
+            detail = None
+    if isinstance(detail, dict):
+        payload = dict(detail)
+        payload.setdefault("task_id", task_id)
+        _push_detail_to_chat(chat_id, payload, extra_text=status_line)
+    else:
+        _push_detail_to_chat(chat_id, None, fallback=status_line)
+
+
+def _background_quick_check_job(app_obj: Flask, chat_id: Optional[str], url: str, task_id: str) -> None:
+    logger = app_obj.logger
+    status_line = f"快速查看任務 {task_id} 已完成。"
+    fallback = f"{status_line} 但目前無法取得票券資訊。"
+    try:
+        detail = _maybe_probe(url)
+    except Exception as exc:  # pragma: no cover - network failure path
+        logger.error(f"[quick-bg] probe failed for {url}: {exc}")
+        if chat_id:
+            send_text(chat_id, f"快速查看任務 {task_id} 失敗：{exc}")
+        return
+
+    if isinstance(detail, dict):
+        payload = dict(detail)
+        payload.setdefault("task_id", task_id)
+        _push_detail_to_chat(chat_id, payload, extra_text=status_line)
+    else:
+        _push_detail_to_chat(chat_id, None, fallback=fallback)
+
+
+def _perform_cron_tick() -> Dict[str, Any]:
+    start = time.time()
+    resp: Dict[str, Any] = {"ok": True, "processed": 0, "skipped": 0, "errors": []}
+    try:
+        if not FS_OK:
+            resp["ok"] = False
+            resp["errors"].append("No Firestore client")
+            return resp
+
+        now = datetime.now(timezone.utc)
+        try:
+            docs = list(fs_client.collection(COL).where("enabled", "==", True).stream())
+        except Exception as exc:
+            _get_logger().error(f"[tick] list watchers failed: {exc}")
+            resp["ok"] = False
+            resp["errors"].append(f"list failed: {exc}")
+            return resp
+
+        handled = 0
+        for d in docs:
+            if (time.time() - start) > TICK_SOFT_DEADLINE_SEC:
+                resp["errors"].append("soft-deadline reached; remaining will run next tick")
+                break
+            if handled >= MAX_PER_TICK:
+                resp["errors"].append("max-per-tick reached; remaining will run next tick")
+                break
+
+            r = d.to_dict()
+            period = int(r.get("period", DEFAULT_PERIOD_SEC))
+            next_run_at = r.get("next_run_at") or (now - timedelta(seconds=1))
+            if now < next_run_at:
+                resp["skipped"] += 1
+                continue
+
+            url = r.get("url")
+            try:
+                res = probe(url)
+            except Exception as exc:
+                _get_logger().error(f"[tick] probe error for {url}: {exc}")
+                res = {"ok": False, "msg": f"probe error: {exc}", "sig": "NA", "url": url}
+
+            try:
+                fs_client.collection(COL).document(d.id).update({
+                    "last_sig": res.get("sig", "NA"),
+                    "last_total": res.get("total", 0),
+                    "last_ok": bool(res.get("ok", False)),
+                    "updated_at": now,
+                    "next_run_at": now + timedelta(seconds=period),
+                })
+            except Exception as exc:
+                _get_logger().error(f"[tick] update doc error: {exc}")
+                resp["errors"].append(f"update error: {exc}")
+
+            changed = (res.get("sig", "NA") != r.get("last_sig", ""))
+            if ALWAYS_NOTIFY or changed:
+                try:
+                    res["task_id"] = r.get("id")
+                    chat_id = r.get("chat_id")
+                    sent: Set[str] = set()
+                    sm = res.get("seatmap")
+                    img = res.get("image")
+                    if sm and _url_ok(sm):
+                        send_image(chat_id, sm)
+                        sent.add(sm)
+                    if img and _url_ok(img) and img not in sent:
+                        send_image(chat_id, img)
+                    send_text(chat_id, fmt_result_text(res))
+                except Exception as exc:
+                    _get_logger().error(f"[tick] notify error: {exc}")
+                    resp["errors"].append(f"notify error: {exc}")
+
+            handled += 1
+            resp["processed"] += 1
+
+    except Exception as exc:
+        _get_logger().error(f"[tick] fatal: {exc}\n{traceback.format_exc()}")
+        resp["ok"] = False
+        resp["errors"].append(str(exc))
+    finally:
+        resp["elapsed_ms"] = int((time.time() - start) * 1000)
+
+    return resp
+
+
+def _background_cron_tick_job(app_obj: Flask, task_id: str) -> None:
+    logger = app_obj.logger
+    try:
+        result = _perform_cron_tick()
+        logger.info(
+            "[cron-bg] task=%s ok=%s processed=%s skipped=%s errors=%s elapsed_ms=%s",
+            task_id,
+            result.get("ok"),
+            result.get("processed"),
+            result.get("skipped"),
+            len(result.get("errors", [])),
+            result.get("elapsed_ms"),
+        )
+    except Exception as exc:  # pragma: no cover - defensive guard
+        logger.exception(f"[cron-bg] task={task_id} crashed: {exc}")
+
+
+
 def _collect_liff_items(limit: int, keyword: Optional[str], only_concert: bool, mode: str, debug: bool) -> tuple[List[Dict[str, Any]], str, List[Dict[str, Any]]]:
     trace: List[Dict[str, Any]] = []
     items: List[Dict[str, Any]] = []
@@ -3883,31 +3962,6 @@ def _collect_liff_items(limit: int, keyword: Optional[str], only_concert: bool, 
             items = enriched
             trace.append({"phase": "enrich", "count": len(items)})
 
-    if items:
-        sess = sess_default()
-        enriched: List[Dict[str, Any]] = []
-        for base in items:
-            details_url = base.get("details_url") or base.get("url")
-            if not isinstance(details_url, str) or not details_url:
-                continue
-            item_trace: Optional[List[Dict[str, Any]]] = [] if debug else None
-            try:
-                data = _probe_activity_details(details_url, sess, trace=item_trace)
-            except Exception as exc:
-                app.logger.info(f"[liff_api] enrich fail {details_url}: {exc}")
-                if item_trace is not None:
-                    item_trace.append({"phase": "error", "reason": str(exc)})
-                continue
-            base_image = base.get("image_url") or base.get("image")
-            if base_image and not data.get("image"):
-                data["image"] = base_image
-                data["image_url"] = base_image
-            if item_trace:
-                data["trace"] = item_trace
-            enriched.append(data)
-        if enriched:
-            items = enriched
-            trace.append({"phase": "enrich", "count": len(items)})
 
     return items or [], actual_mode, trace
 
@@ -4305,8 +4359,9 @@ def create_app() -> Flask:
         flask_app.register_blueprint(main_bp)
         return flask_app
     except Exception:
-        print("Failed to create Flask app", file=sys.stderr)
-        traceback.print_exc()
+
+        print("FATAL boot error:\n" + traceback.format_exc(), file=sys.stderr, flush=True)
+
         raise
 
 
