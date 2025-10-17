@@ -12,6 +12,7 @@ import traceback
 import sys
 import requests
 from datetime import datetime, timezone, timedelta
+from .globals import _initialize_globals
 from typing import Dict, Tuple, Optional, Any, List, Set
 from urllib.parse import urlparse, urlunparse, parse_qs, urlencode, urljoin, unquote
 from flask import (
@@ -23,6 +24,20 @@ from flask import (
     current_app,
 )
 
+def create_app() -> Flask:
+    try:
+        flask_app = Flask(__name__)
+        flask_app.url_map.strict_slashes = False
+        _initialize_globals(flask_app)
+        from .blueprints.liff_api import bp as liff_api_bp
+        from .blueprints.main    import bp as main_bp
+        flask_app.register_blueprint(liff_api_bp)
+        flask_app.register_blueprint(main_bp)
+        return flask_app
+    except Exception:
+        print("FATAL boot error:\n" + traceback.format_exc(), file=sys.stderr, flush=True)
+        raise
+
 liff_api_bp = Blueprint("liff_api", __name__, url_prefix="/api/liff")
 main_bp = Blueprint("main", __name__)
 
@@ -32,7 +47,6 @@ def _get_logger() -> logging.Logger:
         return current_app.logger  # type: ignore[return-value]
     except Exception:
         return logging.getLogger("ticketsearch")
-
 
 ALLOWED_ORIGINS: List[str] = []
 line_bot_api: Optional["LineBotApi"] = None  # type: ignore[name-defined]
@@ -48,7 +62,6 @@ FS_ERROR_MSG: str = ""
 MAX_PER_TICK: int = 6
 TICK_SOFT_DEADLINE_SEC: int = 50
 COL = "watchers"
-
 
 def _initialize_globals(app: Flask) -> None:
     global ALLOWED_ORIGINS, line_bot_api, handler, DEFAULT_PERIOD_SEC, ALWAYS_NOTIFY
@@ -4349,20 +4362,6 @@ def __nf(e):  # noqa: D401
     print("[NF]", request.method, request.path)
     return jsonify({"error": "not found", "path": request.path}), 404
 
-
-def create_app() -> Flask:
-    try:
-        flask_app = Flask(__name__)
-        flask_app.url_map.strict_slashes = False
-        _initialize_globals(flask_app)
-        flask_app.register_blueprint(liff_api_bp)
-        flask_app.register_blueprint(main_bp)
-        return flask_app
-    except Exception:
-
-        print("FATAL boot error:\n" + traceback.format_exc(), file=sys.stderr, flush=True)
-
-        raise
 
 
 app = create_app()
