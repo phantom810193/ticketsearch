@@ -26,7 +26,8 @@ from flask import (
 liff_api_bp = Blueprint("liff_api", __name__, url_prefix="/api/liff")
 main_bp = Blueprint("main", __name__)
 
-@app.get("/diag/browser")
+
+@main_bp.get("/diag/browser")
 def diag_browser():
     try:
         chrome = os.environ.get("CHROME_BIN") or shutil.which("chromium") or shutil.which("chromium-browser")
@@ -206,14 +207,31 @@ _IBON_BREAK_OPEN_UNTIL = 0.0  # timestamp，> now 代表 API 暫停使用
 _IBON_BREAK_COOLDOWN = int(os.getenv("IBON_API_COOLDOWN_SEC", "300"))  # 500 後冷卻秒數（預設 5 分鐘）
 _IBON_API_DISABLED = os.getenv("IBON_API_DISABLE", "0") == "1"  # 緊急開關：1 => 永遠不用 API
 
-def _quick_check_bg(app, payload):
-    # 背景工作一定要有 app context
-    with app.app_context():
-        try:
-            url = payload["url"]              # 這裡做你的抓票/解析/推播
-            # do_fetch_and_push(url)
-        except Exception as e:
-            current_app.logger.exception("quick-bg failed for %s", url)
+def _quick_check_bg(app_obj: Flask, chat_id: Optional[str], url: str, task_id: str) -> None:
+    logger = getattr(app_obj, "logger", logging.getLogger("ticketsearch"))
+    start = time.time()
+    logger.debug(f"[quick-check] task {task_id} started for {url}")
+    status_line = f"快速查看任務 {task_id} 已完成。"
+    fallback = f"{status_line} 但目前無法取得票券資訊。"
+    detail: Optional[Dict[str, Any]] = None
+    try:
+        with app_obj.app_context():
+            try:
+                detail = _maybe_probe(url)
+            except Exception as exc:  # pragma: no cover - network failure path
+                logger.error(f"[quick-bg] probe failed for {url}: {exc}")
+                if chat_id:
+                    send_text(chat_id, f"快速查看任務 {task_id} 失敗：{exc}")
+                return
+            if isinstance(detail, dict):
+                payload = dict(detail)
+                payload.setdefault("task_id", task_id)
+                _push_detail_to_chat(chat_id, payload, extra_text=status_line)
+            else:
+                _push_detail_to_chat(chat_id, None, fallback=fallback)
+    finally:
+        elapsed = time.time() - start
+        logger.debug(f"[quick-check] task {task_id} finished in {elapsed:.3f}s for {url}")
 
 def _breaker_open_now() -> bool:
     return (time.time() < _IBON_BREAK_OPEN_UNTIL) or _IBON_API_DISABLED
@@ -305,6 +323,20 @@ def _decode_ibon_html(response: requests.Response) -> str:
         return raw.decode(enc, errors="replace")
     except Exception:
         return raw.decode("utf-8", errors="replace")
+
+
+def read_html_safely(response: requests.Response) -> str:
+    """Decode ibon Traditional Chinese pages without mojibake."""
+
+    try:
+        html = _decode_ibon_html(response)
+    except Exception as exc:
+        _get_logger().warning(f"[html] decode failed, fallback to utf-8: {exc}")
+        try:
+            html = response.content.decode("utf-8", errors="replace")
+        except Exception:
+            html = response.text
+    return html
 
 
 def _extract_xsrf_token(payload: Any) -> Optional[str]:
@@ -761,7 +793,7 @@ def _run_js_with_fallback(url: str, js_func_literal: str):
         s = requests.Session()
         s.headers.update({"User-Agent": "Mozilla/5.0"})
         r = http_get(s, url, timeout=12)
-        html = r.text
+        html = read_html_safely(r)
         urls = []
         for m in re.finditer(r'(?i)(?:https?://ticket\.ibon\.com\.tw)?/ActivityInfo/Details/(\d+)', html):
             u = urljoin("https://ticket.ibon.com.tw/", m.group(0))
@@ -1297,7 +1329,8 @@ def _resolve_utk_url(
                 if final_url and "UTK0201_000" in final_url.upper():
                     resolved = final_url
                 elif 200 <= status < 400:
-                    urls = _extract_ticket_urls_from_text(resp.text)
+                    html_blob = read_html_safely(resp)
+                    urls = _extract_ticket_urls_from_text(html_blob)
                     if urls:
                         resolved = urls[0]
                     elif resp.history:
@@ -1627,7 +1660,13 @@ def fetch_from_ticket_details(details_url: str, sess: requests.Session) -> Dict[
         resp = http_get(sess, details_url, timeout=6)
 
         if resp.status_code == 200:
-            detail_html = _decode_ibon_html(resp)
+            detail_html = read_html_safely(resp)
+            html_summary = _extract_remaining_tickets_from_html(detail_html)
+            if html_summary:
+                out.setdefault("remaining_tickets", html_summary)
+                _get_logger().debug(
+                    f"[details] html fallback extracted remaining for {details_url}: {html_summary}"
+                )
     except Exception as exc:
         _get_logger().info(f"[details] fetch fail: {exc}")
 
@@ -2360,6 +2399,94 @@ def _extract_utk_ticket_rows(html: str) -> List[Dict[str, Any]]:
     return results
 
 
+_RE_REMAINING_NUM = re.compile(r"(?:尚餘|剩餘|可售|可購買|餘票|票量)[^\d]{0,6}(\d{1,4})\s*張")
+_RE_TOTAL_NUM = re.compile(r"(?:總(?:計)?|共(?:有)?|全部)[^\d]{0,6}(\d{1,4})\s*張")
+
+
+def _extract_remaining_tickets_from_html(html: Optional[str]) -> Optional[Dict[str, Any]]:
+    if not html:
+        return None
+
+    text = ""
+    try:
+        soup = soup_parse(html)
+        text = soup.get_text("\n")
+    except Exception:
+        text = re.sub(r"<[^>]+>", " ", html)
+
+    compact = re.sub(r"\s+", " ", text).strip()
+    if not compact:
+        return None
+
+    remaining_val: Optional[int] = None
+    for match in _RE_REMAINING_NUM.finditer(compact):
+        try:
+            remaining_val = int(match.group(1))
+        except Exception:
+            continue
+
+    total_val: Optional[int] = None
+    for match in _RE_TOTAL_NUM.finditer(compact):
+        try:
+            total_val = int(match.group(1))
+        except Exception:
+            continue
+
+    sold_out = bool(re.search(r"售完|完售|售罄", compact))
+
+    if remaining_val is None and sold_out:
+        return {"remaining": "售完"}
+
+    if remaining_val is not None:
+        payload: Dict[str, Any] = {"remaining": str(remaining_val)}
+        if total_val is not None and total_val >= remaining_val:
+            payload["total"] = str(total_val)
+        if sold_out and remaining_val == 0:
+            payload.setdefault("status", "售完")
+        return payload
+
+    return None
+
+
+def _summarize_remaining_tickets(
+    tickets: Optional[List[Dict[str, Any]]],
+    html: Optional[str],
+    url: Optional[str] = None,
+) -> Optional[Dict[str, Any]]:
+    if not tickets and not html:
+        return None
+
+    logger = _get_logger()
+
+    total_numeric = 0
+    numeric_found = False
+    sold_out = False
+
+    for ticket in tickets or []:
+        remaining = ticket.get("remaining")
+        if isinstance(remaining, (int, float)):
+            numeric_found = True
+            total_numeric += max(0, int(remaining))
+        status_text = str(ticket.get("status") or "")
+        if "售完" in status_text or "完售" in status_text:
+            sold_out = True
+
+    if numeric_found:
+        summary = {"remaining": str(total_numeric), "total": str(total_numeric)}
+        logger.debug(f"[remaining] aggregated {summary} from tickets for {url}")
+        return summary
+
+    if sold_out:
+        summary = {"remaining": "售完"}
+        logger.debug(f"[remaining] detected sold out status for {url}")
+        return summary
+
+    fallback = _extract_remaining_tickets_from_html(html)
+    if fallback:
+        logger.debug(f"[remaining] html fallback triggered for {url}: {fallback}")
+    return fallback
+
+
 def try_fetch_livemap_by_perf(perf_id: str, sess: requests.Session, html: Optional[str] = None) -> Tuple[Dict[str, int], int]:
     if not perf_id:
         return {}, 0
@@ -2404,7 +2531,7 @@ def fetch_area_left_from_utk0101(base_000_url: str, perf_id: str, product_id: st
         r = http_get(sess, url, params=params, headers=headers, timeout=12)
         if r.status_code != 200:
             return None
-        html = r.text
+        html = read_html_safely(r)
         m = re.search(r'(?:剩餘|尚餘|可購買|可售)[^\d]{0,6}(\d{1,3})', html)
         if not m:
             m = re.search(r'(\d{1,3})\s*張', html)
@@ -2627,6 +2754,17 @@ def parse_UTK0201_000(url: str, sess: requests.Session, referer: Optional[str] =
     else:
         out["tickets"] = tickets
 
+    remaining_summary = _summarize_remaining_tickets(out.get("tickets"), html, url)
+    if remaining_summary:
+        out["remaining_tickets"] = remaining_summary
+        try:
+            remaining_val = int(str(remaining_summary.get("remaining")))
+        except (TypeError, ValueError):
+            remaining_val = None
+        if remaining_val is not None:
+            out.setdefault("remain", remaining_val)
+            out.setdefault("remaining", remaining_val)
+
 
     sig_base = hash_state(human_numeric, selling_names)
     out["sig"] = hashlib.md5((sig_base + ("|SO" if sold_out else "")).encode("utf-8")).hexdigest()
@@ -2840,6 +2978,17 @@ def _probe_activity_details(url: str, sess: requests.Session, trace: Optional[Li
 
     if ticket_candidates:
         result_base["ticket_urls"] = ticket_candidates
+    if "remaining_tickets" not in result_base:
+        fallback_summary = _summarize_remaining_tickets(result_base.get("tickets"), html, url)
+        if fallback_summary:
+            result_base["remaining_tickets"] = fallback_summary
+            try:
+                fallback_remaining = int(str(fallback_summary.get("remaining")))
+            except (TypeError, ValueError):
+                fallback_remaining = None
+            if fallback_remaining is not None:
+                result_base.setdefault("remain", fallback_remaining)
+                result_base.setdefault("remaining", fallback_remaining)
     try:
         total_remaining = sum(
             max(0, int(t.get("remaining", 0)))
@@ -2869,7 +3018,8 @@ def probe(url: str) -> dict:
         r.encoding = r.apparent_encoding
     title = ""
     try:
-        soup = soup_parse(r.text)
+        html_blob = read_html_safely(r)
+        soup = soup_parse(html_blob)
         if soup.title and soup.title.text:
             title = soup.title.text.strip()
     except Exception:
@@ -3375,6 +3525,7 @@ def fetch_ibon_entertainments(limit=10, keyword=None, only_concert=False):
     items = fetch_ibon_list_via_api(limit=limit, keyword=keyword, only_concert=only_concert)
     if items:
         return items
+    _get_logger().debug("[activities] html fallback triggered for entertainment list")
     return fetch_ibon_ent_html_hard(limit=limit, keyword=keyword, only_concert=only_concert)
 
 def _truthy(v: Optional[str]) -> bool:
@@ -3729,28 +3880,6 @@ def _background_unwatch_job(app_obj: Flask, chat_id: Optional[str], url: Optiona
         _push_detail_to_chat(chat_id, None, fallback=status_line)
 
 
-def _background_quick_check_job(app_obj: Flask, chat_id: Optional[str], url: str, task_id: str) -> None:
-    logger = app_obj.logger
-
-    status_line = f"快速查看任務 {task_id} 已完成。"
-    fallback = f"{status_line} 但目前無法取得票券資訊。"
-    try:
-        detail = _maybe_probe(url)
-    except Exception as exc:  # pragma: no cover - network failure path
-
-        logger.error(f"[quick-bg] probe failed for {url}: {exc}")
-
-        if chat_id:
-            send_text(chat_id, f"快速查看任務 {task_id} 失敗：{exc}")
-        return
-
-    if isinstance(detail, dict):
-        payload = dict(detail)
-        payload.setdefault("task_id", task_id)
-        _push_detail_to_chat(chat_id, payload, extra_text=status_line)
-    else:
-        _push_detail_to_chat(chat_id, None, fallback=fallback)
-
 def _background_watch_job(app_obj: Flask, chat_id: Optional[str], url: str, task_id: str, created: bool, period: int) -> None:
     logger = app_obj.logger
     status_line = f"任務 {task_id} 已{'建立' if created else '更新'}，每 {period} 秒監看。"
@@ -3787,26 +3916,6 @@ def _background_unwatch_job(app_obj: Flask, chat_id: Optional[str], url: Optiona
         _push_detail_to_chat(chat_id, payload, extra_text=status_line)
     else:
         _push_detail_to_chat(chat_id, None, fallback=status_line)
-
-
-def _background_quick_check_job(app_obj: Flask, chat_id: Optional[str], url: str, task_id: str) -> None:
-    logger = app_obj.logger
-    status_line = f"快速查看任務 {task_id} 已完成。"
-    fallback = f"{status_line} 但目前無法取得票券資訊。"
-    try:
-        detail = _maybe_probe(url)
-    except Exception as exc:  # pragma: no cover - network failure path
-        logger.error(f"[quick-bg] probe failed for {url}: {exc}")
-        if chat_id:
-            send_text(chat_id, f"快速查看任務 {task_id} 失敗：{exc}")
-        return
-
-    if isinstance(detail, dict):
-        payload = dict(detail)
-        payload.setdefault("task_id", task_id)
-        _push_detail_to_chat(chat_id, payload, extra_text=status_line)
-    else:
-        _push_detail_to_chat(chat_id, None, fallback=fallback)
 
 
 def _perform_cron_tick() -> Dict[str, Any]:
@@ -4168,9 +4277,8 @@ def _quick_check_impl(url: str, chat_id: Optional[str] = None):
     if not _spawn_background_worker(
         app_obj,
         "quick-check",
-        _background_quick_check_job,
+        _quick_check_bg,
         app_obj,
-
         chat_id,
         url,
         task_id,
